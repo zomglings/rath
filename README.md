@@ -65,6 +65,57 @@ rath test --list          # list available tests
 rath <command> -h         # help for any (sub)command
 ```
 
-Integration tests are standalone scripts in `src/integration/` (compiled to
-`dist/integration/`); each exits 0 on success. They call live APIs and require
-`OPENAI_API_KEY`.
+## Integration tests
+
+### Contract
+
+Each integration test is a standalone script: it is executed with `node`,
+receives no arguments, and signals its verdict purely through its exit code —
+0 for pass, non-zero (conventionally 1) for fail. Anything it writes to
+stdout/stderr is shown as-is; on failure the assertion error and stack trace
+land on stderr.
+
+### Discovery and execution
+
+Tests live in `src/integration/`, one file per test, and compile with the
+normal build (`npm run build`) to `dist/integration/`. `rath test` discovers
+every `*.js` file in `dist/integration/` (resolved relative to the installed
+CLI, so the published package can run its own tests); the test's name is its
+filename without the extension. Tests run sequentially, each in a child
+`node` process with inherited stdio and environment, and the runner reports
+per-test PASS/FAIL plus a summary, exiting 1 if any test failed. To add a
+test, drop a script in `src/integration/` that exits 0 on success and
+rebuild — no registration step.
+
+### Requirements and conventions
+
+The current tests call the live OpenAI API: they require `OPENAI_API_KEY` in
+the environment and fail fast with a clear error when it is missing. They
+cost real money (fractions of a cent in tokens, plus per-use fees for hosted
+tools such as web search and code interpreter containers), which is why they
+are not part of the pre-commit checks. `RATH_TEST_MODEL` overrides the model
+(default: `gpt-5-mini`). Tests log a per-run token cost on success, and
+assert on request payloads via the provider's `onPayload` hook when they need
+to prove what was actually sent to the API.
+
+### Current tests
+
+- `openai-native-web-search` — the issue #5 acceptance spike. Three turns
+  through pi-ai's `stream()`: a hosted web search with structured citations,
+  lossless replay of raw `web_search_call` items, and a JSON
+  serialize/deserialize round-trip of the full context.
+- `openai-native-code-interpreter` — opt-in hosted tool. Computes fib(100)
+  with `codeInterpreter: true`, checks the `code_interpreter_call` item is
+  captured and the answer exact, then replays it losslessly after a JSON
+  round-trip.
+- `openai-native-agent-loop` — interop with pi's stock agent loop
+  (`@earendil-works/pi-agent-core`, a dev dependency). Hosted tools disabled;
+  a client-side tool is executed by the loop and only `function` tools appear
+  in request payloads.
+- `openai-native-client-tool` — client-side tool parsing through plain
+  `stream()`: ToolCall block shape (structured arguments, `callId|itemId`
+  id, `stopReason "toolUse"`), then `function_call`/`function_call_output`
+  replay with matching `call_id`.
+
+Not yet covered: `file_search` (needs a vector-store fixture) and
+`image_generation` (cost).
