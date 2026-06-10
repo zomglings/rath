@@ -1,6 +1,11 @@
 # rath
 This is my harness. There are many like it, but this one is mine.
 
+rath is a library for creating specialized agent loops. Each specialized
+agent is its own program built from the primitives defined here: API
+providers, an agent loop, and the tools they share. The first primitive is
+the `openai-native` provider.
+
 ## openai-native provider
 
 `@zomglings/rath` registers a custom [pi-ai](https://github.com/badlogic/pi-mono) API
