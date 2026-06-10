@@ -65,17 +65,35 @@ export const testCommand: Command = {
       description: "List available tests without running them",
     },
   ],
-  run: async (flags) => {
+  run: async (argv) => {
+    const names: string[] = [];
+    let list = false;
+    for (let i = 0; i < argv.length; i++) {
+      const token = argv[i]!;
+      if (token === "-n" || token === "--name") {
+        const value = argv[++i];
+        if (value === undefined) {
+          process.stderr.write(`Option ${token} requires a value\n`);
+          return 1;
+        }
+        names.push(value);
+      } else if (token === "--list") {
+        list = true;
+      } else {
+        process.stderr.write(`Unknown argument: ${token}\nRun with -h for usage.\n`);
+        return 1;
+      }
+    }
+
     const all = discoverTests();
-    if (flags.values.has("list")) {
+    if (list) {
       for (const test of all) {
         process.stdout.write(test.name + "\n");
       }
       return 0;
     }
     let selected = all;
-    const names = flags.values.get("name");
-    if (names) {
+    if (names.length > 0) {
       const known = new Map(all.map((t) => [t.name, t]));
       const missing = names.filter((n) => !known.has(n));
       if (missing.length > 0) {

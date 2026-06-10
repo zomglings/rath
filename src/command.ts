@@ -1,9 +1,13 @@
 /**
  * Minimal recursive CLI command framework.
  *
- * - Commands form a tree; each node has its own help text.
- * - `-h`/`--help` anywhere on the command line prints help for the deepest
- *   resolved command (the "current leaf") and exits 0.
+ * Commands form a tree; each node has its own help text. Descent peels
+ * matched subcommand names: a command's `run` receives exactly the arguments
+ * that follow its own name on the command line. Leaf commands parse their
+ * own arguments however they like; the framework does no flag parsing.
+ *
+ * `-h`/`--help` anywhere on the command line prints help for the deepest
+ * resolved command (the "current leaf") and exits 0.
  */
 
 export interface FlagSpec {
@@ -18,11 +22,6 @@ export interface FlagSpec {
   description: string;
 }
 
-export interface ParsedFlags {
-  /** Flag long name -> values (booleans collect "true"). */
-  values: Map<string, string[]>;
-}
-
 export interface Command {
   name: string;
   /** One-line summary, shown in parent help. */
@@ -31,10 +30,15 @@ export interface Command {
   description?: string;
   /** Usage line override; defaults to a derived one. */
   usage?: string;
+  /** Flag documentation for help text. Parsing is the command's own job. */
   flags?: FlagSpec[];
   subcommands?: Command[];
-  /** Leaf action. Intermediate commands may omit it (help is shown instead). */
-  run?: (flags: ParsedFlags, positional: string[]) => Promise<number> | number;
+  /**
+   * Command handler. Receives the arguments that follow this command's name
+   * (ancestor command names peeled off) and returns the process exit code.
+   * Commands without a handler are non-leaf: invoking them prints help.
+   */
+  run?: (argv: string[]) => Promise<number> | number;
 }
 
 export function helpText(command: Command, path: string[]): string {
@@ -81,94 +85,41 @@ const HELP_FLAG: FlagSpec = {
   description: "Print help for the current command",
 };
 
+function isHelpToken(token: string): boolean {
+  return token === "-h" || token === "--help";
+}
+
 /**
  * Resolve and execute a command line against a command tree.
  * Returns the process exit code.
  */
-export async function execute(root: Command, argv: string[]): Promise<number> {
-  // Resolve the command path: descend while leading positional tokens name
-  // subcommands. Flags are collected for the resolved command.
-  let command = root;
-  const path = [root.name];
-  let helpRequested = false;
-  const rest: string[] = [];
+export async function execute(
+  command: Command,
+  argv: string[],
+  path: string[] = [command.name],
+): Promise<number> {
+  const helpRequested = argv.some(isHelpToken);
+  const args = argv.filter((token) => !isHelpToken(token));
 
-  let i = 0;
-  let descending = true;
-  while (i < argv.length) {
-    const token = argv[i]!;
-    if (token === "-h" || token === "--help") {
-      helpRequested = true;
-      i++;
-      continue;
-    }
-    if (descending && !token.startsWith("-")) {
-      const child = command.subcommands?.find((c) => c.name === token);
-      if (child) {
-        command = child;
-        path.push(child.name);
-        i++;
-        continue;
-      }
-    }
-    descending = false;
-    rest.push(token);
-    i++;
+  // Keep descending while the next token names a subcommand.
+  const child = args.length > 0 ? command.subcommands?.find((c) => c.name === args[0]) : undefined;
+  if (child) {
+    const rest = [...args.slice(1), ...(helpRequested ? ["--help"] : [])];
+    return execute(child, rest, [...path, child.name]);
   }
 
   if (helpRequested) {
     process.stdout.write(helpText(command, path) + "\n");
     return 0;
   }
-
-  // Parse flags for the resolved command.
-  const specs = command.flags ?? [];
-  const flags: ParsedFlags = { values: new Map() };
-  const positional: string[] = [];
-  for (let j = 0; j < rest.length; j++) {
-    const token = rest[j]!;
-    if (token.startsWith("-") && token !== "-" && token !== "--") {
-      const isLong = token.startsWith("--");
-      const name = isLong ? token.slice(2) : token.slice(1);
-      const spec = specs.find((s) => (isLong ? s.long === name : s.short === name));
-      if (!spec) {
-        process.stderr.write(`Unknown option for "${path.join(" ")}": ${token}\n\n`);
-        process.stderr.write(helpText(command, path) + "\n");
-        return 1;
-      }
-      let value = "true";
-      if (spec.takesValue) {
-        const next = rest[j + 1];
-        if (next === undefined) {
-          process.stderr.write(`Option ${token} requires a value\n`);
-          return 1;
-        }
-        value = next;
-        j++;
-      }
-      const existing = flags.values.get(spec.long);
-      if (existing) {
-        if (!spec.repeatable) {
-          process.stderr.write(`Option --${spec.long} may only be given once\n`);
-          return 1;
-        }
-        existing.push(value);
-      } else {
-        flags.values.set(spec.long, [value]);
-      }
-    } else {
-      positional.push(token);
-    }
+  if (command.run) {
+    return command.run(args);
   }
-
-  if (!command.run) {
-    if (positional.length > 0) {
-      process.stderr.write(`Unknown command: ${path.join(" ")} ${positional[0]}\n\n`);
-      process.stderr.write(helpText(command, path) + "\n");
-      return 1;
-    }
-    process.stdout.write(helpText(command, path) + "\n");
-    return 0;
+  if (args.length > 0) {
+    process.stderr.write(`Unknown command: ${path.join(" ")} ${args[0]}\n\n`);
+    process.stderr.write(helpText(command, path) + "\n");
+    return 1;
   }
-  return command.run(flags, positional);
+  process.stdout.write(helpText(command, path) + "\n");
+  return 0;
 }
