@@ -14,4 +14,8 @@ Before committing, run all checks:
 npm run check
 npm run build
 ```
-(Lint and test scripts are not yet configured — update this block as scripts land, and keep it current.)
+(Lint is not yet configured — update this block as scripts land, and keep it current.)
+
+Integration tests run via `node dist/cli.js test` (or `rath test`). They call
+live APIs, cost money, and require OPENAI_API_KEY, so they are not part of the
+pre-commit checks; run them when changing provider code.
