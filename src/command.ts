@@ -1,13 +1,16 @@
 /**
  * Minimal recursive CLI command framework.
  *
- * Commands form a tree; each node has its own help text. Descent peels
- * matched subcommand names: a command's `run` receives exactly the arguments
- * that follow its own name on the command line. Leaf commands parse their
- * own arguments however they like; the framework does no flag parsing.
+ * Commands form a tree and `run` is a method: invoking the CLI is just
+ * `root.run("", process.argv.slice(2))`. `run` receives the prefix of
+ * ancestor command names ("" for the root) and the arguments that follow the
+ * command's own name. Non-leaf commands use `runSubcommands`, which cases on
+ * the first argument and delegates to the matching subcommand's `run`; leaf
+ * commands parse their argv themselves — the framework does no flag parsing.
  *
  * `-h`/`--help` anywhere on the command line prints help for the deepest
- * resolved command (the "current leaf") and exits 0.
+ * resolved command: dispatchers pass help tokens through during descent, and
+ * every `run` answers them for itself (see `helpRequested`).
  */
 
 export interface FlagSpec {
@@ -34,24 +37,37 @@ export interface Command {
   flags?: FlagSpec[];
   subcommands?: Command[];
   /**
-   * Command handler. Receives the arguments that follow this command's name
-   * (ancestor command names peeled off) and returns the process exit code.
-   * Commands without a handler are non-leaf: invoking them prints help.
+   * Execute this command. `prefix` is the space-joined names of ancestor
+   * commands ("" for the root); `argv` is everything on the command line
+   * after this command's own name. Returns the process exit code.
    */
-  run?: (argv: string[]) => Promise<number> | number;
+  run(this: Command, prefix: string, argv: string[]): Promise<number> | number;
 }
 
-export function helpText(command: Command, path: string[]): string {
-  const fullName = path.join(" ");
+export function fullName(command: Command, prefix: string): string {
+  return prefix ? `${prefix} ${command.name}` : command.name;
+}
+
+function isHelpToken(token: string): boolean {
+  return token === "-h" || token === "--help";
+}
+
+/** Whether the command line asks for help (`-h`/`--help` anywhere). */
+export function helpRequested(argv: string[]): boolean {
+  return argv.some(isHelpToken);
+}
+
+export function helpText(command: Command, prefix: string): string {
+  const name = fullName(command, prefix);
   const lines: string[] = [];
-  lines.push(`${fullName} - ${command.summary}`);
+  lines.push(`${name} - ${command.summary}`);
   if (command.description) {
     lines.push("", command.description);
   }
   const usage =
     command.usage ??
     [
-      fullName,
+      name,
       command.subcommands?.length ? "<command>" : null,
       command.flags?.length ? "[options]" : null,
     ]
@@ -85,41 +101,32 @@ const HELP_FLAG: FlagSpec = {
   description: "Print help for the current command",
 };
 
-function isHelpToken(token: string): boolean {
-  return token === "-h" || token === "--help";
-}
-
 /**
- * Resolve and execute a command line against a command tree.
- * Returns the process exit code.
+ * Stock `run` for non-leaf commands. If the first argument (ignoring help
+ * tokens) names a subcommand, delegates to its `run` with that name peeled
+ * off and help tokens preserved; otherwise prints help (exit 0, or exit 1
+ * with an error if an unknown command was given).
  */
-export async function execute(
-  command: Command,
-  argv: string[],
-  path: string[] = [command.name],
-): Promise<number> {
-  const helpRequested = argv.some(isHelpToken);
-  const args = argv.filter((token) => !isHelpToken(token));
-
-  // Keep descending while the next token names a subcommand.
-  const child = args.length > 0 ? command.subcommands?.find((c) => c.name === args[0]) : undefined;
-  if (child) {
-    const rest = [...args.slice(1), ...(helpRequested ? ["--help"] : [])];
-    return execute(child, rest, [...path, child.name]);
+export const runSubcommands: Command["run"] = function (prefix, argv) {
+  const firstArg = argv.findIndex((token) => !isHelpToken(token));
+  if (firstArg >= 0) {
+    const child = this.subcommands?.find((c) => c.name === argv[firstArg]);
+    if (child) {
+      return child.run(fullName(this, prefix), [
+        ...argv.slice(0, firstArg),
+        ...argv.slice(firstArg + 1),
+      ]);
+    }
   }
-
-  if (helpRequested) {
-    process.stdout.write(helpText(command, path) + "\n");
+  if (helpRequested(argv)) {
+    process.stdout.write(helpText(this, prefix) + "\n");
     return 0;
   }
-  if (command.run) {
-    return command.run(args);
-  }
-  if (args.length > 0) {
-    process.stderr.write(`Unknown command: ${path.join(" ")} ${args[0]}\n\n`);
-    process.stderr.write(helpText(command, path) + "\n");
+  if (firstArg >= 0) {
+    process.stderr.write(`Unknown command: ${fullName(this, prefix)} ${argv[firstArg]}\n\n`);
+    process.stderr.write(helpText(this, prefix) + "\n");
     return 1;
   }
-  process.stdout.write(helpText(command, path) + "\n");
+  process.stdout.write(helpText(this, prefix) + "\n");
   return 0;
-}
+};

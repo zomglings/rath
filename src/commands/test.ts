@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Command } from "../command.js";
+import { fullName, helpRequested, helpText, type Command } from "../command.js";
 
 interface IntegrationTest {
   name: string;
@@ -65,7 +65,11 @@ export const testCommand: Command = {
       description: "List available tests without running them",
     },
   ],
-  run: async (argv) => {
+  async run(prefix, argv) {
+    if (helpRequested(argv)) {
+      process.stdout.write(helpText(this, prefix) + "\n");
+      return 0;
+    }
     const names: string[] = [];
     let list = false;
     for (let i = 0; i < argv.length; i++) {
@@ -80,7 +84,9 @@ export const testCommand: Command = {
       } else if (token === "--list") {
         list = true;
       } else {
-        process.stderr.write(`Unknown argument: ${token}\nRun with -h for usage.\n`);
+        process.stderr.write(
+          `Unknown argument: ${token}\nRun "${fullName(this, prefix)} -h" for usage.\n`,
+        );
         return 1;
       }
     }
