@@ -33,6 +33,7 @@
     "check": "tsc --noEmit"
   },
   "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.74.2",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
   },
