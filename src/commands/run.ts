@@ -13,7 +13,11 @@
  * hosted web search is available (on by default, --no-web-search disables
  * it). Client-side tools are loaded on demand from
  * @earendil-works/pi-coding-agent. Frontends: a plain readline REPL
- * (default, also used for -p one-shots) and a pi-tui interface (-T/--tui).
+ * (default, also used for -p one-shots) and a pi-tui interface (-T/--tui)
+ * rendered with Pi's own interactive components. The TUI's dependencies
+ * (pi-tui and pi-coding-agent's UI) are imported inside runTui, so they only
+ * load when --tui is used; the type-only imports below are erased at compile
+ * time and cost nothing.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import * as readline from "node:readline/promises";
@@ -32,6 +36,8 @@ import {
   streamSimple,
   type TextContent,
 } from "@earendil-works/pi-ai";
+import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
+import type * as PiTui from "@earendil-works/pi-tui";
 import { type Command, fullName, helpRequested, helpText } from "../command.js";
 import {
   contentBlocks,
@@ -544,7 +550,6 @@ export const runCommand: Command = {
     }
 
     if (flags.tui) {
-      const { runTui } = await import("./run-tui.js");
       const code = await runTui(agent, flags);
       save();
       return code;
@@ -552,7 +557,7 @@ export const runCommand: Command = {
 
     attachRenderer(agent);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | /info /model /lsmodels /reasoning /exit (or Ctrl+D)`)}\n`,
+      `${dim(`model: ${flags.model} | /info /sys /model /lsmodels /reasoning /exit (or Ctrl+D)`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
@@ -590,3 +595,361 @@ export const runCommand: Command = {
     return 0;
   },
 };
+
+// ---------------------------------------------------------------------------
+// TUI frontend (-T/--tui)
+// ---------------------------------------------------------------------------
+
+// Styles do not carry across TUI lines; every style helper applies per line.
+function styled(open: string): (text: string) => string {
+  return (text: string) =>
+    text
+      .split("\n")
+      .map((line) => `${open}${line}\x1b[0m`)
+      .join("\n");
+}
+
+const dimLine = styled("\x1b[2m");
+const cyanLine = styled("\x1b[36m");
+const yellowLine = styled("\x1b[33m");
+const redLine = styled("\x1b[31m");
+
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/**
+ * Display copy of an assistant message without the rendered-citations
+ * trailer: the trailer exists for persistence and provider handoff; the TUI
+ * shows clickable sources instead.
+ */
+function displayMessage(message: AssistantMessage): AssistantMessage {
+  return { ...message, content: message.content.filter((b) => !isRenderedCitations(b)) };
+}
+
+function messageText(content: string | { type: string; text?: string }[]): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  return content
+    .filter((c) => c.type === "text")
+    .map((c) => c.text ?? "")
+    .join("\n");
+}
+
+/**
+ * pi-tui frontend. Same session semantics as the plain REPL — same Agent,
+ * same slash commands, same citation merging — rendered with Pi's own
+ * interactive components (AssistantMessageComponent, UserMessageComponent,
+ * ToolExecutionComponent, and the Pi theme), so the TUI looks like vanilla
+ * Pi. rath adds what those components do not know about: hosted-tool
+ * markers and clickable citation sources. Messages stream as they arrive
+ * and are re-rendered in full on completion.
+ */
+async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    process.stderr.write("--tui requires an interactive terminal\n");
+    return 1;
+  }
+
+  // The TUI's dependencies load here so plain runs never pay for them.
+  const piTui = await import("@earendil-works/pi-tui");
+  const piCa = await import("@earendil-works/pi-coding-agent");
+  const {
+    Container,
+    Editor,
+    hyperlink,
+    Loader,
+    matchesKey,
+    ProcessTerminal,
+    SelectList,
+    Text,
+    TUI,
+  } = piTui;
+  const {
+    AssistantMessageComponent,
+    getMarkdownTheme,
+    getSelectListTheme,
+    initTheme,
+    ToolExecutionComponent,
+    UserMessageComponent,
+  } = piCa;
+
+  // Pi's built-in dark theme, selected explicitly. Caveat: initTheme also
+  // registers (not applies) themes found in ~/.pi/agent/themes — the only
+  // implicit read in rath run, cosmetic-only, forced on us because
+  // pi-coding-agent does not export setThemeInstance/loadThemeFromPath.
+  initTheme("dark", false);
+  const markdownTheme = getMarkdownTheme();
+  const selectTheme = getSelectListTheme();
+  const editorTheme: PiTui.EditorTheme = { borderColor: dimLine, selectList: selectTheme };
+
+  /** Clickable sources list rebuilt from the message's citations. */
+  const sourcesComponent = (message: AssistantMessage): PiTui.Text | undefined => {
+    const urls = new Map<string, string>();
+    for (const block of message.content) {
+      if (block.type === "text" && !isRenderedCitations(block)) {
+        for (const citation of getCitations(block)) {
+          if (citation.type === "url_citation" && !urls.has(citation.url)) {
+            urls.set(citation.url, citation.title);
+          }
+        }
+      }
+    }
+    if (urls.size === 0) {
+      return undefined;
+    }
+    const lines = [...urls].map(
+      ([url, title]) => `  ${hyperlink(title || url, url)}${title ? dimLine(` — ${url}`) : ""}`,
+    );
+    return new Text(`${dimLine("sources:")}\n${lines.join("\n")}`);
+  };
+
+  const hostedMarkers = (message: AssistantMessage): PiTui.Text[] =>
+    contentBlocks(message)
+      .filter(isHostedToolCall)
+      .map((block) => new Text(yellowLine(`[${block.toolName}]`)));
+
+  const tui = new TUI(new ProcessTerminal());
+  const transcript = new Container();
+  const status = new Container();
+  const loader = new Loader(tui, cyanLine, dimLine, "thinking…", {
+    frames: SPINNER,
+    intervalMs: 80,
+  });
+  const editor = new Editor(tui, editorTheme);
+
+  const banner = new Text("");
+  const refreshBanner = () => {
+    banner.setText(
+      `${cyanLine("rath")} ${dimLine(
+        `| ${flags.model} | reasoning: ${agent.state.thinkingLevel} | ` +
+          "/info /sys /model /lsmodels /reasoning /exit | Ctrl+C interrupts",
+      )}`,
+    );
+  };
+  refreshBanner();
+  tui.addChild(banner);
+  tui.addChild(transcript);
+  tui.addChild(status);
+  tui.addChild(editor);
+  tui.setFocus(editor);
+
+  const addAssistant = (message: AssistantMessage) => {
+    transcript.addChild(
+      new AssistantMessageComponent(displayMessage(message), false, markdownTheme),
+    );
+    for (const marker of hostedMarkers(message)) {
+      transcript.addChild(marker);
+    }
+    const sources = sourcesComponent(message);
+    if (sources) {
+      transcript.addChild(sources);
+    }
+  };
+
+  /** Overlay selector; Enter applies, Escape cancels. */
+  const openSelector = (items: PiTui.SelectItem[], onPick: (value: string) => void) => {
+    const list = new SelectList(items, 12, selectTheme);
+    const handle = tui.showOverlay(list, { width: "80%", maxHeight: "60%" });
+    list.onSelect = (item) => {
+      handle.hide();
+      onPick(item.value);
+      tui.requestRender();
+    };
+    list.onCancel = () => {
+      handle.hide();
+      tui.requestRender();
+    };
+  };
+
+  const echoCommandResult = (input: string) => {
+    const result = handleSlashCommand(input, agent, flags);
+    if (result?.output) {
+      transcript.addChild(
+        new Text(result.isError ? redLine(result.output) : dimLine(result.output)),
+      );
+    }
+    refreshBanner();
+  };
+
+  /** TUI-native rendering for selected slash commands. Returns true when handled. */
+  const handleTuiCommand = (input: string): boolean => {
+    const [command = "", ...rest] = input.split(/\s+/);
+    const arg = rest.join(" ").trim();
+    if (command === "/model" && arg.length === 0) {
+      openSelector(
+        listModels().map((spec) => ({ value: spec, label: spec })),
+        (spec) => echoCommandResult(`/model ${spec}`),
+      );
+      return true;
+    }
+    if (command === "/reasoning" && arg.length === 0) {
+      openSelector(
+        REASONING_LEVELS.map((level) => ({
+          value: level,
+          label: level,
+          description: level === agent.state.thinkingLevel ? "current" : "",
+        })),
+        (level) => echoCommandResult(`/reasoning ${level}`),
+      );
+      return true;
+    }
+    if (command === "/info") {
+      const pairs = sessionInfo(agent, flags);
+      const width = Math.max(...pairs.map(([key]) => key.length));
+      const panel = pairs
+        .map(([key, value]) => `${dimLine(key.padEnd(width))}  ${value}`)
+        .join("\n");
+      transcript.addChild(new Text(panel, 2, 1));
+      return true;
+    }
+    return false;
+  };
+
+  // Replay a loaded context into the transcript so the session is visible.
+  for (const message of agent.state.messages) {
+    if (message.role === "user") {
+      transcript.addChild(new UserMessageComponent(messageText(message.content), markdownTheme));
+    } else if (message.role === "assistant") {
+      addAssistant(message as AssistantMessage);
+    }
+  }
+
+  let resolveDone: (code: number) => void = () => {};
+  const done = new Promise<number>((resolve) => {
+    resolveDone = resolve;
+  });
+
+  let current: PiCodingAgent.AssistantMessageComponent | null = null;
+  const toolComponents = new Map<string, PiCodingAgent.ToolExecutionComponent>();
+  agent.subscribe((event) => {
+    if (event.type === "agent_start") {
+      status.addChild(loader);
+      loader.start();
+    } else if (event.type === "agent_end") {
+      loader.stop();
+      status.clear();
+      toolComponents.clear();
+    } else if (event.type === "message_start") {
+      if (event.message.role === "user") {
+        transcript.addChild(
+          new UserMessageComponent(messageText(event.message.content), markdownTheme),
+        );
+      } else if (event.message.role === "assistant") {
+        current = new AssistantMessageComponent(undefined, false, markdownTheme);
+        transcript.addChild(current);
+      }
+    } else if (event.type === "message_update") {
+      if (event.message.role === "assistant") {
+        current?.updateContent(displayMessage(event.message as AssistantMessage));
+      }
+    } else if (event.type === "message_end") {
+      if (event.message.role === "assistant") {
+        const message = event.message as AssistantMessage;
+        if (message.stopReason !== "error" && message.stopReason !== "aborted") {
+          applyCitationTrailer(message);
+        }
+        if (current) {
+          // Replace the streaming component with the full final rendering
+          // (markers and sources included).
+          transcript.removeChild(current);
+          current = null;
+        }
+        addAssistant(message);
+      }
+    } else if (event.type === "tool_execution_start") {
+      const component = new ToolExecutionComponent(
+        event.toolName,
+        event.toolCallId,
+        event.args,
+        undefined,
+        undefined,
+        tui,
+        process.cwd(),
+      );
+      component.setArgsComplete();
+      component.markExecutionStarted();
+      toolComponents.set(event.toolCallId, component);
+      transcript.addChild(component);
+    } else if (event.type === "tool_execution_update") {
+      const component = toolComponents.get(event.toolCallId);
+      const partial = event.partialResult as
+        | { content?: { type: string }[]; details?: unknown }
+        | undefined;
+      if (component && partial?.content) {
+        component.updateResult(
+          { content: partial.content, details: partial.details, isError: false },
+          true,
+        );
+      }
+    } else if (event.type === "tool_execution_end") {
+      const component = toolComponents.get(event.toolCallId);
+      const result = event.result as { content?: { type: string }[]; details?: unknown };
+      component?.updateResult(
+        { content: result?.content ?? [], details: result?.details, isError: event.isError },
+        false,
+      );
+    }
+    tui.requestRender();
+  });
+
+  editor.onSubmit = (text: string) => {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) {
+      return;
+    }
+    if (trimmed.startsWith("/")) {
+      transcript.addChild(new Text(`\n${cyanLine("›")} ${trimmed}`));
+      if (!handleTuiCommand(trimmed)) {
+        const result = handleSlashCommand(trimmed, agent, flags);
+        if (result) {
+          if (result.output) {
+            transcript.addChild(
+              new Text(result.isError ? redLine(result.output) : dimLine(result.output)),
+            );
+          }
+          refreshBanner();
+          if (result.exit) {
+            tui.stop();
+            resolveDone(0);
+          }
+        }
+      }
+      tui.requestRender();
+      return;
+    }
+    const message = { role: "user" as const, content: trimmed, timestamp: Date.now() };
+    if (agent.state.isStreaming) {
+      // Injected after the current turn finishes; the loop emits its
+      // message_start when it lands.
+      agent.steer(message);
+      transcript.addChild(new Text(dimLine(`(queued) › ${trimmed}`)));
+      tui.requestRender();
+      return;
+    }
+    agent.prompt(message).catch((error) => {
+      transcript.addChild(
+        new Text(redLine(`error: ${error instanceof Error ? error.message : error}`)),
+      );
+      tui.requestRender();
+    });
+  };
+
+  tui.addInputListener((data) => {
+    if (matchesKey(data, "ctrl+c")) {
+      if (agent.state.isStreaming) {
+        agent.abort();
+      } else {
+        tui.stop();
+        resolveDone(0);
+      }
+      return { consume: true };
+    }
+    return undefined;
+  });
+
+  tui.start();
+  const code = await done;
+  agent.abort();
+  await agent.waitForIdle();
+  return code;
+}
