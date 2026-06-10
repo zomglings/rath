@@ -1,6 +1,9 @@
 {
-  "name": "rath",
+  "name": "@zomglings/rath",
   "version": "0.0.1",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "An agent harness.",
   "type": "module",
   "license": "MIT",
