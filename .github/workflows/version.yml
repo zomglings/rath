@@ -1,0 +1,36 @@
+name: version
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require version greater than main
+        run: |
+          git fetch origin main --depth=1
+          git show origin/main:package.json > /tmp/main-package.json
+          node <<'EOF'
+          const fs = require("fs");
+          const parse = (version, source) => {
+            const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+            if (!m) {
+              console.error(`Unparseable version in ${source}: ${version}`);
+              process.exit(1);
+            }
+            return m.slice(1, 4).map(Number);
+          };
+          const head = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+          const base = JSON.parse(fs.readFileSync("/tmp/main-package.json", "utf8")).version;
+          const h = parse(head, "this PR");
+          const b = parse(base, "main");
+          const greater = h[0] !== b[0] ? h[0] > b[0] : h[1] !== b[1] ? h[1] > b[1] : h[2] > b[2];
+          if (!greater) {
+            console.error(`package.json version must be bumped above main: PR has ${head}, main has ${base}`);
+            process.exit(1);
+          }
+          console.log(`Version bump OK: ${base} -> ${head}`);
+          EOF
