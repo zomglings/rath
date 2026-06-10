@@ -1,16 +1,18 @@
 /**
  * "openai-native": a pi-ai API provider for the OpenAI Responses API with
- * native (server-side) web search.
+ * native (server-side, "hosted") tools: web search, file search, code
+ * interpreter, and image generation.
  *
  * pi-ai's stock "openai-responses" provider discards `url_citation`
  * annotations (it hardcodes `annotations: []` on replay) and only models
  * client-side function tools. This provider is a conversion layer built on
  * the official `openai` SDK that:
  *
- *  - sends the hosted `web_search` tool alongside any client function tools;
- *  - captures `url_citation` annotations as structured `citations` on text
- *    blocks (extra fields survive structural typing and JSON serialization);
- *  - captures raw `web_search_call` output items as `hostedToolCall` blocks
+ *  - sends enabled hosted tools (web search on by default; the others are
+ *    opt-in via options) alongside any client function tools;
+ *  - captures citation annotations as structured `citations` on text blocks
+ *    (extra fields survive structural typing and JSON serialization);
+ *  - captures raw hosted tool call output items as `hostedToolCall` blocks
  *    and replays them verbatim on later turns.
  *
  * Only rath's own code switches over the extended block types. Contexts that
@@ -19,10 +21,15 @@
  */
 import OpenAI from "openai";
 import type {
+  FileSearchTool,
+  ResponseCodeInterpreterToolCall,
   ResponseCreateParamsStreaming,
+  ResponseFileSearchToolCall,
   ResponseFunctionWebSearch,
+  ResponseIncludable,
   ResponseInput,
   ResponseInputItem,
+  ResponseOutputItem,
   ResponseOutputText,
   ResponseReasoningItem,
   ResponseStreamEvent,
@@ -51,7 +58,7 @@ import {
 
 export const OPENAI_NATIVE_API = "openai-native";
 
-/** Structured citation extracted from a `url_citation` annotation. */
+/** Structured citation extracted from a `url_citation` annotation (web search). */
 export interface UrlCitation {
   type: "url_citation";
   url: string;
@@ -62,10 +69,53 @@ export interface UrlCitation {
   endIndex: number;
 }
 
+/** Structured citation extracted from a `file_citation` annotation (file search). */
+export interface FileCitation {
+  type: "file_citation";
+  fileId: string;
+  filename: string;
+  /** Index of the file in the list of files. */
+  index: number;
+}
+
+/**
+ * Structured citation extracted from a `container_file_citation` annotation
+ * (a file produced by the code interpreter).
+ */
+export interface ContainerFileCitation {
+  type: "container_file_citation";
+  containerId: string;
+  fileId: string;
+  filename: string;
+  /** Index of the first character of the cited span in the text block. */
+  startIndex: number;
+  /** Index one past the last character of the cited span in the text block. */
+  endIndex: number;
+}
+
+export type Citation = UrlCitation | FileCitation | ContainerFileCitation;
+
 /** Text block extended with citations. Structurally still a TextContent. */
 export interface HostedTextContent extends TextContent {
-  citations?: UrlCitation[];
+  citations?: Citation[];
 }
+
+/**
+ * Hosted (server-side) tools this provider supports. The full enumeration of
+ * hosted tools lives in OpenAI's built-in tools documentation
+ * (https://platform.openai.com/docs/guides/tools) and in the `Tool` union of
+ * the openai SDK (openai/resources/responses/responses). Our support is not
+ * meant to be comprehensive — e.g. remote MCP (`mcp_call`, `mcp_list_tools`,
+ * `mcp_approval_request`) is not supported.
+ */
+export type HostedToolName = "web_search" | "file_search" | "code_interpreter" | "image_generation";
+
+/** Raw Responses API output items for the supported hosted tool calls. */
+export type HostedToolCallItem =
+  | ResponseFunctionWebSearch
+  | ResponseFileSearchToolCall
+  | ResponseCodeInterpreterToolCall
+  | ResponseOutputItem.ImageGenerationCall;
 
 /**
  * A server-side tool call (e.g. web search) executed by OpenAI. `raw` is the
@@ -76,9 +126,9 @@ export interface HostedTextContent extends TextContent {
 export interface HostedToolCallContent {
   type: "hostedToolCall";
   id: string;
-  toolName: "web_search";
-  status: ResponseFunctionWebSearch["status"];
-  raw: ResponseFunctionWebSearch;
+  toolName: HostedToolName;
+  status: HostedToolCallItem["status"];
+  raw: HostedToolCallItem;
 }
 
 export type HostedContentBlock = TextContent | ThinkingContent | ToolCall | HostedToolCallContent;
@@ -102,7 +152,7 @@ export function getHostedToolCalls(message: AssistantMessage): HostedToolCallCon
 }
 
 /** Citations on a text block, if any. */
-export function getCitations(block: TextContent): UrlCitation[] {
+export function getCitations(block: TextContent): Citation[] {
   return (block as HostedTextContent).citations ?? [];
 }
 
@@ -115,6 +165,18 @@ export interface OpenAINativeOptions extends StreamOptions {
    * filters/user_location.
    */
   webSearch?: boolean | Omit<WebSearchTool, "type">;
+  /**
+   * Hosted file search over vector stores. Off unless configured — it
+   * requires vector store ids.
+   */
+  fileSearch?: Omit<FileSearchTool, "type">;
+  /**
+   * Hosted code interpreter. Off by default; `true` uses an auto container,
+   * an object customizes the container/files.
+   */
+  codeInterpreter?: boolean | Omit<OpenAITool.CodeInterpreter, "type">;
+  /** Hosted image generation. Off by default; an object customizes output. */
+  imageGeneration?: boolean | Omit<OpenAITool.ImageGeneration, "type">;
 }
 
 // ---------------------------------------------------------------------------
@@ -249,12 +311,19 @@ function buildParams(
   context: Context,
   options?: OpenAINativeOptions,
 ): ResponseCreateParamsStreaming {
+  const include: ResponseIncludable[] = ["web_search_call.action.sources"];
+  if (options?.fileSearch) {
+    include.push("file_search_call.results");
+  }
+  if (options?.codeInterpreter) {
+    include.push("code_interpreter_call.outputs");
+  }
   const params: ResponseCreateParamsStreaming = {
     model: model.id,
     input: convertNativeMessages(model, context),
     stream: true,
     store: false,
-    include: ["web_search_call.action.sources"],
+    include,
     prompt_cache_key: options?.sessionId,
   };
   if (options?.maxTokens) {
@@ -268,6 +337,20 @@ function buildParams(
   if (options?.webSearch !== false) {
     const config = typeof options?.webSearch === "object" ? options.webSearch : {};
     tools.push({ type: "web_search", ...config });
+  }
+  if (options?.fileSearch) {
+    tools.push({ type: "file_search", ...options.fileSearch });
+  }
+  if (options?.codeInterpreter) {
+    const config =
+      typeof options.codeInterpreter === "object"
+        ? options.codeInterpreter
+        : { container: { type: "auto" as const } };
+    tools.push({ type: "code_interpreter", ...config });
+  }
+  if (options?.imageGeneration) {
+    const config = typeof options.imageGeneration === "object" ? options.imageGeneration : {};
+    tools.push({ type: "image_generation", ...config });
   }
   for (const tool of context.tools ?? []) {
     tools.push({
@@ -331,24 +414,76 @@ function parseTextSignature(signature: string | undefined): TextSignatureV1 | un
   return { v: 1, id: signature };
 }
 
-function citationToAnnotation(citation: UrlCitation): ResponseOutputText.URLCitation {
-  return {
-    type: "url_citation",
-    url: citation.url,
-    title: citation.title,
-    start_index: citation.startIndex,
-    end_index: citation.endIndex,
-  };
+type OutputAnnotation =
+  | ResponseOutputText.URLCitation
+  | ResponseOutputText.FileCitation
+  | ResponseOutputText.ContainerFileCitation;
+
+function citationToAnnotation(citation: Citation): OutputAnnotation {
+  switch (citation.type) {
+    case "url_citation":
+      return {
+        type: "url_citation",
+        url: citation.url,
+        title: citation.title,
+        start_index: citation.startIndex,
+        end_index: citation.endIndex,
+      };
+    case "file_citation":
+      return {
+        type: "file_citation",
+        file_id: citation.fileId,
+        filename: citation.filename,
+        index: citation.index,
+      };
+    case "container_file_citation":
+      return {
+        type: "container_file_citation",
+        container_id: citation.containerId,
+        file_id: citation.fileId,
+        filename: citation.filename,
+        start_index: citation.startIndex,
+        end_index: citation.endIndex,
+      };
+  }
 }
 
-function annotationToCitation(annotation: ResponseOutputText.URLCitation): UrlCitation {
-  return {
-    type: "url_citation",
-    url: annotation.url,
-    title: annotation.title,
-    startIndex: annotation.start_index,
-    endIndex: annotation.end_index,
-  };
+/** Returns undefined for annotation types we do not capture (e.g. file_path). */
+function annotationToCitation(annotation: { type: string }): Citation | undefined {
+  switch (annotation.type) {
+    case "url_citation": {
+      const a = annotation as ResponseOutputText.URLCitation;
+      return {
+        type: "url_citation",
+        url: a.url,
+        title: a.title,
+        startIndex: a.start_index,
+        endIndex: a.end_index,
+      };
+    }
+    case "file_citation": {
+      const a = annotation as ResponseOutputText.FileCitation;
+      return {
+        type: "file_citation",
+        fileId: a.file_id,
+        filename: a.filename,
+        index: a.index,
+      };
+    }
+    case "container_file_citation": {
+      const a = annotation as ResponseOutputText.ContainerFileCitation;
+      return {
+        type: "container_file_citation",
+        containerId: a.container_id,
+        fileId: a.file_id,
+        filename: a.filename,
+        startIndex: a.start_index,
+        endIndex: a.end_index,
+      };
+    }
+    default:
+      return undefined;
+  }
 }
 
 export function convertNativeMessages(
@@ -461,6 +596,17 @@ export function convertNativeMessages(
 // Responses API stream -> pi-ai events
 // ---------------------------------------------------------------------------
 
+const HOSTED_CALL_ITEMS: Record<HostedToolCallItem["type"], HostedToolName> = {
+  web_search_call: "web_search",
+  file_search_call: "file_search",
+  code_interpreter_call: "code_interpreter",
+  image_generation_call: "image_generation",
+};
+
+function asHostedToolCallItem(item: { type: string }): HostedToolCallItem | undefined {
+  return item.type in HOSTED_CALL_ITEMS ? (item as HostedToolCallItem) : undefined;
+}
+
 async function processNativeStream(
   openaiStream: AsyncIterable<ResponseStreamEvent>,
   output: AssistantMessage,
@@ -494,18 +640,21 @@ async function processNativeStream(
         } as ToolCall;
         blocks.push(currentBlock);
         stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
-      } else if (item.type === "web_search_call") {
-        const webSearch = item as ResponseFunctionWebSearch;
-        currentBlock = {
-          type: "hostedToolCall",
-          id: webSearch.id,
-          toolName: "web_search",
-          status: webSearch.status,
-          raw: webSearch,
-        };
-        blocks.push(currentBlock);
-        // No pi-ai event type models hosted tool calls; the block is visible
-        // on `partial` in subsequent events and on the final message.
+      } else {
+        const hosted = asHostedToolCallItem(item);
+        if (hosted) {
+          currentBlock = {
+            type: "hostedToolCall",
+            id: hosted.id,
+            toolName: HOSTED_CALL_ITEMS[hosted.type],
+            status: hosted.status,
+            raw: hosted,
+          };
+          blocks.push(currentBlock);
+          // No pi-ai event type models hosted tool calls; the block is
+          // visible on `partial` in subsequent events and on the final
+          // message.
+        }
       }
     } else if (event.type === "response.output_text.delta") {
       if (currentBlock?.type === "text") {
@@ -529,13 +678,11 @@ async function processNativeStream(
       }
     } else if (event.type === "response.output_text.annotation.added") {
       if (currentBlock?.type === "text") {
-        const annotation = event.annotation as { type?: string };
-        if (annotation?.type === "url_citation") {
+        const citation = annotationToCitation(event.annotation as { type: string });
+        if (citation) {
           const textBlock = currentBlock as HostedTextContent;
           textBlock.citations = textBlock.citations ?? [];
-          textBlock.citations.push(
-            annotationToCitation(annotation as ResponseOutputText.URLCitation),
-          );
+          textBlock.citations.push(citation);
         }
       }
     } else if (
@@ -598,11 +745,7 @@ async function processNativeStream(
         );
         // The completed item carries the authoritative annotation list.
         const finalCitations = item.content.flatMap((c) =>
-          c.type === "output_text"
-            ? c.annotations
-                .filter((a): a is ResponseOutputText.URLCitation => a.type === "url_citation")
-                .map(annotationToCitation)
-            : [],
+          c.type === "output_text" ? c.annotations.flatMap((a) => annotationToCitation(a) ?? []) : [],
         );
         if (finalCitations.length > 0 || (textBlock.citations?.length ?? 0) > 0) {
           textBlock.citations = finalCitations;
@@ -625,24 +768,26 @@ async function processNativeStream(
           partial: output,
         });
         currentBlock = null;
-      } else if (item.type === "web_search_call") {
-        const webSearch = item as ResponseFunctionWebSearch;
-        const block = blocks.find(
-          (b): b is HostedToolCallContent => isHostedToolCall(b) && b.id === webSearch.id,
-        );
-        if (block) {
-          block.status = webSearch.status;
-          block.raw = webSearch;
-        } else {
-          blocks.push({
-            type: "hostedToolCall",
-            id: webSearch.id,
-            toolName: "web_search",
-            status: webSearch.status,
-            raw: webSearch,
-          });
+      } else {
+        const hosted = asHostedToolCallItem(item);
+        if (hosted) {
+          const block = blocks.find(
+            (b): b is HostedToolCallContent => isHostedToolCall(b) && b.id === hosted.id,
+          );
+          if (block) {
+            block.status = hosted.status;
+            block.raw = hosted;
+          } else {
+            blocks.push({
+              type: "hostedToolCall",
+              id: hosted.id,
+              toolName: HOSTED_CALL_ITEMS[hosted.type],
+              status: hosted.status,
+              raw: hosted,
+            });
+          }
+          currentBlock = null;
         }
-        currentBlock = null;
       }
     } else if (event.type === "response.completed") {
       const response = event.response;

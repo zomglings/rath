@@ -48,7 +48,7 @@ function describeMessage(message: AssistantMessage): string {
   return contentBlocks(message)
     .map((block) => {
       if (isHostedToolCall(block)) {
-        return `hostedToolCall(${block.raw.action.type}, ${block.status})`;
+        return `hostedToolCall(${block.toolName}, ${block.status})`;
       }
       if (block.type === "text") {
         return `text(${block.text.length} chars, ${getCitations(block).length} citations)`;
@@ -94,7 +94,7 @@ async function main(): Promise<void> {
     .flatMap((b) => getCitations(b));
   assert.ok(citations1.length > 0, "turn 1 text must carry at least one citation");
   for (const citation of citations1) {
-    assert.equal(citation.type, "url_citation");
+    assert.ok(citation.type === "url_citation", "web search must produce url_citations");
     assert.ok(citation.url.startsWith("http"), `citation has a URL (got: ${citation.url})`);
     assert.equal(typeof citation.title, "string", "citation has a title");
     assert.ok(

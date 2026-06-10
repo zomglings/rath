@@ -4,13 +4,22 @@ This is my harness. There are many like it, but this one is mine.
 ## openai-native provider
 
 `@zomglings/rath` registers a custom [pi-ai](https://github.com/badlogic/pi-mono) API
-provider, `openai-native`, that adds OpenAI's native (server-side) web search to
-pi-ai without forking it. It is built on the official `openai` SDK (Responses API).
+provider, `openai-native`, that adds OpenAI's native (server-side, "hosted")
+tools to pi-ai without forking it. It is built on the official `openai` SDK
+(Responses API).
 
-- `url_citation` annotations are captured as structured `citations` on text
-  blocks (URL, title, text span).
-- Raw `web_search_call` output items ride along as `hostedToolCall` blocks and
-  are replayed verbatim to the API on later turns.
+Supported hosted tools: web search (on by default), file search, code
+interpreter, and image generation (opt-in via stream options). The full
+enumeration of hosted tools lives in OpenAI's built-in tools documentation
+(https://platform.openai.com/docs/guides/tools); our support is not meant to
+be comprehensive — e.g. remote MCP is not supported.
+
+- Citation annotations (`url_citation`, `file_citation`,
+  `container_file_citation`) are captured as structured `citations` on text
+  blocks.
+- Raw hosted tool call output items (`web_search_call`,
+  `code_interpreter_call`, ...) ride along as `hostedToolCall` blocks and are
+  replayed verbatim to the API on later turns.
 - Contexts survive JSON serialize/deserialize with citations intact.
 
 ```ts
