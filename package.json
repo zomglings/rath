@@ -1,6 +1,6 @@
 {
   "name": "@zomglings/rath",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publishConfig": {
     "access": "public"
   },
@@ -35,11 +35,12 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
-    "@earendil-works/pi-agent-core": "^0.74.2",
+    "@earendil-works/pi-coding-agent": "^0.74.2",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.74.2",
     "@earendil-works/pi-ai": "^0.74.2",
     "openai": "^6.42.0"
   }

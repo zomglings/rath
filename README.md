@@ -73,11 +73,37 @@ The `rath` CLI exists for people developing or using rath to:
    harness while it works.
 
 ```
+rath run                  # generic agent loop, interactive
+rath run -p <prompt>      # one prompt, then exit
 rath test                 # run all integration tests
 rath test -n <name>       # run specific tests (repeatable; --name)
 rath test --list          # list available tests
 rath <command> -h         # help for any (sub)command
 ```
+
+### rath run
+
+`rath run` starts a generic agent loop with nothing implicit: no skill
+discovery, no context-file walking (AGENTS.md is never read), no tools unless
+explicitly enabled with `--tools`. The model sees exactly what the flags
+specify; the provider API key is the only input taken from the environment.
+rath development itself is meant to happen inside `rath run`.
+
+- Models are explicit: `-m <provider>/<model-id>` (default
+  `openai-native/gpt-5-mini`; any registered pi-ai provider works).
+- Hosted web search is on by default with openai-native (`--no-web-search`
+  disables it). After each reply, citations are rendered into a `Sources:`
+  text block appended to the assistant message, marked
+  `renderedCitations: true`: it persists in saved contexts and flattens for
+  free when the context is handed to a provider that does not understand
+  citations, and it is stripped before replay to openai-native, which
+  reconstructs the real annotations itself.
+- `--tools read,bash,edit,write,grep,find,ls` enables client-side tools,
+  loaded on demand from `@earendil-works/pi-coding-agent` (a dev dependency;
+  install it where you use `--tools`). They run with your privileges in the
+  current directory.
+- `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
+  from one.
 
 ## Integration tests
 
