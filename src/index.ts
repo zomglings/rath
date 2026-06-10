@@ -1,16 +1,16 @@
 export {
-  OPENAI_HOSTED_API,
+  OPENAI_NATIVE_API,
   contentBlocks,
-  convertHostedMessages,
+  convertNativeMessages,
   getCitations,
   getHostedToolCalls,
   isHostedToolCall,
-  openaiHostedModel,
-  registerOpenAIHosted,
-  streamOpenAIHosted,
+  openaiNativeModel,
+  registerOpenAINative,
+  streamOpenAINative,
   type HostedContentBlock,
   type HostedTextContent,
   type HostedToolCallContent,
-  type OpenAIHostedOptions,
+  type OpenAINativeOptions,
   type UrlCitation,
-} from "./providers/openai-hosted.js";
+} from "./providers/openai-native.js";

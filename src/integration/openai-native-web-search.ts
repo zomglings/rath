@@ -1,8 +1,8 @@
 /**
- * Acceptance spike for the openai-hosted provider (issue #5).
+ * Acceptance spike for the openai-native provider (issue #5).
  *
  * Runs a 3-turn conversation through pi-ai's stream() with the
- * "openai-hosted" provider and asserts:
+ * "openai-native" provider and asserts:
  *  1. Turn 1 triggers a hosted web search and the assistant message carries
  *     structured citations (URL, title, text span).
  *  2. Turn 2 references turn 1's results; raw hosted-tool items are replayed
@@ -20,9 +20,9 @@ import {
   getCitations,
   getHostedToolCalls,
   isHostedToolCall,
-  openaiHostedModel,
-  registerOpenAIHosted,
-  type OpenAIHostedOptions,
+  openaiNativeModel,
+  registerOpenAINative,
+  type OpenAINativeOptions,
 } from "../index.js";
 
 const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
@@ -33,9 +33,9 @@ function log(message: string): void {
 
 async function runTurn(
   context: Context,
-  options?: OpenAIHostedOptions,
+  options?: OpenAINativeOptions,
 ): Promise<AssistantMessage> {
-  const model = openaiHostedModel(MODEL_ID);
+  const model = openaiNativeModel(MODEL_ID);
   const events = stream(model, context, { reasoningEffort: "low", ...options });
   const message = await events.result();
   if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY is not set");
   }
-  registerOpenAIHosted();
+  registerOpenAINative();
 
   const context: Context = {
     systemPrompt:

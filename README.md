@@ -1,10 +1,10 @@
 # rath
 This is my harness. There are many like it, but this one is mine.
 
-## openai-hosted provider
+## openai-native provider
 
 `@zomglings/rath` registers a custom [pi-ai](https://github.com/badlogic/pi-mono) API
-provider, `openai-hosted`, that adds OpenAI's native (server-side) web search to
+provider, `openai-native`, that adds OpenAI's native (server-side) web search to
 pi-ai without forking it. It is built on the official `openai` SDK (Responses API).
 
 - `url_citation` annotations are captured as structured `citations` on text
@@ -18,13 +18,13 @@ import { stream } from "@earendil-works/pi-ai";
 import {
   getCitations,
   getHostedToolCalls,
-  openaiHostedModel,
-  registerOpenAIHosted,
+  openaiNativeModel,
+  registerOpenAINative,
 } from "@zomglings/rath";
 
-registerOpenAIHosted();
+registerOpenAINative();
 
-const model = openaiHostedModel("gpt-5-mini");
+const model = openaiNativeModel("gpt-5-mini");
 const context = {
   messages: [
     {
@@ -44,7 +44,7 @@ console.log(getHostedToolCalls(message));
 ```
 
 Contexts containing `hostedToolCall` blocks or citations are only understood by
-the `openai-hosted` provider; flatten them before handing a context to a stock
+the `openai-native` provider; flatten them before handing a context to a stock
 pi-ai provider (not yet implemented).
 
 ## CLI

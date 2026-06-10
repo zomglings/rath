@@ -1,5 +1,5 @@
 /**
- * "openai-hosted": a pi-ai API provider for the OpenAI Responses API with
+ * "openai-native": a pi-ai API provider for the OpenAI Responses API with
  * native (server-side) web search.
  *
  * pi-ai's stock "openai-responses" provider discards `url_citation`
@@ -49,7 +49,7 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 
-export const OPENAI_HOSTED_API = "openai-hosted";
+export const OPENAI_NATIVE_API = "openai-native";
 
 /** Structured citation extracted from a `url_citation` annotation. */
 export interface UrlCitation {
@@ -71,7 +71,7 @@ export interface HostedTextContent extends TextContent {
  * A server-side tool call (e.g. web search) executed by OpenAI. `raw` is the
  * verbatim Responses API output item; it is replayed to the API on later
  * turns. This block type is not part of pi-ai's content union: only
- * openai-hosted (and rath code) understands it.
+ * openai-native (and rath code) understands it.
  */
 export interface HostedToolCallContent {
   type: "hostedToolCall";
@@ -90,7 +90,7 @@ export function isHostedToolCall(block: { type: string }): block is HostedToolCa
 /**
  * View an assistant message's content as the extended block union. pi-ai
  * types content as (TextContent | ThinkingContent | ToolCall)[]; messages
- * produced by openai-hosted additionally carry HostedToolCallContent blocks.
+ * produced by openai-native additionally carry HostedToolCallContent blocks.
  */
 export function contentBlocks(message: AssistantMessage): HostedContentBlock[] {
   return message.content as unknown as HostedContentBlock[];
@@ -106,7 +106,7 @@ export function getCitations(block: TextContent): UrlCitation[] {
   return (block as HostedTextContent).citations ?? [];
 }
 
-export interface OpenAIHostedOptions extends StreamOptions {
+export interface OpenAINativeOptions extends StreamOptions {
   reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   reasoningSummary?: "auto" | "detailed" | "concise" | null;
   /**
@@ -122,15 +122,15 @@ export interface OpenAIHostedOptions extends StreamOptions {
 // ---------------------------------------------------------------------------
 
 /**
- * Clone a stock OpenAI model entry, re-pointing it at the openai-hosted
+ * Clone a stock OpenAI model entry, re-pointing it at the openai-native
  * provider. Pass any model id from pi-ai's `openai` registry.
  */
-export function openaiHostedModel(modelId: string): Model<typeof OPENAI_HOSTED_API> {
+export function openaiNativeModel(modelId: string): Model<typeof OPENAI_NATIVE_API> {
   const base = getModel("openai" as KnownProvider, modelId as never) as Model<string>;
   if (!base) {
     throw new Error(`Unknown OpenAI model: ${modelId}`);
   }
-  return { ...base, api: OPENAI_HOSTED_API } as Model<typeof OPENAI_HOSTED_API>;
+  return { ...base, api: OPENAI_NATIVE_API } as Model<typeof OPENAI_NATIVE_API>;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,16 +139,16 @@ export function openaiHostedModel(modelId: string): Model<typeof OPENAI_HOSTED_A
 
 let registered = false;
 
-/** Register the openai-hosted provider with pi-ai. Idempotent. */
-export function registerOpenAIHosted(): void {
+/** Register the openai-native provider with pi-ai. Idempotent. */
+export function registerOpenAINative(): void {
   if (registered) {
     return;
   }
   registerApiProvider({
-    api: OPENAI_HOSTED_API,
-    stream: streamOpenAIHosted,
+    api: OPENAI_NATIVE_API,
+    stream: streamOpenAINative,
     streamSimple: (model, context, options) =>
-      streamOpenAIHosted(model, context, {
+      streamOpenAINative(model, context, {
         ...options,
         reasoningEffort: options?.reasoning,
       }),
@@ -160,7 +160,7 @@ export function registerOpenAIHosted(): void {
 // Provider stream function
 // ---------------------------------------------------------------------------
 
-export const streamOpenAIHosted: StreamFunction<typeof OPENAI_HOSTED_API, OpenAIHostedOptions> = (
+export const streamOpenAINative: StreamFunction<typeof OPENAI_NATIVE_API, OpenAINativeOptions> = (
   model,
   context,
   options,
@@ -217,7 +217,7 @@ export const streamOpenAIHosted: StreamFunction<typeof OPENAI_HOSTED_API, OpenAI
         model,
       );
       stream.push({ type: "start", partial: output });
-      await processHostedStream(openaiStream, output, stream, model);
+      await processNativeStream(openaiStream, output, stream, model);
       if (options?.signal?.aborted) {
         throw new Error("Request was aborted");
       }
@@ -245,13 +245,13 @@ export const streamOpenAIHosted: StreamFunction<typeof OPENAI_HOSTED_API, OpenAI
 // ---------------------------------------------------------------------------
 
 function buildParams(
-  model: Model<typeof OPENAI_HOSTED_API>,
+  model: Model<typeof OPENAI_NATIVE_API>,
   context: Context,
-  options?: OpenAIHostedOptions,
+  options?: OpenAINativeOptions,
 ): ResponseCreateParamsStreaming {
   const params: ResponseCreateParamsStreaming = {
     model: model.id,
-    input: convertHostedMessages(model, context),
+    input: convertNativeMessages(model, context),
     stream: true,
     store: false,
     include: ["web_search_call.action.sources"],
@@ -351,8 +351,8 @@ function annotationToCitation(annotation: ResponseOutputText.URLCitation): UrlCi
   };
 }
 
-export function convertHostedMessages(
-  model: Model<typeof OPENAI_HOSTED_API>,
+export function convertNativeMessages(
+  model: Model<typeof OPENAI_NATIVE_API>,
   context: Context,
 ): ResponseInput {
   const items: ResponseInputItem[] = [];
@@ -382,7 +382,7 @@ export function convertHostedMessages(
         }
       }
     } else if (msg.role === "assistant") {
-      const native = msg.api === OPENAI_HOSTED_API && msg.provider === model.provider;
+      const native = msg.api === OPENAI_NATIVE_API && msg.provider === model.provider;
       for (const block of msg.content as HostedContentBlock[]) {
         if (block.type === "thinking") {
           if (native && block.thinkingSignature) {
@@ -461,11 +461,11 @@ export function convertHostedMessages(
 // Responses API stream -> pi-ai events
 // ---------------------------------------------------------------------------
 
-async function processHostedStream(
+async function processNativeStream(
   openaiStream: AsyncIterable<ResponseStreamEvent>,
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
-  model: Model<typeof OPENAI_HOSTED_API>,
+  model: Model<typeof OPENAI_NATIVE_API>,
 ): Promise<void> {
   const blocks = output.content as HostedContentBlock[];
   let currentBlock: HostedContentBlock | null = null;
