@@ -12,7 +12,6 @@ NEVER rebase. Use merge commits to integrate changes.
 Before committing, run all checks:
 ```
 npm run check
-npm run lint
-npm test
+npm run build
 ```
-(Tooling is not yet configured — update this block as scripts land, and keep it current.)
+(Lint and test scripts are not yet configured — update this block as scripts land, and keep it current.)
