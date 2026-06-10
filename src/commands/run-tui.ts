@@ -4,12 +4,22 @@
  * differential rendering, an editor input, and Ctrl+C interrupting the
  * current turn instead of killing the session.
  *
- * Messages stream as plain text and are re-rendered on completion: markdown
- * for assistant prose, colored markers for tool and hosted-tool calls, and
- * OSC 8 hyperlinks for citations.
+ * Rendering reuses Pi's own interactive components from
+ * @earendil-works/pi-coding-agent (AssistantMessageComponent,
+ * UserMessageComponent, ToolExecutionComponent, and the Pi theme), so the
+ * TUI looks like vanilla Pi. rath adds what those components do not know
+ * about: hosted-tool markers and clickable citation sources.
  */
 import type { Agent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import {
+  AssistantMessageComponent,
+  getMarkdownTheme,
+  getSelectListTheme,
+  initTheme,
+  ToolExecutionComponent,
+  UserMessageComponent,
+} from "@earendil-works/pi-coding-agent";
 import {
   type Component,
   Container,
@@ -17,13 +27,10 @@ import {
   type EditorTheme,
   hyperlink,
   Loader,
-  Markdown,
-  type MarkdownTheme,
   matchesKey,
   ProcessTerminal,
   type SelectItem,
   SelectList,
-  type SelectListTheme,
   Text,
   TUI,
 } from "@earendil-works/pi-tui";
@@ -36,7 +43,7 @@ import {
   REASONING_LEVELS,
   type RunFlags,
   sessionInfo,
-} from "./run-shared.js";
+} from "./run.js";
 
 // Styles do not carry across TUI lines; every style helper applies per line.
 function styled(open: string): (text: string) => string {
@@ -47,74 +54,12 @@ function styled(open: string): (text: string) => string {
       .join("\n");
 }
 
-const identity = (s: string) => s;
 const dim = styled("\x1b[2m");
-const bold = styled("\x1b[1m");
-const italic = styled("\x1b[3m");
-const underline = styled("\x1b[4m");
-const strikethrough = styled("\x1b[9m");
-const inverse = styled("\x1b[7m");
 const cyan = styled("\x1b[36m");
 const yellow = styled("\x1b[33m");
 const red = styled("\x1b[31m");
-const blueUnderline = styled("\x1b[34m\x1b[4m");
-const boldCyan = styled("\x1b[1m\x1b[36m");
-
-const selectTheme: SelectListTheme = {
-  selectedPrefix: identity,
-  selectedText: inverse,
-  description: dim,
-  scrollInfo: dim,
-  noMatch: dim,
-};
-
-const editorTheme: EditorTheme = {
-  borderColor: dim,
-  selectList: selectTheme,
-};
-
-const markdownTheme: MarkdownTheme = {
-  heading: boldCyan,
-  link: blueUnderline,
-  linkUrl: dim,
-  code: yellow,
-  codeBlock: identity,
-  codeBlockBorder: dim,
-  quote: italic,
-  quoteBorder: dim,
-  hr: dim,
-  listBullet: cyan,
-  bold,
-  italic,
-  strikethrough,
-  underline,
-};
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-function truncateArgs(args: unknown): string {
-  const text = JSON.stringify(args);
-  return text.length > 120 ? `${text.slice(0, 120)}…` : text;
-}
-
-/** Plain-text rendering used while a message is streaming. */
-function renderStreaming(message: AssistantMessage): string {
-  const parts: string[] = [];
-  for (const block of contentBlocks(message)) {
-    if (block.type === "thinking") {
-      if (block.thinking.trim().length > 0) {
-        parts.push(dim(block.thinking));
-      }
-    } else if (isHostedToolCall(block)) {
-      parts.push(yellow(`[${block.toolName}]`));
-    } else if (block.type === "toolCall") {
-      parts.push(yellow(`[${block.name}: ${truncateArgs(block.arguments)}]`));
-    } else if (block.type === "text") {
-      parts.push(isRenderedCitations(block) ? dim(block.text) : block.text);
-    }
-  }
-  return parts.join("\n");
-}
 
 /** Clickable sources list rebuilt from the message's citations. */
 function sourcesComponent(message: AssistantMessage): Text | undefined {
@@ -137,33 +82,19 @@ function sourcesComponent(message: AssistantMessage): Text | undefined {
   return new Text(`${dim("sources:")}\n${lines.join("\n")}`);
 }
 
-/** Pretty rendering for a completed assistant message. */
-function prettyAssistant(message: AssistantMessage): Component {
-  const out = new Container();
-  for (const block of contentBlocks(message)) {
-    if (block.type === "thinking") {
-      if (block.thinking.trim().length > 0) {
-        out.addChild(new Text(dim(block.thinking)));
-      }
-    } else if (isHostedToolCall(block)) {
-      out.addChild(new Text(yellow(`[${block.toolName}]`)));
-    } else if (block.type === "toolCall") {
-      out.addChild(new Text(yellow(`[${block.name}: ${truncateArgs(block.arguments)}]`)));
-    } else if (block.type === "text") {
-      if (isRenderedCitations(block)) {
-        const sources = sourcesComponent(message);
-        if (sources) {
-          out.addChild(sources);
-        }
-      } else if (block.text.trim().length > 0) {
-        out.addChild(new Markdown(block.text, 0, 0, markdownTheme));
-      }
-    }
-  }
-  if (message.stopReason === "error" || message.stopReason === "aborted") {
-    out.addChild(new Text(red(`error: ${message.errorMessage ?? message.stopReason}`)));
-  }
-  return out;
+/**
+ * Display copy of an assistant message without the rendered-citations
+ * trailer: the trailer exists for persistence and provider handoff; the TUI
+ * shows clickable sources instead.
+ */
+function displayMessage(message: AssistantMessage): AssistantMessage {
+  return { ...message, content: message.content.filter((b) => !isRenderedCitations(b)) };
+}
+
+function hostedMarkers(message: AssistantMessage): Component[] {
+  return contentBlocks(message)
+    .filter(isHostedToolCall)
+    .map((block) => new Text(yellow(`[${block.toolName}]`)));
 }
 
 function messageText(content: string | { type: string; text?: string }[]): string {
@@ -176,15 +107,20 @@ function messageText(content: string | { type: string; text?: string }[]): strin
     .join("\n");
 }
 
-function userEcho(text: string): Text {
-  return new Text(`\n${cyan("›")} ${bold(text)}`);
-}
-
 export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     process.stderr.write("--tui requires an interactive terminal\n");
     return 1;
   }
+
+  // Pi's built-in dark theme, selected explicitly. Caveat: initTheme also
+  // registers (not applies) themes found in ~/.pi/agent/themes — the only
+  // implicit read in rath run, cosmetic-only, forced on us because
+  // pi-coding-agent does not export setThemeInstance/loadThemeFromPath.
+  initTheme("dark", false);
+  const markdownTheme = getMarkdownTheme();
+  const selectTheme = getSelectListTheme();
+  const editorTheme: EditorTheme = { borderColor: dim, selectList: selectTheme };
 
   const tui = new TUI(new ProcessTerminal());
   const transcript = new Container();
@@ -207,6 +143,19 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   tui.addChild(status);
   tui.addChild(editor);
   tui.setFocus(editor);
+
+  const addAssistant = (message: AssistantMessage) => {
+    transcript.addChild(
+      new AssistantMessageComponent(displayMessage(message), false, markdownTheme),
+    );
+    for (const marker of hostedMarkers(message)) {
+      transcript.addChild(marker);
+    }
+    const sources = sourcesComponent(message);
+    if (sources) {
+      transcript.addChild(sources);
+    }
+  };
 
   /** Overlay selector; Enter applies, Escape cancels. */
   const openSelector = (items: SelectItem[], onPick: (value: string) => void) => {
@@ -236,9 +185,8 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     const [command = "", ...rest] = input.split(/\s+/);
     const arg = rest.join(" ").trim();
     if (command === "/model" && arg.length === 0) {
-      const specs = listModels();
       openSelector(
-        specs.map((spec) => ({ value: spec, label: spec })),
+        listModels().map((spec) => ({ value: spec, label: spec })),
         (spec) => echoCommandResult(`/model ${spec}`),
       );
       return true;
@@ -267,9 +215,9 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   // Replay a loaded context into the transcript so the session is visible.
   for (const message of agent.state.messages) {
     if (message.role === "user") {
-      transcript.addChild(userEcho(messageText(message.content)));
+      transcript.addChild(new UserMessageComponent(messageText(message.content), markdownTheme));
     } else if (message.role === "assistant") {
-      transcript.addChild(prettyAssistant(message as AssistantMessage));
+      addAssistant(message as AssistantMessage);
     }
   }
 
@@ -278,7 +226,8 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     resolveDone = resolve;
   });
 
-  let current: Text | null = null;
+  let current: AssistantMessageComponent | null = null;
+  const toolComponents = new Map<string, ToolExecutionComponent>();
   agent.subscribe((event) => {
     if (event.type === "agent_start") {
       status.addChild(loader);
@@ -286,16 +235,19 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     } else if (event.type === "agent_end") {
       loader.stop();
       status.clear();
+      toolComponents.clear();
     } else if (event.type === "message_start") {
       if (event.message.role === "user") {
-        transcript.addChild(userEcho(messageText(event.message.content)));
+        transcript.addChild(
+          new UserMessageComponent(messageText(event.message.content), markdownTheme),
+        );
       } else if (event.message.role === "assistant") {
-        current = new Text("");
+        current = new AssistantMessageComponent(undefined, false, markdownTheme);
         transcript.addChild(current);
       }
     } else if (event.type === "message_update") {
       if (event.message.role === "assistant") {
-        current?.setText(renderStreaming(event.message as AssistantMessage));
+        current?.updateContent(displayMessage(event.message as AssistantMessage));
       }
     } else if (event.type === "message_end") {
       if (event.message.role === "assistant") {
@@ -303,13 +255,46 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
         if (message.stopReason !== "error" && message.stopReason !== "aborted") {
           applyCitationTrailer(message);
         }
-        // Swap the streaming text for the pretty rendering.
         if (current) {
+          // Replace the streaming component with the full final rendering
+          // (markers and sources included).
           transcript.removeChild(current);
           current = null;
         }
-        transcript.addChild(prettyAssistant(message));
+        addAssistant(message);
       }
+    } else if (event.type === "tool_execution_start") {
+      const component = new ToolExecutionComponent(
+        event.toolName,
+        event.toolCallId,
+        event.args,
+        undefined,
+        undefined,
+        tui,
+        process.cwd(),
+      );
+      component.setArgsComplete();
+      component.markExecutionStarted();
+      toolComponents.set(event.toolCallId, component);
+      transcript.addChild(component);
+    } else if (event.type === "tool_execution_update") {
+      const component = toolComponents.get(event.toolCallId);
+      const partial = event.partialResult as
+        | { content?: { type: string }[]; details?: unknown }
+        | undefined;
+      if (component && partial?.content) {
+        component.updateResult(
+          { content: partial.content, details: partial.details, isError: false },
+          true,
+        );
+      }
+    } else if (event.type === "tool_execution_end") {
+      const component = toolComponents.get(event.toolCallId);
+      const result = event.result as { content?: { type: string }[]; details?: unknown };
+      component?.updateResult(
+        { content: result?.content ?? [], details: result?.details, isError: event.isError },
+        false,
+      );
     }
     tui.requestRender();
   });
@@ -320,7 +305,7 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       return;
     }
     if (trimmed.startsWith("/")) {
-      transcript.addChild(userEcho(trimmed));
+      transcript.addChild(new Text(`\n${cyan("›")} ${trimmed}`));
       if (!handleTuiCommand(trimmed)) {
         const result = handleSlashCommand(trimmed, agent, flags);
         if (result) {
