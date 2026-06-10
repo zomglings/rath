@@ -13,20 +13,15 @@
  * Requires OPENAI_API_KEY. Exits 0 on success, 1 on failure.
  */
 import assert from "node:assert/strict";
-import { agentLoop, type AgentContext, type AgentTool } from "@earendil-works/pi-agent-core";
-import {
-  streamSimple,
-  Type,
-  type Message,
-  type SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
+import { type AgentContext, type AgentTool, agentLoop } from "@earendil-works/pi-agent-core";
+import { type Message, type SimpleStreamOptions, streamSimple, Type } from "@earendil-works/pi-ai";
 import { getHostedToolCalls, openaiNativeModel, registerOpenAINative } from "../index.js";
 
 const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
 const CODEWORD = "PERIWINKLE-42";
 
 function log(message: string): void {
-  process.stdout.write(message + "\n");
+  process.stdout.write(`${message}\n`);
 }
 
 async function main(): Promise<void> {
@@ -128,11 +123,13 @@ async function main(): Promise<void> {
   }
 
   // 3. The final answer uses the tool result.
-  const finalText = assistants[assistants.length - 1]!.content
-    .filter((b) => b.type === "text")
+  const finalText = assistants[assistants.length - 1]!.content.filter((b) => b.type === "text")
     .map((b) => b.text)
     .join("\n");
-  assert.ok(finalText.includes(CODEWORD), `final reply must contain ${CODEWORD} (got: ${finalText})`);
+  assert.ok(
+    finalText.includes(CODEWORD),
+    `final reply must contain ${CODEWORD} (got: ${finalText})`,
+  );
 
   const totalCost = assistants.reduce((sum, m) => sum + m.usage.cost.total, 0);
   log(`All assertions passed. Total token cost: $${totalCost.toFixed(4)}`);

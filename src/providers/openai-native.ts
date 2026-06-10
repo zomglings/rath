@@ -19,9 +19,30 @@
  * contain extended blocks must be flattened before being sent to a stock
  * provider (not implemented here; see issue #5 "out of scope").
  */
+
+import {
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Context,
+  calculateCost,
+  createAssistantMessageEventStream,
+  getEnvApiKey,
+  getModel,
+  type KnownProvider,
+  type Model,
+  parseStreamingJson,
+  registerApiProvider,
+  type StopReason,
+  type StreamFunction,
+  type StreamOptions,
+  type TextContent,
+  type ThinkingContent,
+  type ToolCall,
+} from "@earendil-works/pi-ai";
 import OpenAI from "openai";
 import type {
   FileSearchTool,
+  Tool as OpenAITool,
   ResponseCodeInterpreterToolCall,
   ResponseCreateParamsStreaming,
   ResponseFileSearchToolCall,
@@ -33,28 +54,8 @@ import type {
   ResponseOutputText,
   ResponseReasoningItem,
   ResponseStreamEvent,
-  Tool as OpenAITool,
   WebSearchTool,
 } from "openai/resources/responses/responses.js";
-import {
-  calculateCost,
-  createAssistantMessageEventStream,
-  getEnvApiKey,
-  getModel,
-  parseStreamingJson,
-  registerApiProvider,
-  type AssistantMessage,
-  type AssistantMessageEventStream,
-  type Context,
-  type KnownProvider,
-  type Model,
-  type StopReason,
-  type StreamFunction,
-  type StreamOptions,
-  type TextContent,
-  type ThinkingContent,
-  type ToolCall,
-} from "@earendil-works/pi-ai";
 
 export const OPENAI_NATIVE_API = "openai-native";
 
@@ -249,9 +250,7 @@ export const streamOpenAINative: StreamFunction<typeof OPENAI_NATIVE_API, OpenAI
     try {
       const apiKey = options?.apiKey || getEnvApiKey(model.provider) || process.env.OPENAI_API_KEY;
       if (!apiKey) {
-        throw new Error(
-          "OpenAI API key is required. Set OPENAI_API_KEY or pass options.apiKey.",
-        );
+        throw new Error("OpenAI API key is required. Set OPENAI_API_KEY or pass options.apiKey.");
       }
       const headers: Record<string, string> = { ...model.headers };
       if (options?.sessionId) {
@@ -377,8 +376,9 @@ function buildParams(
       params.include!.push("reasoning.encrypted_content");
     } else if (model.thinkingLevelMap?.off !== null) {
       params.reasoning = {
-        effort: (model.thinkingLevelMap?.off ??
-          "none") as NonNullable<ResponseCreateParamsStreaming["reasoning"]>["effort"],
+        effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<
+          ResponseCreateParamsStreaming["reasoning"]
+        >["effort"],
       };
     }
   }
@@ -739,13 +739,12 @@ async function processNativeStream(
         textBlock.text = item.content
           .map((c) => (c.type === "output_text" ? c.text : c.type === "refusal" ? c.refusal : ""))
           .join("");
-        textBlock.textSignature = encodeTextSignature(
-          item.id,
-          (item as { phase?: string }).phase,
-        );
+        textBlock.textSignature = encodeTextSignature(item.id, (item as { phase?: string }).phase);
         // The completed item carries the authoritative annotation list.
         const finalCitations = item.content.flatMap((c) =>
-          c.type === "output_text" ? c.annotations.flatMap((a) => annotationToCitation(a) ?? []) : [],
+          c.type === "output_text"
+            ? c.annotations.flatMap((a) => annotationToCitation(a) ?? [])
+            : [],
         );
         if (finalCitations.length > 0 || (textBlock.citations?.length ?? 0) > 0) {
           textBlock.citations = finalCitations;
@@ -807,10 +806,7 @@ async function processNativeStream(
       }
       calculateCost(model, output.usage);
       output.stopReason = mapStopReason(response?.status);
-      if (
-        output.stopReason === "stop" &&
-        output.content.some((b) => b.type === "toolCall")
-      ) {
+      if (output.stopReason === "stop" && output.content.some((b) => b.type === "toolCall")) {
         output.stopReason = "toolUse";
       }
     } else if (event.type === "error") {

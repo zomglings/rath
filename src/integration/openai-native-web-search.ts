@@ -14,27 +14,24 @@
  * Requires OPENAI_API_KEY. Exits 0 on success, 1 on failure.
  */
 import assert from "node:assert/strict";
-import { stream, type Context, type AssistantMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Context, stream } from "@earendil-works/pi-ai";
 import {
   contentBlocks,
   getCitations,
   getHostedToolCalls,
   isHostedToolCall,
+  type OpenAINativeOptions,
   openaiNativeModel,
   registerOpenAINative,
-  type OpenAINativeOptions,
 } from "../index.js";
 
 const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
 
 function log(message: string): void {
-  process.stdout.write(message + "\n");
+  process.stdout.write(`${message}\n`);
 }
 
-async function runTurn(
-  context: Context,
-  options?: OpenAINativeOptions,
-): Promise<AssistantMessage> {
+async function runTurn(context: Context, options?: OpenAINativeOptions): Promise<AssistantMessage> {
   const model = openaiNativeModel(MODEL_ID);
   const events = stream(model, context, { reasoningEffort: "low", ...options });
   const message = await events.result();
@@ -89,9 +86,7 @@ async function main(): Promise<void> {
     assert.equal(search.status, "completed", "web search call must complete");
   }
 
-  const citations1 = turn1.content
-    .filter((b) => b.type === "text")
-    .flatMap((b) => getCitations(b));
+  const citations1 = turn1.content.filter((b) => b.type === "text").flatMap((b) => getCitations(b));
   assert.ok(citations1.length > 0, "turn 1 text must carry at least one citation");
   for (const citation of citations1) {
     assert.ok(citation.type === "url_citation", "web search must produce url_citations");

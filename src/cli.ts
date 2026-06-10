@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { runSubcommands, type Command } from "./command.js";
+import { type Command, runSubcommands } from "./command.js";
 import { testCommand } from "./commands/test.js";
 
 const root: Command = {

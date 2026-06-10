@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fullName, helpRequested, helpText, type Command } from "../command.js";
+import { type Command, fullName, helpRequested, helpText } from "../command.js";
 
 interface IntegrationTest {
   name: string;
@@ -67,7 +67,7 @@ export const testCommand: Command = {
   ],
   async run(prefix, argv) {
     if (helpRequested(argv)) {
-      process.stdout.write(helpText(this, prefix) + "\n");
+      process.stdout.write(`${helpText(this, prefix)}\n`);
       return 0;
     }
     const names: string[] = [];
@@ -94,7 +94,7 @@ export const testCommand: Command = {
     const all = discoverTests();
     if (list) {
       for (const test of all) {
-        process.stdout.write(test.name + "\n");
+        process.stdout.write(`${test.name}\n`);
       }
       return 0;
     }
@@ -118,7 +118,9 @@ export const testCommand: Command = {
       process.stdout.write(`=== ${test.name} ===\n`);
       const code = await runTest(test);
       results.push({ name: test.name, code });
-      process.stdout.write(`=== ${test.name}: ${code === 0 ? "PASS" : `FAIL (exit ${code})`} ===\n`);
+      process.stdout.write(
+        `=== ${test.name}: ${code === 0 ? "PASS" : `FAIL (exit ${code})`} ===\n`,
+      );
     }
     const failed = results.filter((r) => r.code !== 0);
     process.stdout.write(

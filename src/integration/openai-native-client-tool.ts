@@ -12,18 +12,18 @@
  * Requires OPENAI_API_KEY. Exits 0 on success, 1 on failure.
  */
 import assert from "node:assert/strict";
-import { stream, Type, type AssistantMessage, type Context } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Context, stream, Type } from "@earendil-works/pi-ai";
 import {
   getHostedToolCalls,
+  type OpenAINativeOptions,
   openaiNativeModel,
   registerOpenAINative,
-  type OpenAINativeOptions,
 } from "../index.js";
 
 const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
 
 function log(message: string): void {
-  process.stdout.write(message + "\n");
+  process.stdout.write(`${message}\n`);
 }
 
 async function runTurn(context: Context, options?: OpenAINativeOptions): Promise<AssistantMessage> {
@@ -91,7 +91,9 @@ async function main(): Promise<void> {
     !("partialJson" in toolCall),
     "the streaming scratch buffer must not survive on the final block",
   );
-  log(`Turn 1 OK: toolCall parsed (name=print, message=${JSON.stringify(toolCall.arguments.message)})`);
+  log(
+    `Turn 1 OK: toolCall parsed (name=print, message=${JSON.stringify(toolCall.arguments.message)})`,
+  );
 
   // ---- Execute the tool client-side ----
   log(`[print tool] ${toolCall.arguments.message}`);

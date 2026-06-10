@@ -119,14 +119,14 @@ export const runSubcommands: Command["run"] = function (prefix, argv) {
     }
   }
   if (helpRequested(argv)) {
-    process.stdout.write(helpText(this, prefix) + "\n");
+    process.stdout.write(`${helpText(this, prefix)}\n`);
     return 0;
   }
   if (firstArg >= 0) {
     process.stderr.write(`Unknown command: ${fullName(this, prefix)} ${argv[firstArg]}\n\n`);
-    process.stderr.write(helpText(this, prefix) + "\n");
+    process.stderr.write(`${helpText(this, prefix)}\n`);
     return 1;
   }
-  process.stdout.write(helpText(this, prefix) + "\n");
+  process.stdout.write(`${helpText(this, prefix)}\n`);
   return 0;
 };

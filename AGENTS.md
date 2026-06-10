@@ -14,7 +14,8 @@ Before committing, run all checks:
 npm run check
 npm run build
 ```
-(Lint is not yet configured — update this block as scripts land, and keep it current.)
+`npm run check` runs tsc and Biome (lint + format check); `npm run fix` applies
+Biome fixes. (Keep this block current as scripts change.)
 
 Integration tests run via `node dist/cli.js test` (or `rath test`). They call
 live APIs, cost money, and require OPENAI_API_KEY, so they are not part of the

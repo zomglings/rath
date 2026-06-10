@@ -10,19 +10,19 @@
  * Requires OPENAI_API_KEY. Exits 0 on success, 1 on failure.
  */
 import assert from "node:assert/strict";
-import { stream, type AssistantMessage, type Context } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Context, stream } from "@earendil-works/pi-ai";
 import {
   getHostedToolCalls,
+  type OpenAINativeOptions,
   openaiNativeModel,
   registerOpenAINative,
-  type OpenAINativeOptions,
 } from "../index.js";
 
 const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
 const FIB_100 = "354224848179261915075";
 
 function log(message: string): void {
-  process.stdout.write(message + "\n");
+  process.stdout.write(`${message}\n`);
 }
 
 async function runTurn(context: Context, options?: OpenAINativeOptions): Promise<AssistantMessage> {
