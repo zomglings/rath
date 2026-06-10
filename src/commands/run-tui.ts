@@ -3,14 +3,22 @@
  * plain REPL — same Agent, same slash commands, same citation merging — with
  * differential rendering, an editor input, and Ctrl+C interrupting the
  * current turn instead of killing the session.
+ *
+ * Messages stream as plain text and are re-rendered on completion: markdown
+ * for assistant prose, colored markers for tool and hosted-tool calls, and
+ * OSC 8 hyperlinks for citations.
  */
 import type { Agent } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
+  type Component,
   Container,
   Editor,
   type EditorTheme,
+  hyperlink,
   Loader,
+  Markdown,
+  type MarkdownTheme,
   matchesKey,
   ProcessTerminal,
   type SelectItem,
@@ -19,7 +27,7 @@ import {
   Text,
   TUI,
 } from "@earendil-works/pi-tui";
-import { contentBlocks, isHostedToolCall } from "../index.js";
+import { contentBlocks, getCitations, isHostedToolCall } from "../index.js";
 import {
   applyCitationTrailer,
   handleSlashCommand,
@@ -30,58 +38,132 @@ import {
   sessionInfo,
 } from "./run-shared.js";
 
-const DIM = "\x1b[2m";
-const RESET = "\x1b[0m";
-const INVERSE = "\x1b[7m";
-const UNINVERSE = "\x1b[27m";
-
-/** Styles do not carry across TUI lines; apply dim per line. */
-function dimLines(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => `${DIM}${line}${RESET}`)
-    .join("\n");
+// Styles do not carry across TUI lines; every style helper applies per line.
+function styled(open: string): (text: string) => string {
+  return (text: string) =>
+    text
+      .split("\n")
+      .map((line) => `${open}${line}\x1b[0m`)
+      .join("\n");
 }
 
 const identity = (s: string) => s;
-const dimColor = (s: string) => `${DIM}${s}${RESET}`;
-const inverse = (s: string) => `${INVERSE}${s}${UNINVERSE}`;
+const dim = styled("\x1b[2m");
+const bold = styled("\x1b[1m");
+const italic = styled("\x1b[3m");
+const underline = styled("\x1b[4m");
+const strikethrough = styled("\x1b[9m");
+const inverse = styled("\x1b[7m");
+const cyan = styled("\x1b[36m");
+const yellow = styled("\x1b[33m");
+const red = styled("\x1b[31m");
+const blueUnderline = styled("\x1b[34m\x1b[4m");
+const boldCyan = styled("\x1b[1m\x1b[36m");
 
 const selectTheme: SelectListTheme = {
   selectedPrefix: identity,
   selectedText: inverse,
-  description: dimColor,
-  scrollInfo: dimColor,
-  noMatch: dimColor,
+  description: dim,
+  scrollInfo: dim,
+  noMatch: dim,
 };
 
 const editorTheme: EditorTheme = {
-  borderColor: dimColor,
+  borderColor: dim,
   selectList: selectTheme,
 };
 
-function renderAssistant(message: AssistantMessage): string {
+const markdownTheme: MarkdownTheme = {
+  heading: boldCyan,
+  link: blueUnderline,
+  linkUrl: dim,
+  code: yellow,
+  codeBlock: identity,
+  codeBlockBorder: dim,
+  quote: italic,
+  quoteBorder: dim,
+  hr: dim,
+  listBullet: cyan,
+  bold,
+  italic,
+  strikethrough,
+  underline,
+};
+
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function truncateArgs(args: unknown): string {
+  const text = JSON.stringify(args);
+  return text.length > 120 ? `${text.slice(0, 120)}…` : text;
+}
+
+/** Plain-text rendering used while a message is streaming. */
+function renderStreaming(message: AssistantMessage): string {
   const parts: string[] = [];
   for (const block of contentBlocks(message)) {
     if (block.type === "thinking") {
       if (block.thinking.trim().length > 0) {
-        parts.push(dimLines(block.thinking));
+        parts.push(dim(block.thinking));
       }
     } else if (isHostedToolCall(block)) {
-      parts.push(dimLines(`[${block.toolName}]`));
+      parts.push(yellow(`[${block.toolName}]`));
     } else if (block.type === "toolCall") {
-      const args = JSON.stringify(block.arguments);
-      parts.push(
-        dimLines(`[${block.name}: ${args.length > 120 ? `${args.slice(0, 120)}…` : args}]`),
-      );
+      parts.push(yellow(`[${block.name}: ${truncateArgs(block.arguments)}]`));
     } else if (block.type === "text") {
-      parts.push(isRenderedCitations(block) ? dimLines(block.text) : block.text);
+      parts.push(isRenderedCitations(block) ? dim(block.text) : block.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** Clickable sources list rebuilt from the message's citations. */
+function sourcesComponent(message: AssistantMessage): Text | undefined {
+  const urls = new Map<string, string>();
+  for (const block of message.content) {
+    if (block.type === "text" && !isRenderedCitations(block)) {
+      for (const citation of getCitations(block)) {
+        if (citation.type === "url_citation" && !urls.has(citation.url)) {
+          urls.set(citation.url, citation.title);
+        }
+      }
+    }
+  }
+  if (urls.size === 0) {
+    return undefined;
+  }
+  const lines = [...urls].map(
+    ([url, title]) => `  ${hyperlink(title || url, url)}${title ? dim(` — ${url}`) : ""}`,
+  );
+  return new Text(`${dim("sources:")}\n${lines.join("\n")}`);
+}
+
+/** Pretty rendering for a completed assistant message. */
+function prettyAssistant(message: AssistantMessage): Component {
+  const out = new Container();
+  for (const block of contentBlocks(message)) {
+    if (block.type === "thinking") {
+      if (block.thinking.trim().length > 0) {
+        out.addChild(new Text(dim(block.thinking)));
+      }
+    } else if (isHostedToolCall(block)) {
+      out.addChild(new Text(yellow(`[${block.toolName}]`)));
+    } else if (block.type === "toolCall") {
+      out.addChild(new Text(yellow(`[${block.name}: ${truncateArgs(block.arguments)}]`)));
+    } else if (block.type === "text") {
+      if (isRenderedCitations(block)) {
+        const sources = sourcesComponent(message);
+        if (sources) {
+          out.addChild(sources);
+        }
+      } else if (block.text.trim().length > 0) {
+        out.addChild(new Markdown(block.text, 0, 0, markdownTheme));
+      }
     }
   }
   if (message.stopReason === "error" || message.stopReason === "aborted") {
-    parts.push(`error: ${message.errorMessage ?? message.stopReason}`);
+    out.addChild(new Text(red(`error: ${message.errorMessage ?? message.stopReason}`)));
   }
-  return parts.join("\n");
+  return out;
 }
 
 function messageText(content: string | { type: string; text?: string }[]): string {
@@ -94,6 +176,10 @@ function messageText(content: string | { type: string; text?: string }[]): strin
     .join("\n");
 }
 
+function userEcho(text: string): Text {
+  return new Text(`\n${cyan("›")} ${bold(text)}`);
+}
+
 export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     process.stderr.write("--tui requires an interactive terminal\n");
@@ -103,16 +189,16 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   const tui = new TUI(new ProcessTerminal());
   const transcript = new Container();
   const status = new Container();
-  const loader = new Loader(tui, dimColor, dimColor, "working");
+  const loader = new Loader(tui, cyan, dim, "thinking…", { frames: SPINNER, intervalMs: 80 });
   const editor = new Editor(tui, editorTheme);
 
   const banner = new Text("");
   const refreshBanner = () => {
     banner.setText(
-      dimLines(
-        `model: ${flags.model} | reasoning: ${agent.state.thinkingLevel} | ` +
-          "/info /model /lsmodels /reasoning /exit | Ctrl+C interrupts",
-      ),
+      `${cyan("rath")} ${dim(
+        `| ${flags.model} | reasoning: ${agent.state.thinkingLevel} | ` +
+          "/info /sys /model /lsmodels /reasoning /exit | Ctrl+C interrupts",
+      )}`,
     );
   };
   refreshBanner();
@@ -140,7 +226,7 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   const echoCommandResult = (input: string) => {
     const result = handleSlashCommand(input, agent, flags);
     if (result?.output) {
-      transcript.addChild(new Text(result.isError ? result.output : dimLines(result.output)));
+      transcript.addChild(new Text(result.isError ? red(result.output) : dim(result.output)));
     }
     refreshBanner();
   };
@@ -149,12 +235,8 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   const handleTuiCommand = (input: string): boolean => {
     const [command = "", ...rest] = input.split(/\s+/);
     const arg = rest.join(" ").trim();
-    if (command === "/lsmodels" || (command === "/model" && arg.length === 0)) {
-      const specs = listModels(arg.length > 0 ? arg : undefined);
-      if (specs.length === 0) {
-        transcript.addChild(new Text(dimLines(`no models matching "${arg}"`)));
-        return true;
-      }
+    if (command === "/model" && arg.length === 0) {
+      const specs = listModels();
       openSelector(
         specs.map((spec) => ({ value: spec, label: spec })),
         (spec) => echoCommandResult(`/model ${spec}`),
@@ -175,9 +257,7 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     if (command === "/info") {
       const pairs = sessionInfo(agent, flags);
       const width = Math.max(...pairs.map(([key]) => key.length));
-      const panel = pairs
-        .map(([key, value]) => `${dimColor(key.padEnd(width))}  ${value}`)
-        .join("\n");
+      const panel = pairs.map(([key, value]) => `${dim(key.padEnd(width))}  ${value}`).join("\n");
       transcript.addChild(new Text(panel, 2, 1));
       return true;
     }
@@ -187,9 +267,9 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   // Replay a loaded context into the transcript so the session is visible.
   for (const message of agent.state.messages) {
     if (message.role === "user") {
-      transcript.addChild(new Text(`\n> ${messageText(message.content)}`));
+      transcript.addChild(userEcho(messageText(message.content)));
     } else if (message.role === "assistant") {
-      transcript.addChild(new Text(renderAssistant(message as AssistantMessage)));
+      transcript.addChild(prettyAssistant(message as AssistantMessage));
     }
   }
 
@@ -208,14 +288,14 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       status.clear();
     } else if (event.type === "message_start") {
       if (event.message.role === "user") {
-        transcript.addChild(new Text(`\n> ${messageText(event.message.content)}`));
+        transcript.addChild(userEcho(messageText(event.message.content)));
       } else if (event.message.role === "assistant") {
         current = new Text("");
         transcript.addChild(current);
       }
     } else if (event.type === "message_update") {
       if (event.message.role === "assistant") {
-        current?.setText(renderAssistant(event.message as AssistantMessage));
+        current?.setText(renderStreaming(event.message as AssistantMessage));
       }
     } else if (event.type === "message_end") {
       if (event.message.role === "assistant") {
@@ -223,8 +303,12 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
         if (message.stopReason !== "error" && message.stopReason !== "aborted") {
           applyCitationTrailer(message);
         }
-        current?.setText(renderAssistant(message));
-        current = null;
+        // Swap the streaming text for the pretty rendering.
+        if (current) {
+          transcript.removeChild(current);
+          current = null;
+        }
+        transcript.addChild(prettyAssistant(message));
       }
     }
     tui.requestRender();
@@ -236,23 +320,19 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       return;
     }
     if (trimmed.startsWith("/")) {
-      transcript.addChild(new Text(`\n> ${trimmed}`));
-      if (handleTuiCommand(trimmed)) {
-        tui.requestRender();
-        return;
-      }
-      const result = handleSlashCommand(trimmed, agent, flags);
-      if (result) {
-        if (result.output) {
-          transcript.addChild(new Text(result.isError ? result.output : dimLines(result.output)));
+      transcript.addChild(userEcho(trimmed));
+      if (!handleTuiCommand(trimmed)) {
+        const result = handleSlashCommand(trimmed, agent, flags);
+        if (result) {
+          if (result.output) {
+            transcript.addChild(new Text(result.isError ? red(result.output) : dim(result.output)));
+          }
+          refreshBanner();
+          if (result.exit) {
+            tui.stop();
+            resolveDone(0);
+          }
         }
-        refreshBanner();
-        if (result.exit) {
-          tui.stop();
-          resolveDone(0);
-        }
-        tui.requestRender();
-        return;
       }
       tui.requestRender();
       return;
@@ -262,12 +342,14 @@ export async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       // Injected after the current turn finishes; the loop emits its
       // message_start when it lands.
       agent.steer(message);
-      transcript.addChild(new Text(dimLines(`(queued) > ${trimmed}`)));
+      transcript.addChild(new Text(dim(`(queued) › ${trimmed}`)));
       tui.requestRender();
       return;
     }
     agent.prompt(message).catch((error) => {
-      transcript.addChild(new Text(`error: ${error instanceof Error ? error.message : error}`));
+      transcript.addChild(
+        new Text(red(`error: ${error instanceof Error ? error.message : error}`)),
+      );
       tui.requestRender();
     });
   };

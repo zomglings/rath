@@ -108,9 +108,8 @@ rath development itself is meant to happen inside `rath run`.
   free when the context is handed to a provider that does not understand
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
-- `--tools read,bash,edit,write,grep,find,ls` enables client-side tools,
-  loaded on demand from `@earendil-works/pi-coding-agent` (a dev dependency;
-  install it where you use `--tools`). They run with your privileges in the
+- `--tools read,bash,edit,write,grep,find,ls` enables client-side tools from
+  `@earendil-works/pi-coding-agent`. They run with your privileges in the
   current directory.
 - `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
   from one.

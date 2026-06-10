@@ -39,19 +39,10 @@ export interface RunFlags {
 
 /**
  * Load the requested client-side tools from @earendil-works/pi-coding-agent.
- * The dependency is imported on demand so that rath's published package does
- * not require it; it is only needed when --tools is used.
+ * Imported lazily: the package is large and only needed when --tools is used.
  */
 export async function loadTools(names: ToolName[], cwd: string): Promise<AgentTool[]> {
-  let pi: typeof import("@earendil-works/pi-coding-agent");
-  try {
-    pi = await import("@earendil-works/pi-coding-agent");
-  } catch {
-    throw new Error(
-      "--tools requires @earendil-works/pi-coding-agent; install it with: " +
-        "npm install @earendil-works/pi-coding-agent",
-    );
-  }
+  const pi = await import("@earendil-works/pi-coding-agent");
   const factories: Record<ToolName, (cwd: string) => unknown> = {
     read: pi.createReadTool,
     bash: pi.createBashTool,
