@@ -58,6 +58,15 @@ pi-ai provider (not yet implemented).
 
 ## CLI
 
+The `rath` CLI exists for people developing or using rath to:
+
+1. Test that the rath implementation is up-to-date with the upstream LLM APIs
+   (integration tests): providers wrap live APIs whose behavior can drift, so
+   `rath test` checks the real thing rather than mocks.
+2. Help agents (e.g. Pi, Claude Code, Codex) build specialized agents using
+   rath: the CLI gives an agent a scriptable way to explore and verify the
+   harness while it works.
+
 ```
 rath test                 # run all integration tests
 rath test -n <name>       # run specific tests (repeatable; --name)
