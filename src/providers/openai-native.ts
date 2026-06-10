@@ -35,8 +35,6 @@ import {
   type StopReason,
   type StreamFunction,
   type StreamOptions,
-  type TextContent,
-  type ThinkingContent,
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import OpenAI from "openai";
@@ -56,50 +54,16 @@ import type {
   ResponseStreamEvent,
   WebSearchTool,
 } from "openai/resources/responses/responses.js";
+import {
+  type Citation,
+  getCitations,
+  type HostedContentBlock,
+  type HostedTextContent,
+  type HostedToolCallContent,
+  isHostedToolCall,
+} from "../content.js";
 
 export const OPENAI_NATIVE_API = "openai-native";
-
-/** Structured citation extracted from a `url_citation` annotation (web search). */
-export interface UrlCitation {
-  type: "url_citation";
-  url: string;
-  title: string;
-  /** Index of the first character of the cited span in the text block. */
-  startIndex: number;
-  /** Index one past the last character of the cited span in the text block. */
-  endIndex: number;
-}
-
-/** Structured citation extracted from a `file_citation` annotation (file search). */
-export interface FileCitation {
-  type: "file_citation";
-  fileId: string;
-  filename: string;
-  /** Index of the file in the list of files. */
-  index: number;
-}
-
-/**
- * Structured citation extracted from a `container_file_citation` annotation
- * (a file produced by the code interpreter).
- */
-export interface ContainerFileCitation {
-  type: "container_file_citation";
-  containerId: string;
-  fileId: string;
-  filename: string;
-  /** Index of the first character of the cited span in the text block. */
-  startIndex: number;
-  /** Index one past the last character of the cited span in the text block. */
-  endIndex: number;
-}
-
-export type Citation = UrlCitation | FileCitation | ContainerFileCitation;
-
-/** Text block extended with citations. Structurally still a TextContent. */
-export interface HostedTextContent extends TextContent {
-  citations?: Citation[];
-}
 
 /**
  * Hosted (server-side) tools this provider supports. The full enumeration of
@@ -118,44 +82,10 @@ export type HostedToolCallItem =
   | ResponseCodeInterpreterToolCall
   | ResponseOutputItem.ImageGenerationCall;
 
-/**
- * A server-side tool call (e.g. web search) executed by OpenAI. `raw` is the
- * verbatim Responses API output item; it is replayed to the API on later
- * turns. This block type is not part of pi-ai's content union: only
- * openai-native (and rath code) understands it.
- */
-export interface HostedToolCallContent {
-  type: "hostedToolCall";
-  id: string;
+/** A hosted tool call block as produced by this provider. */
+export type OpenAINativeHostedToolCall = HostedToolCallContent<HostedToolCallItem> & {
   toolName: HostedToolName;
-  status: HostedToolCallItem["status"];
-  raw: HostedToolCallItem;
-}
-
-export type HostedContentBlock = TextContent | ThinkingContent | ToolCall | HostedToolCallContent;
-
-export function isHostedToolCall(block: { type: string }): block is HostedToolCallContent {
-  return block.type === "hostedToolCall";
-}
-
-/**
- * View an assistant message's content as the extended block union. pi-ai
- * types content as (TextContent | ThinkingContent | ToolCall)[]; messages
- * produced by openai-native additionally carry HostedToolCallContent blocks.
- */
-export function contentBlocks(message: AssistantMessage): HostedContentBlock[] {
-  return message.content as unknown as HostedContentBlock[];
-}
-
-/** Hosted (server-side) tool call blocks on an assistant message. */
-export function getHostedToolCalls(message: AssistantMessage): HostedToolCallContent[] {
-  return contentBlocks(message).filter(isHostedToolCall);
-}
-
-/** Citations on a text block, if any. */
-export function getCitations(block: TextContent): Citation[] {
-  return (block as HostedTextContent).citations ?? [];
-}
+};
 
 export interface OpenAINativeOptions extends StreamOptions {
   reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -553,7 +483,8 @@ export function convertNativeMessages(
           });
         } else if (block.type === "hostedToolCall") {
           if (native) {
-            items.push(block.raw);
+            // Blocks on native messages were produced by this provider.
+            items.push(block.raw as HostedToolCallItem);
           }
           // Foreign hosted-tool blocks cannot be replayed to this API.
         }

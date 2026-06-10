@@ -34,18 +34,19 @@ import {
   type Model,
   type SimpleStreamOptions,
   streamSimple,
-  type TextContent,
 } from "@earendil-works/pi-ai";
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { type Command, fullName, helpRequested, helpText } from "../command.js";
 import {
+  applyCitationTrailer,
   contentBlocks,
-  getCitations,
   isHostedToolCall,
   OPENAI_NATIVE_API,
   openaiNativeModel,
   registerOpenAINative,
+  stripRenderedCitations,
+  uniqueUrlCitations,
 } from "../index.js";
 
 const DIM = "\x1b[2m";
@@ -143,52 +144,6 @@ export function saveContext(agent: Agent, path: string): void {
     path,
     `${JSON.stringify({ systemPrompt: agent.state.systemPrompt, messages }, null, 2)}\n`,
   );
-}
-
-/**
- * Citation merging. After each assistant message, citations are rendered
- * into a "Sources:" text block appended to the message, marked with
- * `renderedCitations: true`. The trailer persists in saved contexts and
- * flattens for free when a context is handed to a provider that does not
- * understand citations. Before replay to openai-native — which reconstructs
- * the real annotations itself — marked blocks are stripped, so the model's
- * own history stays byte-identical to what it produced.
- */
-export interface RenderedCitationsBlock {
-  type: "text";
-  text: string;
-  renderedCitations: true;
-}
-
-export function isRenderedCitations(block: { type: string }): block is RenderedCitationsBlock {
-  return block.type === "text" && (block as RenderedCitationsBlock).renderedCitations === true;
-}
-
-/**
- * Render the message's citations and append them as a marked text block.
- * Returns the trailer text, or undefined when there is nothing to add.
- */
-export function applyCitationTrailer(message: AssistantMessage): string | undefined {
-  if (message.content.some(isRenderedCitations)) {
-    return undefined;
-  }
-  const citations = message.content
-    .filter((b): b is TextContent => b.type === "text")
-    .flatMap(getCitations);
-  const urls = new Map<string, string>();
-  for (const citation of citations) {
-    if (citation.type === "url_citation" && !urls.has(citation.url)) {
-      urls.set(citation.url, citation.title);
-    }
-  }
-  if (urls.size === 0) {
-    return undefined;
-  }
-  const lines = [...urls].map(([url, title]) => `- ${title ? `${title} — ` : ""}${url}`);
-  const trailer = `Sources:\n${lines.join("\n")}`;
-  const block: RenderedCitationsBlock = { type: "text", text: trailer, renderedCitations: true };
-  (message.content as unknown as RenderedCitationsBlock[]).push(block);
-  return trailer;
 }
 
 /** Current session configuration as key/value pairs, for /info displays. */
@@ -525,7 +480,7 @@ export const runCommand: Command = {
               return [];
             }
             if (m.role === "assistant" && agent.state.model.api === OPENAI_NATIVE_API) {
-              return [{ ...m, content: m.content.filter((b) => !isRenderedCitations(b)) }];
+              return [stripRenderedCitations(m)];
             }
             return [m];
           }),
@@ -616,15 +571,6 @@ const redLine = styled("\x1b[31m");
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/**
- * Display copy of an assistant message without the rendered-citations
- * trailer: the trailer exists for persistence and provider handoff; the TUI
- * shows clickable sources instead.
- */
-function displayMessage(message: AssistantMessage): AssistantMessage {
-  return { ...message, content: message.content.filter((b) => !isRenderedCitations(b)) };
-}
-
 function messageText(content: string | { type: string; text?: string }[]): string {
   if (typeof content === "string") {
     return content;
@@ -684,21 +630,12 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
 
   /** Clickable sources list rebuilt from the message's citations. */
   const sourcesComponent = (message: AssistantMessage): PiTui.Text | undefined => {
-    const urls = new Map<string, string>();
-    for (const block of message.content) {
-      if (block.type === "text" && !isRenderedCitations(block)) {
-        for (const citation of getCitations(block)) {
-          if (citation.type === "url_citation" && !urls.has(citation.url)) {
-            urls.set(citation.url, citation.title);
-          }
-        }
-      }
-    }
-    if (urls.size === 0) {
+    const citations = uniqueUrlCitations(message);
+    if (citations.length === 0) {
       return undefined;
     }
-    const lines = [...urls].map(
-      ([url, title]) => `  ${hyperlink(title || url, url)}${title ? dimLine(` — ${url}`) : ""}`,
+    const lines = citations.map(
+      (c) => `  ${hyperlink(c.title || c.url, c.url)}${c.title ? dimLine(` — ${c.url}`) : ""}`,
     );
     return new Text(`${dimLine("sources:")}\n${lines.join("\n")}`);
   };
@@ -735,7 +672,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
 
   const addAssistant = (message: AssistantMessage) => {
     transcript.addChild(
-      new AssistantMessageComponent(displayMessage(message), false, markdownTheme),
+      new AssistantMessageComponent(stripRenderedCitations(message), false, markdownTheme),
     );
     for (const marker of hostedMarkers(message)) {
       transcript.addChild(marker);
@@ -840,7 +777,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       }
     } else if (event.type === "message_update") {
       if (event.message.role === "assistant") {
-        current?.updateContent(displayMessage(event.message as AssistantMessage));
+        current?.updateContent(stripRenderedCitations(event.message as AssistantMessage));
       }
     } else if (event.type === "message_end") {
       if (event.message.role === "assistant") {

@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { type AssistantMessage, type Context, stream } from "@earendil-works/pi-ai";
 import {
   getHostedToolCalls,
+  type HostedToolCallItem,
   type OpenAINativeOptions,
   openaiNativeModel,
   registerOpenAINative,
@@ -62,7 +63,7 @@ async function main(): Promise<void> {
   });
   const turn1 = await runTurn(context);
 
-  const calls1 = getHostedToolCalls(turn1);
+  const calls1 = getHostedToolCalls<HostedToolCallItem>(turn1);
   assert.ok(calls1.length > 0, "turn 1 must contain at least one hostedToolCall block");
   for (const call of calls1) {
     assert.equal(call.toolName, "code_interpreter");

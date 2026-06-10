@@ -19,6 +19,7 @@ import {
   contentBlocks,
   getCitations,
   getHostedToolCalls,
+  type HostedToolCallItem,
   isHostedToolCall,
   type OpenAINativeOptions,
   openaiNativeModel,
@@ -79,7 +80,7 @@ async function main(): Promise<void> {
   const turn1 = await runTurn(context);
   log(`Turn 1 content: ${describeMessage(turn1)}`);
 
-  const searches1 = getHostedToolCalls(turn1);
+  const searches1 = getHostedToolCalls<HostedToolCallItem>(turn1);
   assert.ok(searches1.length > 0, "turn 1 must contain at least one hosted web_search_call block");
   for (const search of searches1) {
     assert.equal(search.raw.type, "web_search_call", "raw item must be a web_search_call");
