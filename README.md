@@ -89,10 +89,18 @@ explicitly enabled with `--tools`. The model sees exactly what the flags
 specify; the provider API key is the only input taken from the environment.
 rath development itself is meant to happen inside `rath run`.
 
+- Two interactive frontends: a plain readline REPL (default; also handles
+  `-p` one-shots) and a pi-tui interface (`-T`/`--tui`) with differential
+  rendering, an editor input, selector overlays for the session commands,
+  and Ctrl+C interrupting the current turn instead of killing the session.
 - Models are explicit: `-m <provider>/<model-id>` (default
-  `openai-native/gpt-5-mini`; any registered pi-ai provider works). In the
-  interactive session, `/model` shows the current model and
-  `/model <provider>/<model-id>` switches it for future turns.
+  `openai-native/gpt-5-mini`; any registered pi-ai provider works).
+- In-session commands (both frontends): `/info` shows the session
+  configuration, `/sys` shows the system prompt, `/model` shows or switches
+  the model, `/lsmodels [filter]` lists available models, `/reasoning`
+  shows or sets the reasoning level (validated against the model's
+  supported levels), `/exit` quits. In the TUI, `/model`, `/lsmodels`, and
+  `/reasoning` open selector overlays.
 - Hosted web search is on by default with openai-native (`--no-web-search`
   disables it). After each reply, citations are rendered into a `Sources:`
   text block appended to the assistant message, marked

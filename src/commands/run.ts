@@ -12,146 +12,40 @@
  * pi-ai's provider registry; the openai-native provider is registered, so
  * hosted web search is available (on by default, --no-web-search disables
  * it). Client-side tools are loaded on demand from
- * @earendil-works/pi-coding-agent.
+ * @earendil-works/pi-coding-agent. Frontends: a plain readline REPL
+ * (default, also used for -p one-shots) and a pi-tui interface (-T/--tui).
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import * as readline from "node:readline/promises";
-import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
-import {
-  type Api,
-  getModel,
-  type KnownProvider,
-  type Message,
-  type Model,
-  type SimpleStreamOptions,
-  streamSimple,
-  type TextContent,
-} from "@earendil-works/pi-ai";
+import { Agent } from "@earendil-works/pi-agent-core";
+import { type Message, type SimpleStreamOptions, streamSimple } from "@earendil-works/pi-ai";
 import { type Command, fullName, helpRequested, helpText } from "../command.js";
 import {
   contentBlocks,
-  getCitations,
   isHostedToolCall,
   OPENAI_NATIVE_API,
-  openaiNativeModel,
   registerOpenAINative,
 } from "../index.js";
+import {
+  applyCitationTrailer,
+  handleSlashCommand,
+  isRenderedCitations,
+  loadContext,
+  loadTools,
+  REASONING_LEVELS,
+  type ReasoningLevel,
+  type RunFlags,
+  resolveModel,
+  saveContext,
+  TOOL_NAMES,
+  type ToolName,
+} from "./run-shared.js";
 
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
-const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-type ReasoningLevel = (typeof REASONING_LEVELS)[number];
-
-const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
-type ToolName = (typeof TOOL_NAMES)[number];
-
-interface RunFlags {
-  model: string;
-  prompt?: string;
-  systemPrompt: string;
-  reasoning: ReasoningLevel;
-  webSearch: boolean;
-  tools: ToolName[];
-  loadPath?: string;
-  savePath?: string;
-}
-
-/**
- * Load the requested client-side tools from @earendil-works/pi-coding-agent.
- * The dependency is imported on demand so that rath's published package does
- * not require it; it is only needed when --tools is used.
- */
-async function loadTools(names: ToolName[], cwd: string): Promise<AgentTool[]> {
-  let pi: typeof import("@earendil-works/pi-coding-agent");
-  try {
-    pi = await import("@earendil-works/pi-coding-agent");
-  } catch {
-    throw new Error(
-      "--tools requires @earendil-works/pi-coding-agent; install it with: " +
-        "npm install @earendil-works/pi-coding-agent",
-    );
-  }
-  const factories: Record<ToolName, (cwd: string) => unknown> = {
-    read: pi.createReadTool,
-    bash: pi.createBashTool,
-    edit: pi.createEditTool,
-    write: pi.createWriteTool,
-    grep: pi.createGrepTool,
-    find: pi.createFindTool,
-    ls: pi.createLsTool,
-  };
-  return names.map((name) => factories[name](cwd) as AgentTool);
-}
-
 function dim(text: string): string {
   return process.stdout.isTTY ? `${DIM}${text}${RESET}` : text;
-}
-
-function resolveModel(spec: string): Model<Api> {
-  const slash = spec.indexOf("/");
-  if (slash <= 0 || slash === spec.length - 1) {
-    throw new Error(`Model must be <provider>/<model-id> (got: ${spec})`);
-  }
-  const provider = spec.slice(0, slash);
-  const modelId = spec.slice(slash + 1);
-  if (provider === OPENAI_NATIVE_API) {
-    return openaiNativeModel(modelId);
-  }
-  const model = getModel(provider as KnownProvider, modelId as never) as Model<Api> | undefined;
-  if (!model) {
-    throw new Error(`Unknown model: ${spec}`);
-  }
-  return model;
-}
-
-interface SerializedContext {
-  systemPrompt?: string;
-  messages: Message[];
-}
-
-function loadContext(path: string): SerializedContext {
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as SerializedContext;
-  if (!Array.isArray(parsed.messages)) {
-    throw new Error(`${path} does not contain a serialized context (messages array missing)`);
-  }
-  return parsed;
-}
-
-/**
- * Citation merging. After each assistant message, citations are rendered
- * into a "Sources:" text block appended to the message, marked with
- * `renderedCitations: true`. The trailer persists in saved contexts and
- * flattens for free when a context is handed to a provider that does not
- * understand citations. Before replay to openai-native — which reconstructs
- * the real annotations itself — marked blocks are stripped, so the model's
- * own history stays byte-identical to what it produced.
- */
-interface RenderedCitationsBlock {
-  type: "text";
-  text: string;
-  renderedCitations: true;
-}
-
-function isRenderedCitations(block: { type: string }): block is RenderedCitationsBlock {
-  return block.type === "text" && (block as RenderedCitationsBlock).renderedCitations === true;
-}
-
-function renderCitationsTrailer(message: Message & { role: "assistant" }): string | undefined {
-  const citations = message.content
-    .filter((b): b is TextContent => b.type === "text" && !isRenderedCitations(b))
-    .flatMap(getCitations);
-  const urls = new Map<string, string>();
-  for (const citation of citations) {
-    if (citation.type === "url_citation" && !urls.has(citation.url)) {
-      urls.set(citation.url, citation.title);
-    }
-  }
-  if (urls.size === 0) {
-    return undefined;
-  }
-  const lines = [...urls].map(([url, title]) => `- ${title ? `${title} — ` : ""}${url}`);
-  return `Sources:\n${lines.join("\n")}`;
 }
 
 interface Renderer {
@@ -159,7 +53,7 @@ interface Renderer {
   hadError: () => boolean;
 }
 
-/** Wire stdout rendering onto the agent's event stream. */
+/** Wire plain stdout rendering onto the agent's event stream. */
 function attachRenderer(agent: Agent): Renderer {
   let openLine = false;
   const ensureNewline = () => {
@@ -211,16 +105,8 @@ function attachRenderer(agent: Agent): Renderer {
           errored = true;
           return;
         }
-        const trailer = renderCitationsTrailer(message);
+        const trailer = applyCitationTrailer(message);
         if (trailer) {
-          // Merge into the transcript (persisted via --save, flattened for
-          // foreign providers) and show it.
-          const block: RenderedCitationsBlock = {
-            type: "text",
-            text: trailer,
-            renderedCitations: true,
-          };
-          message.content.push(block);
           process.stdout.write(`${dim(trailer)}\n`);
         }
       }
@@ -238,9 +124,12 @@ export const runCommand: Command = {
     "exactly what the flags specify. The provider API key (e.g.\n" +
     "OPENAI_API_KEY) is the only input taken from the environment.\n" +
     "\n" +
-    "Without --prompt, reads prompts interactively; /model [provider/model-id]\n" +
-    "shows or switches the model, /exit or Ctrl+D ends the session. With\n" +
-    "--prompt, runs one prompt and exits (0 on success).",
+    "Without --prompt, reads prompts interactively (plain REPL, or pi-tui\n" +
+    "with -T/--tui). In-session commands: /info shows the configuration,\n" +
+    "/model [provider/model-id] shows or\n" +
+    "switches the model, /lsmodels [filter] lists available models,\n" +
+    "/reasoning [level] shows or sets the reasoning level, /exit quits.\n" +
+    "With --prompt, runs one prompt and exits (0 on success).",
   flags: [
     {
       long: "model",
@@ -253,6 +142,12 @@ export const runCommand: Command = {
       short: "p",
       takesValue: true,
       description: "Run a single prompt non-interactively and exit",
+    },
+    {
+      long: "tui",
+      short: "T",
+      takesValue: false,
+      description: "Interactive pi-tui interface instead of the plain REPL",
     },
     {
       long: "system-prompt",
@@ -305,6 +200,7 @@ export const runCommand: Command = {
       reasoning: "low",
       webSearch: true,
       tools: [],
+      tui: false,
     };
     let systemPromptFile: string | undefined;
     for (let i = 0; i < argv.length; i++) {
@@ -321,6 +217,8 @@ export const runCommand: Command = {
           flags.model = value();
         } else if (token === "-p" || token === "--prompt") {
           flags.prompt = value();
+        } else if (token === "-T" || token === "--tui") {
+          flags.tui = true;
         } else if (token === "--system-prompt") {
           flags.systemPrompt = value();
         } else if (token === "--system-prompt-file") {
@@ -401,30 +299,31 @@ export const runCommand: Command = {
       process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
       return 1;
     }
-    const renderer = attachRenderer(agent);
 
     const save = () => {
       if (flags.savePath) {
-        const messages = agent.state.messages.filter(
-          (m): m is Message =>
-            m.role === "user" || m.role === "assistant" || m.role === "toolResult",
-        );
-        writeFileSync(
-          flags.savePath,
-          `${JSON.stringify({ systemPrompt: agent.state.systemPrompt, messages }, null, 2)}\n`,
-        );
+        saveContext(agent, flags.savePath);
         process.stderr.write(`${dim(`context saved to ${flags.savePath}`)}\n`);
       }
     };
 
     if (flags.prompt !== undefined) {
+      const renderer = attachRenderer(agent);
       await agent.prompt(flags.prompt);
       save();
       return renderer.hadError() ? 1 : 0;
     }
 
+    if (flags.tui) {
+      const { runTui } = await import("./run-tui.js");
+      const code = await runTui(agent, flags);
+      save();
+      return code;
+    }
+
+    attachRenderer(agent);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | /model to switch, /exit or Ctrl+D to quit`)}\n`,
+      `${dim(`model: ${flags.model} | /info /model /lsmodels /reasoning /exit (or Ctrl+D)`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
@@ -439,21 +338,17 @@ export const runCommand: Command = {
         if (trimmed.length === 0) {
           continue;
         }
-        if (trimmed === "/exit") {
-          break;
-        }
-        if (trimmed === "/model" || trimmed.startsWith("/model ")) {
-          const spec = trimmed.slice("/model".length).trim();
-          if (spec.length === 0) {
-            process.stderr.write(`${dim(`model: ${flags.model}`)}\n`);
-            continue;
+        const result = handleSlashCommand(trimmed, agent, flags);
+        if (result) {
+          if (result.output) {
+            if (result.isError) {
+              process.stderr.write(`${result.output}\n`);
+            } else {
+              process.stderr.write(`${dim(result.output)}\n`);
+            }
           }
-          try {
-            agent.state.model = resolveModel(spec);
-            flags.model = spec;
-            process.stderr.write(`${dim(`model: ${spec}`)}\n`);
-          } catch (error) {
-            process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
+          if (result.exit) {
+            break;
           }
           continue;
         }
