@@ -90,7 +90,9 @@ specify; the provider API key is the only input taken from the environment.
 rath development itself is meant to happen inside `rath run`.
 
 - Models are explicit: `-m <provider>/<model-id>` (default
-  `openai-native/gpt-5-mini`; any registered pi-ai provider works).
+  `openai-native/gpt-5-mini`; any registered pi-ai provider works). In the
+  interactive session, `/model` shows the current model and
+  `/model <provider>/<model-id>` switches it for future turns.
 - Hosted web search is on by default with openai-native (`--no-web-search`
   disables it). After each reply, citations are rendered into a `Sources:`
   text block appended to the assistant message, marked

@@ -7,14 +7,16 @@
  * prompts. The only thing taken from the environment is the provider API
  * key. rath development itself is meant to happen inside `rath run`.
  *
- * Built on pi-agent-core's agentLoop and pi-ai's provider registry; the
- * openai-native provider is registered, so hosted web search is available
- * (on by default, --no-web-search disables it). Client-side tools are
- * loaded on demand from @earendil-works/pi-coding-agent.
+ * Built on pi-agent-core's Agent (the stateful loop wrapper: transcript,
+ * lifecycle events, tool execution, model switching via state.model) and
+ * pi-ai's provider registry; the openai-native provider is registered, so
+ * hosted web search is available (on by default, --no-web-search disables
+ * it). Client-side tools are loaded on demand from
+ * @earendil-works/pi-coding-agent.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import * as readline from "node:readline/promises";
-import { type AgentContext, type AgentTool, agentLoop } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import {
   type Api,
   getModel,
@@ -152,46 +154,13 @@ function renderCitationsTrailer(message: Message & { role: "assistant" }): strin
   return `Sources:\n${lines.join("\n")}`;
 }
 
-/**
- * Run one agent-loop invocation for `prompts`, rendering events to stdout.
- * Returns false if the run ended in an error message.
- */
-async function runPrompt(
-  prompts: Message[],
-  context: AgentContext,
-  model: Model<Api>,
-  flags: RunFlags,
-): Promise<boolean> {
-  const streamFn: typeof streamSimple = (m, ctx, options) =>
-    streamSimple(m, ctx, {
-      ...options,
-      webSearch: flags.webSearch,
-    } as SimpleStreamOptions);
+interface Renderer {
+  /** True when the most recent run produced an error message. */
+  hadError: () => boolean;
+}
 
-  // openai-native replays real annotations; the rendered trailer would
-  // duplicate them. Other providers get the trailer as plain text.
-  const stripTrailers = model.api === OPENAI_NATIVE_API;
-  const events = agentLoop(
-    prompts,
-    context,
-    {
-      model,
-      ...(flags.reasoning === "off" ? {} : { reasoning: flags.reasoning }),
-      convertToLlm: (messages) =>
-        messages.flatMap((m): Message[] => {
-          if (m.role !== "user" && m.role !== "assistant" && m.role !== "toolResult") {
-            return [];
-          }
-          if (m.role === "assistant" && stripTrailers) {
-            return [{ ...m, content: m.content.filter((b) => !isRenderedCitations(b)) }];
-          }
-          return [m];
-        }),
-    },
-    undefined,
-    streamFn,
-  );
-
+/** Wire stdout rendering onto the agent's event stream. */
+function attachRenderer(agent: Agent): Renderer {
   let openLine = false;
   const ensureNewline = () => {
     if (openLine) {
@@ -200,10 +169,12 @@ async function runPrompt(
     }
   };
   const seenHostedCalls = new Set<string>();
-  let ok = true;
+  let errored = false;
 
-  for await (const event of events) {
-    if (event.type === "message_update") {
+  agent.subscribe((event) => {
+    if (event.type === "agent_start") {
+      errored = false;
+    } else if (event.type === "message_update") {
       const e = event.assistantMessageEvent;
       if (e.type === "text_delta") {
         process.stdout.write(e.delta);
@@ -237,8 +208,8 @@ async function runPrompt(
         ensureNewline();
         if (message.stopReason === "error" || message.stopReason === "aborted") {
           process.stderr.write(`error: ${message.errorMessage ?? "unknown"}\n`);
-          ok = false;
-          continue;
+          errored = true;
+          return;
         }
         const trailer = renderCitationsTrailer(message);
         if (trailer) {
@@ -254,17 +225,8 @@ async function runPrompt(
         }
       }
     }
-  }
-  // agentLoop treats the context as a snapshot; the caller owns appending
-  // the run's new messages (prompts included) to the live context.
-  const newMessages = await events.result();
-  context.messages.push(
-    ...newMessages.filter(
-      (m): m is Message =>
-        m.role === "user" || m.role === "assistant" || m.role === "toolResult",
-    ),
-  );
-  return ok;
+  });
+  return { hadError: () => errored };
 }
 
 export const runCommand: Command = {
@@ -276,8 +238,9 @@ export const runCommand: Command = {
     "exactly what the flags specify. The provider API key (e.g.\n" +
     "OPENAI_API_KEY) is the only input taken from the environment.\n" +
     "\n" +
-    "Without --prompt, reads prompts interactively; /exit or Ctrl+D ends the\n" +
-    "session. With --prompt, runs one prompt and exits (0 on success).",
+    "Without --prompt, reads prompts interactively; /model [provider/model-id]\n" +
+    "shows or switches the model, /exit or Ctrl+D ends the session. With\n" +
+    "--prompt, runs one prompt and exits (0 on success).",
   flags: [
     {
       long: "model",
@@ -401,50 +364,68 @@ export const runCommand: Command = {
     }
 
     registerOpenAINative();
-    let model: Model<Api>;
-    let context: AgentContext;
+    let agent: Agent;
     try {
-      model = resolveModel(flags.model);
+      const model = resolveModel(flags.model);
       if (systemPromptFile) {
         flags.systemPrompt = readFileSync(systemPromptFile, "utf8").trim();
       }
       const loaded = flags.loadPath ? loadContext(flags.loadPath) : undefined;
-      context = {
-        systemPrompt: loaded?.systemPrompt ?? flags.systemPrompt,
-        messages: loaded?.messages ?? [],
-        tools: await loadTools(flags.tools, process.cwd()),
-      };
+      agent = new Agent({
+        initialState: {
+          systemPrompt: loaded?.systemPrompt ?? flags.systemPrompt,
+          model,
+          thinkingLevel: flags.reasoning,
+          messages: loaded?.messages ?? [],
+          tools: await loadTools(flags.tools, process.cwd()),
+        },
+        streamFn: (m, ctx, options) =>
+          streamSimple(m, ctx, {
+            ...options,
+            webSearch: flags.webSearch,
+          } as SimpleStreamOptions),
+        // openai-native replays real annotations; the rendered trailer would
+        // duplicate them. Other providers get the trailer as plain text.
+        convertToLlm: (messages) =>
+          messages.flatMap((m): Message[] => {
+            if (m.role !== "user" && m.role !== "assistant" && m.role !== "toolResult") {
+              return [];
+            }
+            if (m.role === "assistant" && agent.state.model.api === OPENAI_NATIVE_API) {
+              return [{ ...m, content: m.content.filter((b) => !isRenderedCitations(b)) }];
+            }
+            return [m];
+          }),
+      });
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
       return 1;
     }
+    const renderer = attachRenderer(agent);
 
     const save = () => {
       if (flags.savePath) {
+        const messages = agent.state.messages.filter(
+          (m): m is Message =>
+            m.role === "user" || m.role === "assistant" || m.role === "toolResult",
+        );
         writeFileSync(
           flags.savePath,
-          `${JSON.stringify(
-            { systemPrompt: context.systemPrompt, messages: context.messages },
-            null,
-            2,
-          )}\n`,
+          `${JSON.stringify({ systemPrompt: agent.state.systemPrompt, messages }, null, 2)}\n`,
         );
         process.stderr.write(`${dim(`context saved to ${flags.savePath}`)}\n`);
       }
     };
 
     if (flags.prompt !== undefined) {
-      const ok = await runPrompt(
-        [{ role: "user", content: flags.prompt, timestamp: Date.now() }],
-        context,
-        model,
-        flags,
-      );
+      await agent.prompt(flags.prompt);
       save();
-      return ok ? 0 : 1;
+      return renderer.hadError() ? 1 : 0;
     }
 
-    process.stderr.write(`${dim(`model: ${flags.model} | /exit or Ctrl+D to quit`)}\n`);
+    process.stderr.write(
+      `${dim(`model: ${flags.model} | /model to switch, /exit or Ctrl+D to quit`)}\n`,
+    );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
       while (true) {
@@ -461,12 +442,22 @@ export const runCommand: Command = {
         if (trimmed === "/exit") {
           break;
         }
-        await runPrompt(
-          [{ role: "user", content: trimmed, timestamp: Date.now() }],
-          context,
-          model,
-          flags,
-        );
+        if (trimmed === "/model" || trimmed.startsWith("/model ")) {
+          const spec = trimmed.slice("/model".length).trim();
+          if (spec.length === 0) {
+            process.stderr.write(`${dim(`model: ${flags.model}`)}\n`);
+            continue;
+          }
+          try {
+            agent.state.model = resolveModel(spec);
+            flags.model = spec;
+            process.stderr.write(`${dim(`model: ${spec}`)}\n`);
+          } catch (error) {
+            process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
+          }
+          continue;
+        }
+        await agent.prompt(trimmed);
       }
     } finally {
       rl.close();
