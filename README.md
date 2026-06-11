@@ -138,9 +138,9 @@ list to choose), since rath development inside `rath run` wants them on hand.
   free when the context is handed to a provider that does not understand
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
-- `--tools read,bash,edit,write,grep,find,ls,request_human_edit` enables
-  client-side tools. Omitting `--tools` enables all of them; `--tools none`
-  disables them. The first seven come from
+- `--tools read,bash,edit,write,grep,find,ls,request_human_edit,configure`
+  enables client-side tools. Omitting `--tools` enables all of them;
+  `--tools none` disables them. The first seven come from
   `@earendil-works/pi-coding-agent`; they run with your privileges in the
   current directory. `request_human_edit` is rath's own human-in-the-loop
   tool: it opens a file in your editor (`$VISUAL`/`$EDITOR`, falling back to
@@ -150,6 +150,12 @@ list to choose), since rath development inside `rath run` wants them on hand.
   changes. The agent can seed the file with a draft via `content`, name a
   `path`, or let it use a temp file (whose path is returned either way). The
   TUI suspends while the editor runs.
+- `configure` lets the model change its own session settings (model,
+  reasoning, web search, mode, active tools, system prompt), the same settings
+  you set with the slash commands; changes take effect next turn. It is an
+  ordinary tool call, so in slow mode it is gated behind the per-call
+  confirmation — the model proposes, you approve — and in go mode it applies
+  immediately. It does not touch the persisted default model.
 - `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
   from one.
 
@@ -210,6 +216,12 @@ to prove what was actually sent to the API.
   (no API, no key). Covers temp-file vs given-path round-trips (consistent
   return shape), the no-change case, and editor resolution ($VISUAL/$EDITOR
   precedence, `--wait` injection for GUI editors, no-editor error).
+- `config-preferences` — the SQLite config store (no API, no key): config-dir
+  resolution, default-model set/update/clear round-trip, automatic schema
+  migration to v1, re-open idempotency, and forward-compatibility.
+- `configure-tool` — the configure tool (no API, no key): every field applied
+  to agent state and flags, rebuilding the tool set including configure
+  itself, per-field error reporting, and the empty-call no-op.
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

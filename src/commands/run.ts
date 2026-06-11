@@ -28,6 +28,7 @@ import * as readline from "node:readline/promises";
 import {
   Agent,
   type AgentTool,
+  type AgentToolResult,
   type BeforeToolCallContext,
   type BeforeToolCallResult,
 } from "@earendil-works/pi-agent-core";
@@ -46,6 +47,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { type Command, fullName, helpText } from "../command.js";
 import { clearDefaultModel, loadPreferences, setDefaultModel } from "../config.js";
 import {
@@ -88,12 +90,13 @@ export const TOOL_NAMES = [
   "find",
   "ls",
   "request_human_edit",
+  "configure",
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
 // Client-side tools sourced from @earendil-works/pi-coding-agent (everything
-// except rath's own request_human_edit).
-type PiToolName = Exclude<ToolName, "request_human_edit">;
+// except rath's own request_human_edit and configure).
+type PiToolName = Exclude<ToolName, "request_human_edit" | "configure">;
 
 // Interaction modes for `rath run`:
 // - "go": full speed, no inspection. Stream everything, never block, tools run
@@ -141,19 +144,32 @@ export function isLongOutput(text: string): boolean {
 }
 
 /**
+ * Context the rath-native tools need from the active session. request_human_edit
+ * and configure both reach back into the running frontend: the editor takes the
+ * terminal (suspendTerminal), and configure mutates the live session (getAgent
+ * returns the Agent once it exists; flags is mutated in place).
+ */
+export interface ToolContext {
+  suspendTerminal?: <T>(fn: () => T) => T;
+  getAgent?: () => Agent;
+  flags?: RunFlags;
+}
+
+/**
  * Load the requested client-side tools, preserving the requested order. The
  * pi-coding-agent tools are imported lazily (the package is large) and only
- * when at least one is requested. request_human_edit is rath's own tool; it
- * needs `suspendTerminal` so it can take the terminal from the active frontend
- * while the editor runs (the TUI passes a tui.stop/start wrapper; the plain
- * REPL needs none).
+ * when at least one is requested. request_human_edit and configure are rath's
+ * own tools, built from `ctx` (see ToolContext). configure is skipped if its
+ * required context (getAgent + flags) is absent.
  */
 export async function loadTools(
   names: ToolName[],
   cwd: string,
-  suspendTerminal?: <T>(fn: () => T) => T,
+  ctx: ToolContext = {},
 ): Promise<AgentTool[]> {
-  const piNames = names.filter((n): n is PiToolName => n !== "request_human_edit");
+  const piNames = names.filter(
+    (n): n is PiToolName => n !== "request_human_edit" && n !== "configure",
+  );
   let piFactories: Record<PiToolName, (cwd: string) => AgentTool> | undefined;
   if (piNames.length > 0) {
     const pi = await import("@earendil-works/pi-coding-agent");
@@ -168,11 +184,23 @@ export async function loadTools(
       ls: pi.createLsTool,
     };
   }
-  return names.map((name) =>
-    name === "request_human_edit"
-      ? (createRequestHumanEditTool({ cwd, suspendTerminal }) as AgentTool)
-      : piFactories![name](cwd),
-  );
+  const tools: AgentTool[] = [];
+  for (const name of names) {
+    if (name === "request_human_edit") {
+      tools.push(
+        createRequestHumanEditTool({ cwd, suspendTerminal: ctx.suspendTerminal }) as AgentTool,
+      );
+    } else if (name === "configure") {
+      const { getAgent, flags } = ctx;
+      if (getAgent && flags) {
+        tools.push(createConfigureTool({ getAgent, flags, suspendTerminal: ctx.suspendTerminal }));
+      }
+      // Without session context configure cannot mutate anything; skip it.
+    } else {
+      tools.push(piFactories![name](cwd));
+    }
+  }
+  return tools;
 }
 
 /**
@@ -183,6 +211,144 @@ export async function loadTools(
  */
 interface TerminalController {
   suspend: <T>(fn: () => T) => T;
+}
+
+const CONFIGURE_PARAMETERS = Type.Object({
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Switch the session model, as <provider>/<model-id> (e.g. openai-native/gpt-5.5).",
+    }),
+  ),
+  reasoning: Type.Optional(
+    Type.Union(
+      REASONING_LEVELS.map((level) => Type.Literal(level)),
+      { description: "Reasoning effort for models that support it." },
+    ),
+  ),
+  webSearch: Type.Optional(
+    Type.Boolean({
+      description: "Enable or disable hosted web search (openai-native / openrouter-native).",
+    }),
+  ),
+  mode: Type.Optional(
+    Type.Union(
+      MODES.map((mode) => Type.Literal(mode)),
+      {
+        description:
+          "Interaction mode: 'go' (full speed) or 'slow' (page output, confirm each tool call).",
+      },
+    ),
+  ),
+  tools: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Replace the active client-side tools with exactly these names (empty array disables all).",
+    }),
+  ),
+  systemPrompt: Type.Optional(Type.String({ description: "Replace the system prompt." })),
+});
+
+export interface ConfigureDetails {
+  /** Human-readable description of each applied change. */
+  changes: string[];
+  /** Per-field errors for changes that were rejected. */
+  errors: string[];
+}
+
+/**
+ * The `configure` tool: lets the model change its own session settings (model,
+ * reasoning, web search, mode, tools, system prompt). Changes take effect on
+ * the next turn, like the slash commands. It is an ordinary tool call, so in
+ * slow mode it is gated behind the per-call confirmation (the human approves
+ * the model's proposed change); in go mode it applies immediately. It mutates
+ * the session only — the persisted default model (/config default-model) is
+ * not touched.
+ */
+function createConfigureTool(opts: {
+  getAgent: () => Agent;
+  flags: RunFlags;
+  suspendTerminal?: <T>(fn: () => T) => T;
+}): AgentTool<typeof CONFIGURE_PARAMETERS, ConfigureDetails> {
+  const { getAgent, flags, suspendTerminal } = opts;
+  const msg = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+  return {
+    name: "configure",
+    label: "Configure session",
+    description:
+      "Change your own session settings: model, reasoning level, web search, interaction mode, " +
+      "active client-side tools, and system prompt. Provide only the fields you want to change; " +
+      "they take effect on the next turn. Returns the resulting configuration. Does not change " +
+      "the persisted default model.",
+    parameters: CONFIGURE_PARAMETERS,
+    execute: async (_toolCallId, params): Promise<AgentToolResult<ConfigureDetails>> => {
+      const agent = getAgent();
+      const changes: string[] = [];
+      const errors: string[] = [];
+
+      if (params.model !== undefined) {
+        try {
+          agent.state.model = resolveModel(params.model);
+          flags.model = params.model;
+          changes.push(`model -> ${params.model}`);
+        } catch (error) {
+          errors.push(`model: ${msg(error)}`);
+        }
+      }
+      if (params.reasoning !== undefined) {
+        agent.state.thinkingLevel = params.reasoning;
+        flags.reasoning = params.reasoning;
+        changes.push(`reasoning -> ${params.reasoning}`);
+      }
+      if (params.webSearch !== undefined) {
+        flags.webSearch = params.webSearch;
+        changes.push(`web search -> ${params.webSearch ? "on" : "off"}`);
+      }
+      if (params.mode !== undefined) {
+        flags.mode = params.mode;
+        changes.push(`mode -> ${params.mode}`);
+      }
+      if (params.tools !== undefined) {
+        const invalid = params.tools.filter((n) => !TOOL_NAMES.includes(n as ToolName));
+        if (invalid.length > 0) {
+          errors.push(`tools: unknown ${invalid.join(", ")} (use ${TOOL_NAMES.join(", ")})`);
+        } else {
+          const names = params.tools as ToolName[];
+          try {
+            agent.state.tools = await loadTools(names, process.cwd(), {
+              suspendTerminal,
+              getAgent,
+              flags,
+            });
+            flags.tools = names;
+            changes.push(`tools -> ${names.length > 0 ? names.join(", ") : "none"}`);
+          } catch (error) {
+            errors.push(`tools: ${msg(error)}`);
+          }
+        }
+      }
+      if (params.systemPrompt !== undefined) {
+        agent.state.systemPrompt = params.systemPrompt;
+        flags.systemPrompt = params.systemPrompt;
+        changes.push(`system prompt -> set (${params.systemPrompt.length} chars)`);
+      }
+
+      const snapshot = sessionInfo(agent, flags)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join("\n");
+      const header =
+        changes.length > 0
+          ? `Applied (effective next turn): ${changes.join("; ")}.`
+          : "No changes requested.";
+      const errorLine = errors.length > 0 ? `\n\nErrors: ${errors.join("; ")}` : "";
+      return {
+        content: [
+          { type: "text", text: `${header}${errorLine}\n\nCurrent configuration:\n${snapshot}` },
+        ],
+        details: { changes, errors },
+      };
+    },
+  };
 }
 
 export function resolveModel(spec: string): Model<Api> {
@@ -380,7 +546,11 @@ export async function handleSlashCommand(
       }
       const names = requested as ToolName[];
       try {
-        agent.state.tools = await loadTools(names, process.cwd(), (fn) => terminal.suspend(fn));
+        agent.state.tools = await loadTools(names, process.cwd(), {
+          suspendTerminal: (fn) => terminal.suspend(fn),
+          getAgent: () => agent,
+          flags,
+        });
         flags.tools = names;
         return { output: `tools: ${names.join(", ")}${deferred}` };
       } catch (error) {
@@ -998,7 +1168,11 @@ export const runCommand: Command = {
           messages: loaded?.messages ?? [],
           tools:
             flags.tools.length > 0
-              ? await loadTools(flags.tools, process.cwd(), (fn) => terminal.suspend(fn))
+              ? await loadTools(flags.tools, process.cwd(), {
+                  suspendTerminal: (fn) => terminal.suspend(fn),
+                  getAgent: () => agent,
+                  flags,
+                })
               : [],
         },
         streamFn: (m, ctx, options) =>
