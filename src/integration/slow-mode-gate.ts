@@ -37,7 +37,6 @@ async function main(): Promise<void> {
     reasoning: "low",
     webSearch: true,
     tools: [],
-    tui: false,
     mode: "slow",
   };
   // Confirm always denies, so a gated call returns a block and a pass-through

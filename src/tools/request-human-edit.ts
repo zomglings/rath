@@ -9,8 +9,8 @@
  *
  * The tool is frontend-agnostic. Spawning an editor needs sole ownership of
  * the terminal, which the TUI does not have while running; the caller passes a
- * `suspendTerminal` hook that suspends its UI for the duration (the plain REPL
- * needs none and uses the pass-through default).
+ * `suspendTerminal` hook that suspends its UI for the duration (callers with
+ * no UI use the pass-through default).
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -119,7 +119,7 @@ export interface RequestHumanEditOptions {
   /**
    * Run `fn` while the caller's UI is suspended so the editor owns the
    * terminal, returning fn's result. Defaults to calling fn directly (correct
-   * for the plain REPL, which holds no UI mid-turn).
+   * for callers that hold no UI).
    */
   suspendTerminal?: <T>(fn: () => T) => T;
 }

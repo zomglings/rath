@@ -45,7 +45,6 @@ async function main(): Promise<void> {
     reasoning: "low",
     webSearch: true,
     tools: ["configure"],
-    tui: false,
     mode: "go",
   };
 

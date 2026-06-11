@@ -97,8 +97,8 @@ The `rath` CLI exists for people developing or using rath to:
    harness while it works.
 
 ```
-rath run                  # generic agent loop, interactive
-rath run -p <prompt>      # one prompt, then exit
+rath run                  # generic agent loop, interactive (pi-tui)
+rath run -p <prompt>      # auto-submit a prompt; exit when its turn settles
 rath test                 # run all integration tests
 rath test -n <name>       # run specific tests (repeatable; --name)
 rath test --list          # list available tests
@@ -114,10 +114,20 @@ from the environment. The one convenience default is tools: `--tools` enables
 all client-side tools when omitted (pass `--tools none` to disable them, or a
 list to choose), since rath development inside `rath run` wants them on hand.
 
-- Two interactive frontends: a plain readline REPL (default; also handles
-  `-p` one-shots) and a pi-tui interface (`-T`/`--tui`) with differential
+- One frontend: a pi-tui interface (a TTY is required) with differential
   rendering, an editor input, selector overlays for the session commands,
-  and Ctrl+C interrupting the current turn instead of killing the session.
+  Ctrl+C interrupting the current turn instead of killing the session, and a
+  statusline below the editor — model, a colored context-window gauge built
+  from the last turn's token usage (cache reads/writes, fresh input, output),
+  cwd, the git branch colored by working-tree state (red merge/rebase, yellow
+  dirty, green clean), and the time the last turn finished.
+- `-p <prompt>` auto-submits the prompt as the session's first message and
+  ends the session when its turn settles (exit code 1 if the turn errored).
+  Typing a prompt of your own during the run takes the session over and keeps
+  it open. The model can end any session with `end_session`, and `/exit
+  [message]` / `end_session({message})` print the parting message to stdout
+  after the TUI releases the terminal — the last, clean, capturable line of
+  the run.
 - Models are explicit: `-m <provider>/<model-id>`. Without `-m`, the pinned
   default model (`/config default-model`) is used, falling back to the
   built-in `openai-native/gpt-5.5`. Any registered pi-ai provider works. At
@@ -138,13 +148,14 @@ list to choose), since rath development inside `rath run` wants them on hand.
   `/websearch [on|off]` toggles hosted web search, `/tools [names|none]`
   shows or sets client-side tools, `/save [path]` writes the context now and
   saves there on exit, `/go`/`/slow` (or `/mode`) switch interaction mode,
-  `/exit` quits. Changes take effect on the next turn. In the TUI, bare
-  `/model` and `/reasoning` open selector overlays.
+  `/exit [message]` quits (printing the message after the TUI closes).
+  Changes take effect on the next turn. Bare `/model` and `/reasoning` open
+  selector overlays.
 - Two interaction modes (`--mode go|slow`, default `go`): **go** runs at full
   speed, tools execute immediately. **slow** gates every tool call behind a
   per-call confirmation (also the mitigation for prompt-injection driving
-  tools while web search is on) and pages long output — through `$PAGER` in
-  the plain REPL, a scrollable overlay in the TUI.
+  tools while web search is on) and pages long output through `$PAGER`,
+  suspending the TUI for the pager's duration.
 - Any registered pi-ai provider works, plus rath's own hosted-tool providers:
   `openai-native/<model>` and `openrouter-native/<model>` (OpenRouter's
   server-side web search with citations; see below).
@@ -211,8 +222,8 @@ cost real money (fractions of a cent in tokens, plus per-use fees for hosted
 tools such as web search and code interpreter containers), which is why they
 are not part of the pre-commit checks. (Several tests are the exception:
 `request-human-edit`, `config-preferences`, `configure-tool`, `session-tools`,
-and `slow-mode-gate` call no API and need no key — they exercise the CLI tools
-and config store directly; `catalogue` needs network but no key, hitting
+`slow-mode-gate`, and `statusline` call no API and need no key — they exercise
+the CLI tools and config store directly; `catalogue` needs network but no key, hitting
 OpenRouter's keyless `/api/v1/models`, and skips cleanly when offline.)
 `RATH_TEST_MODEL` overrides the model used by the
 API tests (default: `gpt-5.5`; the OpenRouter test uses `openai/gpt-5.5`).
@@ -256,6 +267,11 @@ to prove what was actually sent to the API.
 - `session-tools` — the session-operating tools (no API, no key): list_models
   enumerates and filters the catalog, save_context writes the session JSON and
   sets the save-on-exit path, and end_session requests exit and terminates.
+- `statusline` — the TUI statusline (no API, no key): context-bar
+  apportionment (proportional, floored for non-zero categories, clamped),
+  token/timestamp formatting, full-line rendering with and without usage, and
+  `gitInfo` against throwaway repositories in each working-tree state (unborn
+  branch, clean, dirty, detached HEAD, not-a-repo).
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

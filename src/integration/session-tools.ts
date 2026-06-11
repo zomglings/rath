@@ -42,7 +42,6 @@ async function main(): Promise<void> {
     reasoning: "low",
     webSearch: true,
     tools: ["list_models", "save_context", "end_session"],
-    tui: false,
     mode: "go",
   };
   let exitCalls = 0;
