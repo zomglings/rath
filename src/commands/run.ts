@@ -91,12 +91,23 @@ export const TOOL_NAMES = [
   "ls",
   "request_human_edit",
   "configure",
+  "list_models",
+  "save_context",
+  "end_session",
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
-// Client-side tools sourced from @earendil-works/pi-coding-agent (everything
-// except rath's own request_human_edit and configure).
-type PiToolName = Exclude<ToolName, "request_human_edit" | "configure">;
+// rath's own tools, which operate the running session rather than the
+// filesystem. Everything else comes from @earendil-works/pi-coding-agent.
+const RATH_TOOLS = [
+  "request_human_edit",
+  "configure",
+  "list_models",
+  "save_context",
+  "end_session",
+] as const;
+type RathToolName = (typeof RATH_TOOLS)[number];
+type PiToolName = Exclude<ToolName, RathToolName>;
 
 // Interaction modes for `rath run`:
 // - "go": full speed, no inspection. Stream everything, never block, tools run
@@ -144,32 +155,31 @@ export function isLongOutput(text: string): boolean {
 }
 
 /**
- * Context the rath-native tools need from the active session. request_human_edit
- * and configure both reach back into the running frontend: the editor takes the
- * terminal (suspendTerminal), and configure mutates the live session (getAgent
- * returns the Agent once it exists; flags is mutated in place).
+ * Context rath's own tools need to operate the running session: the editor
+ * takes the terminal (suspendTerminal); configure/save_context reach the live
+ * Agent (getAgent, set once it exists) and mutate flags in place; end_session
+ * asks the frontend to quit (requestExit). The session-coupled tools are
+ * skipped when their required context is absent.
  */
 export interface ToolContext {
   suspendTerminal?: <T>(fn: () => T) => T;
   getAgent?: () => Agent;
   flags?: RunFlags;
+  requestExit?: () => void;
 }
 
 /**
  * Load the requested client-side tools, preserving the requested order. The
  * pi-coding-agent tools are imported lazily (the package is large) and only
- * when at least one is requested. request_human_edit and configure are rath's
- * own tools, built from `ctx` (see ToolContext). configure is skipped if its
- * required context (getAgent + flags) is absent.
+ * when at least one is requested. rath's own tools (RATH_TOOLS) are built from
+ * `ctx`; a tool whose required context is missing is skipped.
  */
 export async function loadTools(
   names: ToolName[],
   cwd: string,
   ctx: ToolContext = {},
 ): Promise<AgentTool[]> {
-  const piNames = names.filter(
-    (n): n is PiToolName => n !== "request_human_edit" && n !== "configure",
-  );
+  const piNames = names.filter((n): n is PiToolName => !RATH_TOOLS.includes(n as RathToolName));
   let piFactories: Record<PiToolName, (cwd: string) => AgentTool> | undefined;
   if (piNames.length > 0) {
     const pi = await import("@earendil-works/pi-coding-agent");
@@ -186,18 +196,38 @@ export async function loadTools(
   }
   const tools: AgentTool[] = [];
   for (const name of names) {
-    if (name === "request_human_edit") {
-      tools.push(
-        createRequestHumanEditTool({ cwd, suspendTerminal: ctx.suspendTerminal }) as AgentTool,
-      );
-    } else if (name === "configure") {
-      const { getAgent, flags } = ctx;
-      if (getAgent && flags) {
-        tools.push(createConfigureTool({ getAgent, flags, suspendTerminal: ctx.suspendTerminal }));
-      }
-      // Without session context configure cannot mutate anything; skip it.
-    } else {
-      tools.push(piFactories![name](cwd));
+    switch (name) {
+      case "request_human_edit":
+        tools.push(
+          createRequestHumanEditTool({ cwd, suspendTerminal: ctx.suspendTerminal }) as AgentTool,
+        );
+        break;
+      case "configure":
+        if (ctx.getAgent && ctx.flags) {
+          tools.push(
+            createConfigureTool({
+              getAgent: ctx.getAgent,
+              flags: ctx.flags,
+              suspendTerminal: ctx.suspendTerminal,
+            }),
+          );
+        }
+        break;
+      case "list_models":
+        tools.push(createListModelsTool());
+        break;
+      case "save_context":
+        if (ctx.getAgent && ctx.flags) {
+          tools.push(createSaveContextTool({ getAgent: ctx.getAgent, flags: ctx.flags }));
+        }
+        break;
+      case "end_session":
+        if (ctx.requestExit) {
+          tools.push(createEndSessionTool({ requestExit: ctx.requestExit }));
+        }
+        break;
+      default:
+        tools.push(piFactories![name](cwd));
     }
   }
   return tools;
@@ -247,6 +277,13 @@ const CONFIGURE_PARAMETERS = Type.Object({
     }),
   ),
   systemPrompt: Type.Optional(Type.String({ description: "Replace the system prompt." })),
+  defaultModel: Type.Optional(
+    Type.String({
+      description:
+        "Pin the persisted default model for FUTURE sessions, as <provider>/<model-id>; " +
+        "'none' clears it. Unlike `model` (this session only), this is saved across sessions.",
+    }),
+  ),
 });
 
 export interface ConfigureDetails {
@@ -257,20 +294,20 @@ export interface ConfigureDetails {
 }
 
 /**
- * The `configure` tool: lets the model change its own session settings (model,
- * reasoning, web search, mode, tools, system prompt). Changes take effect on
- * the next turn, like the slash commands. It is an ordinary tool call, so in
- * slow mode it is gated behind the per-call confirmation (the human approves
- * the model's proposed change); in go mode it applies immediately. It mutates
- * the session only — the persisted default model (/config default-model) is
- * not touched.
+ * The `configure` tool: lets the model inspect or change its own session
+ * settings (model, reasoning, web search, mode, tools, system prompt) and pin
+ * the persisted default model for future sessions. Changes take effect on the
+ * next turn, like the slash commands. It is an ordinary tool call, so in slow
+ * mode it is gated behind the per-call confirmation (the human approves the
+ * model's proposed change); in go mode it applies immediately. Takes the full
+ * ToolContext so a tools rebuild keeps every rath tool wired (getAgent and
+ * flags are guaranteed by the loadTools call site).
  */
-function createConfigureTool(opts: {
-  getAgent: () => Agent;
-  flags: RunFlags;
-  suspendTerminal?: <T>(fn: () => T) => T;
-}): AgentTool<typeof CONFIGURE_PARAMETERS, ConfigureDetails> {
-  const { getAgent, flags, suspendTerminal } = opts;
+function createConfigureTool(
+  ctx: ToolContext,
+): AgentTool<typeof CONFIGURE_PARAMETERS, ConfigureDetails> {
+  const getAgent = ctx.getAgent!;
+  const flags = ctx.flags!;
   const msg = (error: unknown): string => (error instanceof Error ? error.message : String(error));
   return {
     name: "configure",
@@ -280,7 +317,8 @@ function createConfigureTool(opts: {
       "interaction mode, active client-side tools, and system prompt. Call with no fields to " +
       "just read the current configuration; provide only the fields you want to change (they " +
       "take effect on the next turn). Either way the result reports the full configuration. " +
-      "Does not change the persisted default model.",
+      "Use `defaultModel` to pin the model for future sessions (persisted), distinct from " +
+      "`model` which changes only this session.",
     parameters: CONFIGURE_PARAMETERS,
     execute: async (_toolCallId, params): Promise<AgentToolResult<ConfigureDetails>> => {
       const agent = getAgent();
@@ -316,11 +354,7 @@ function createConfigureTool(opts: {
         } else {
           const names = params.tools as ToolName[];
           try {
-            agent.state.tools = await loadTools(names, process.cwd(), {
-              suspendTerminal,
-              getAgent,
-              flags,
-            });
+            agent.state.tools = await loadTools(names, process.cwd(), ctx);
             flags.tools = names;
             changes.push(`tools -> ${names.length > 0 ? names.join(", ") : "none"}`);
           } catch (error) {
@@ -332,6 +366,21 @@ function createConfigureTool(opts: {
         agent.state.systemPrompt = params.systemPrompt;
         flags.systemPrompt = params.systemPrompt;
         changes.push(`system prompt -> set (${params.systemPrompt.length} chars)`);
+      }
+      if (params.defaultModel !== undefined) {
+        const spec = params.defaultModel.trim();
+        if (spec === "" || spec === "none") {
+          clearDefaultModel();
+          changes.push(`default model -> cleared (built-in ${DEFAULT_DEFAULT_MODEL})`);
+        } else {
+          try {
+            resolveModel(spec);
+            setDefaultModel(spec);
+            changes.push(`default model -> ${spec} (persisted, future sessions)`);
+          } catch (error) {
+            errors.push(`defaultModel: ${msg(error)}`);
+          }
+        }
       }
 
       const snapshot = sessionInfo(agent, flags)
@@ -347,6 +396,101 @@ function createConfigureTool(opts: {
           { type: "text", text: `${header}${errorLine}\n\nCurrent configuration:\n${snapshot}` },
         ],
         details: { changes, errors },
+      };
+    },
+  };
+}
+
+const LIST_MODELS_PARAMETERS = Type.Object({
+  filter: Type.Optional(
+    Type.String({
+      description: "Substring filter on <provider>/<model-id> (e.g. 'gpt-5', 'openrouter').",
+    }),
+  ),
+});
+
+export interface ListModelsDetails {
+  models: string[];
+}
+
+/** The `list_models` tool: the model enumerates the model specs it can switch to. */
+function createListModelsTool(): AgentTool<typeof LIST_MODELS_PARAMETERS, ListModelsDetails> {
+  return {
+    name: "list_models",
+    label: "List models",
+    description:
+      "List the model specs you can switch to, as <provider>/<model-id>, optionally filtered by " +
+      "a substring. Use these ids with configure's `model` or `defaultModel`.",
+    parameters: LIST_MODELS_PARAMETERS,
+    execute: async (_toolCallId, params): Promise<AgentToolResult<ListModelsDetails>> => {
+      const filter = params.filter && params.filter.length > 0 ? params.filter : undefined;
+      const specs = listModels(filter);
+      const footer = `${specs.length} model${specs.length === 1 ? "" : "s"}${
+        filter ? ` matching "${filter}"` : ""
+      }`;
+      const text = specs.length > 0 ? `${specs.join("\n")}\n${footer}` : footer;
+      return { content: [{ type: "text", text }], details: { models: specs } };
+    },
+  };
+}
+
+const SAVE_CONTEXT_PARAMETERS = Type.Object({
+  path: Type.String({
+    description: "Path to write the session context (JSON) to; also becomes the save-on-exit path.",
+  }),
+});
+
+export interface SaveContextDetails {
+  path: string;
+}
+
+/** The `save_context` tool: the model persists the session for later --load. */
+function createSaveContextTool(opts: {
+  getAgent: () => Agent;
+  flags: RunFlags;
+}): AgentTool<typeof SAVE_CONTEXT_PARAMETERS, SaveContextDetails> {
+  return {
+    name: "save_context",
+    label: "Save context",
+    description:
+      "Save the current session context (messages and system prompt) as JSON to a path, so it " +
+      "can be resumed later with --load. The path also becomes the save-on-exit path.",
+    parameters: SAVE_CONTEXT_PARAMETERS,
+    execute: async (_toolCallId, params): Promise<AgentToolResult<SaveContextDetails>> => {
+      saveContext(opts.getAgent(), params.path);
+      opts.flags.savePath = params.path;
+      return {
+        content: [{ type: "text", text: `Saved context to ${params.path}.` }],
+        details: { path: params.path },
+      };
+    },
+  };
+}
+
+const END_SESSION_PARAMETERS = Type.Object({});
+
+export interface EndSessionDetails {
+  ended: true;
+}
+
+/** The `end_session` tool: the model ends the rath session (like /exit). */
+function createEndSessionTool(opts: {
+  requestExit: () => void;
+}): AgentTool<typeof END_SESSION_PARAMETERS, EndSessionDetails> {
+  return {
+    name: "end_session",
+    label: "End session",
+    description:
+      "End the rath session, as the human would with /exit. Save-on-exit still runs if set. Use " +
+      "when the work is complete and there is nothing left to do.",
+    parameters: END_SESSION_PARAMETERS,
+    execute: async (): Promise<AgentToolResult<EndSessionDetails>> => {
+      opts.requestExit();
+      return {
+        content: [{ type: "text", text: "Ending the session." }],
+        details: { ended: true },
+        // Stop the agent loop after this batch; the frontend then exits.
+        terminate: true,
       };
     },
   };
@@ -455,6 +599,7 @@ export async function handleSlashCommand(
   agent: Agent,
   flags: RunFlags,
   terminal: TerminalController,
+  requestExit: () => void = () => {},
 ): Promise<SlashResult | undefined> {
   if (!input.startsWith("/")) {
     return undefined;
@@ -551,6 +696,7 @@ export async function handleSlashCommand(
           suspendTerminal: (fn) => terminal.suspend(fn),
           getAgent: () => agent,
           flags,
+          requestExit,
         });
         flags.tools = names;
         return { output: `tools: ${names.join(", ")}${deferred}` };
@@ -1136,6 +1282,8 @@ export const runCommand: Command = {
     // Shared with request_human_edit (via loadTools) so the editor can take the
     // terminal; the TUI replaces .suspend with a tui.stop/start wrapper.
     const terminal: TerminalController = { suspend: (fn) => fn() };
+    // end_session calls requestExit; each frontend installs its own quit below.
+    const sessionControl = { requestExit: () => {} };
     let agent: Agent;
     try {
       let model: Model<Api>;
@@ -1173,6 +1321,7 @@ export const runCommand: Command = {
                   suspendTerminal: (fn) => terminal.suspend(fn),
                   getAgent: () => agent,
                   flags,
+                  requestExit: () => sessionControl.requestExit(),
                 })
               : [],
         },
@@ -1274,7 +1423,7 @@ export const runCommand: Command = {
     }
 
     if (flags.tui) {
-      const code = await runTui(agent, flags, terminal);
+      const code = await runTui(agent, flags, terminal, sessionControl);
       save();
       return code;
     }
@@ -1327,6 +1476,11 @@ export const runCommand: Command = {
         abortRequested = false;
       }
     });
+    // end_session sets this mid-turn; the loop breaks once the turn returns.
+    let exitRequested = false;
+    sessionControl.requestExit = () => {
+      exitRequested = true;
+    };
     process.stderr.write("rath> ");
     try {
       for await (const line of rl) {
@@ -1335,7 +1489,13 @@ export const runCommand: Command = {
           process.stderr.write("rath> ");
           continue;
         }
-        const result = await handleSlashCommand(trimmed, agent, flags, terminal);
+        const result = await handleSlashCommand(
+          trimmed,
+          agent,
+          flags,
+          terminal,
+          sessionControl.requestExit,
+        );
         if (result) {
           if (result.output !== undefined) {
             const text = result.output.length > 0 ? result.output : "(empty)";
@@ -1353,6 +1513,9 @@ export const runCommand: Command = {
           continue;
         }
         await agent.prompt(trimmed);
+        if (exitRequested) {
+          break;
+        }
         process.stderr.write("rath> ");
       }
     } finally {
@@ -1406,6 +1569,7 @@ async function runTui(
   agent: Agent,
   flags: RunFlags,
   terminal: TerminalController,
+  sessionControl: { requestExit: () => void },
 ): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     process.stderr.write("--tui requires an interactive terminal\n");
@@ -1578,7 +1742,9 @@ async function runTui(
     }
   };
   const echoCommandResult = async (input: string) => {
-    showCommandOutput((await handleSlashCommand(input, agent, flags, terminal)) ?? {});
+    showCommandOutput(
+      (await handleSlashCommand(input, agent, flags, terminal, sessionControl.requestExit)) ?? {},
+    );
     refreshBanner();
     tui.requestRender();
   };
@@ -1707,6 +1873,12 @@ async function runTui(
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve;
   });
+
+  // end_session quits the TUI the same way /exit does.
+  sessionControl.requestExit = () => {
+    tui.stop();
+    resolveDone(0);
+  };
 
   let current: PiCodingAgent.AssistantMessageComponent | null = null;
   const toolComponents = new Map<string, PiCodingAgent.ToolExecutionComponent>();
@@ -1838,17 +2010,19 @@ async function runTui(
     if (trimmed.startsWith("/")) {
       transcript.addChild(new Text(`\n${cyanLine("›")} ${trimmed}`));
       if (!handleTuiCommand(trimmed)) {
-        handleSlashCommand(trimmed, agent, flags, terminal).then((result) => {
-          if (result) {
-            showCommandOutput(result);
-            refreshBanner();
-            if (result.exit) {
-              tui.stop();
-              resolveDone(0);
+        handleSlashCommand(trimmed, agent, flags, terminal, sessionControl.requestExit).then(
+          (result) => {
+            if (result) {
+              showCommandOutput(result);
+              refreshBanner();
+              if (result.exit) {
+                tui.stop();
+                resolveDone(0);
+              }
             }
-          }
-          tui.requestRender();
-        });
+            tui.requestRender();
+          },
+        );
       }
       tui.requestRender();
       return;

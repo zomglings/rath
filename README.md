@@ -138,24 +138,29 @@ list to choose), since rath development inside `rath run` wants them on hand.
   free when the context is handed to a provider that does not understand
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
-- `--tools read,bash,edit,write,grep,find,ls,request_human_edit,configure`
-  enables client-side tools. Omitting `--tools` enables all of them;
-  `--tools none` disables them. The first seven come from
-  `@earendil-works/pi-coding-agent`; they run with your privileges in the
-  current directory. `request_human_edit` is rath's own human-in-the-loop
-  tool: it opens a file in your editor (`$VISUAL`/`$EDITOR`, falling back to
-  the first of `code`, `vim`, `emacs`, `nano` on PATH; GUI editors like
-  `code`/`cursor` get `--wait` appended so the call blocks) and waits for you
-  to save and quit, then returns the final contents and a unified diff of your
-  changes. The agent can seed the file with a draft via `content`, name a
-  `path`, or let it use a temp file (whose path is returned either way). The
-  TUI suspends while the editor runs.
-- `configure` lets the model change its own session settings (model,
-  reasoning, web search, mode, active tools, system prompt), the same settings
-  you set with the slash commands; changes take effect next turn. It is an
-  ordinary tool call, so in slow mode it is gated behind the per-call
-  confirmation — the model proposes, you approve — and in go mode it applies
-  immediately. It does not touch the persisted default model.
+- `--tools` enables client-side tools (the full set:
+  `read,bash,edit,write,grep,find,ls,request_human_edit,configure,list_models,save_context,end_session`).
+  Omitting `--tools` enables all of them; `--tools none` disables them. The
+  first seven come from `@earendil-works/pi-coding-agent` and run with your
+  privileges in the current directory; the rest are rath's own tools, which
+  give the model the same controls over the session that you have through the
+  slash commands — the agent operates the harness as a peer, not a passenger.
+- `request_human_edit` is rath's human-in-the-loop tool: it opens a file in
+  your editor (`$VISUAL`/`$EDITOR`, falling back to the first of `code`, `vim`,
+  `emacs`, `nano` on PATH; GUI editors like `code`/`cursor` get `--wait`
+  appended so the call blocks) and waits for you to save and quit, then returns
+  the final contents and a unified diff of your changes. The agent can seed the
+  file with a draft via `content`, name a `path`, or let it use a temp file
+  (whose path is returned either way). The TUI suspends while the editor runs.
+- `configure` lets the model inspect or change its own session settings (model,
+  reasoning, web search, mode, active tools, system prompt) and pin the
+  persisted default model (`defaultModel`) for future sessions; calling it with
+  no fields just reads the configuration. `list_models` enumerates the model
+  catalog (the tool form of `/lsmodels`). `save_context` writes the session
+  JSON to a path (the tool form of `/save`). `end_session` ends the session
+  (the tool form of `/exit`). All are ordinary tool calls, so in slow mode they
+  are gated behind the per-call confirmation — the model proposes, you approve
+  — and in go mode they apply immediately.
 - `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
   from one.
 
@@ -221,7 +226,11 @@ to prove what was actually sent to the API.
   migration to v1, re-open idempotency, and forward-compatibility.
 - `configure-tool` — the configure tool (no API, no key): every field applied
   to agent state and flags, rebuilding the tool set including configure
-  itself, per-field error reporting, and the empty-call no-op.
+  itself, per-field error reporting, the empty-call no-op, and pinning/clearing
+  the persisted default model.
+- `session-tools` — the session-operating tools (no API, no key): list_models
+  enumerates and filters the catalog, save_context writes the session JSON and
+  sets the save-on-exit path, and end_session requests exit and terminates.
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

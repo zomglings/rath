@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@earendil-works/pi-agent-core";
 import { loadTools, type RunFlags, resolveModel } from "../commands/run.js";
-import { registerOpenAINative, registerOpenRouterNative } from "../index.js";
+import { loadPreferences, registerOpenAINative, registerOpenRouterNative } from "../index.js";
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);
@@ -108,6 +108,20 @@ async function main(): Promise<void> {
     "returns current configuration",
   );
   log("Case 4 OK: empty call is a no-op that still reports configuration");
+
+  // Case 5: defaultModel pins/clears the persisted default (distinct from model).
+  const flagsModelBefore = flags.model;
+  await configure.execute("c5a", { defaultModel: "openai-native/gpt-5.5" });
+  assert.equal(loadPreferences().defaultModel, "openai-native/gpt-5.5", "default model pinned");
+  assert.equal(flags.model, flagsModelBefore, "defaultModel does not change the session model");
+  await configure.execute("c5b", { defaultModel: "none" });
+  assert.equal(loadPreferences().defaultModel, undefined, "default model cleared");
+  const r5 = await configure.execute("c5c", { defaultModel: "not-a-spec" });
+  assert.ok(
+    r5.details.errors.some((e: string) => e.startsWith("defaultModel")),
+    "invalid default model reported",
+  );
+  log("Case 5 OK: defaultModel pins/clears the persisted default, session model untouched");
 
   log("All assertions passed.");
 }
