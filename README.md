@@ -98,9 +98,9 @@ rath development itself is meant to happen inside `rath run`.
 - In-session commands (both frontends): `/info` shows the session
   configuration, `/sys` shows the system prompt, `/model` shows or switches
   the model, `/lsmodels [filter]` lists available models, `/reasoning`
-  shows or sets the reasoning level (validated against the model's
-  supported levels), `/exit` quits. In the TUI, `/model`, `/lsmodels`, and
-  `/reasoning` open selector overlays.
+  shows or sets the reasoning level (clamped to the model's supported levels
+  by the provider), `/exit` quits. In the TUI, bare `/model` and `/reasoning`
+  open selector overlays.
 - Hosted web search is on by default with openai-native (`--no-web-search`
   disables it). After each reply, citations are rendered into a `Sources:`
   text block appended to the assistant message, marked
@@ -158,9 +158,9 @@ to prove what was actually sent to the API.
   captured and the answer exact, then replays it losslessly after a JSON
   round-trip.
 - `openai-native-agent-loop` — interop with pi's stock agent loop
-  (`@earendil-works/pi-agent-core`, a dev dependency). Hosted tools disabled;
-  a client-side tool is executed by the loop and only `function` tools appear
-  in request payloads.
+  (`@earendil-works/pi-agent-core`). Hosted tools disabled; a client-side
+  tool is executed by the loop and only `function` tools appear in request
+  payloads.
 - `openai-native-client-tool` — client-side tool parsing through plain
   `stream()`: ToolCall block shape (structured arguments, `callId|itemId`
   id, `stopReason "toolUse"`), then `function_call`/`function_call_output`

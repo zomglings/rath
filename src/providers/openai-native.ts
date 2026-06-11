@@ -25,6 +25,7 @@ import {
   type AssistantMessageEventStream,
   type Context,
   calculateCost,
+  clampThinkingLevel,
   createAssistantMessageEventStream,
   getEnvApiKey,
   getModel,
@@ -52,6 +53,7 @@ import type {
   ResponseOutputText,
   ResponseReasoningItem,
   ResponseStreamEvent,
+  ResponseUsage,
   WebSearchTool,
 } from "openai/resources/responses/responses.js";
 import {
@@ -85,6 +87,7 @@ export type HostedToolCallItem =
 /** A hosted tool call block as produced by this provider. */
 export type OpenAINativeHostedToolCall = HostedToolCallContent<HostedToolCallItem> & {
   toolName: HostedToolName;
+  status: HostedToolCallItem["status"];
 };
 
 export interface OpenAINativeOptions extends StreamOptions {
@@ -140,11 +143,15 @@ export function registerOpenAINative(): void {
   registerApiProvider({
     api: OPENAI_NATIVE_API,
     stream: streamOpenAINative,
-    streamSimple: (model, context, options) =>
-      streamOpenAINative(model, context, {
+    streamSimple: (model, context, options) => {
+      // Clamp to the model's supported levels so an unsupported request (e.g.
+      // "xhigh" on a model without it) does not 400 every turn.
+      const clamped = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+      return streamOpenAINative(model, context, {
         ...options,
-        reasoningEffort: options?.reasoning,
-      }),
+        reasoningEffort: clamped === "off" ? undefined : clamped,
+      });
+    },
   });
   registered = true;
 }
@@ -240,7 +247,10 @@ function buildParams(
   context: Context,
   options?: OpenAINativeOptions,
 ): ResponseCreateParamsStreaming {
-  const include: ResponseIncludable[] = ["web_search_call.action.sources"];
+  const include: ResponseIncludable[] = [];
+  if (options?.webSearch !== false) {
+    include.push("web_search_call.action.sources");
+  }
   if (options?.fileSearch) {
     include.push("file_search_call.results");
   }
@@ -448,19 +458,31 @@ export function convertNativeMessages(
       }
     } else if (msg.role === "assistant") {
       const native = msg.api === OPENAI_NATIVE_API && msg.provider === model.provider;
+      // Reasoning items and item ids carry encrypted, model-specific state;
+      // replaying them to a different model fails the API's pairing/decryption
+      // checks. Only replay them when the producing model matches.
+      const sameModel = native && msg.model === model.id;
+      let blockIndex = 0;
       for (const block of msg.content as HostedContentBlock[]) {
         if (block.type === "thinking") {
-          if (native && block.thinkingSignature) {
+          if (sameModel && block.thinkingSignature) {
             items.push(JSON.parse(block.thinkingSignature) as ResponseReasoningItem);
           }
-          // Foreign thinking blocks carry signatures this API cannot verify; drop them.
+          // Foreign or cross-model thinking blocks cannot be replayed here.
         } else if (block.type === "text") {
+          // Empty text blocks (e.g. from an errored turn) are rejected by the
+          // API as malformed message items.
+          if (block.text.length === 0) {
+            continue;
+          }
           const signature = native ? parseTextSignature(block.textSignature) : undefined;
           items.push({
             type: "message",
             role: "assistant",
             status: "completed",
-            id: signature?.id ?? `msg_${msgIndex}`,
+            // Ids are per text item; key fabricated ids by block, not message,
+            // so multi-text messages do not collide.
+            id: signature?.id ?? `msg_${msgIndex}_${blockIndex}`,
             content: [
               {
                 type: "output_text",
@@ -475,19 +497,22 @@ export function convertNativeMessages(
           items.push({
             type: "function_call",
             // Replaying item ids from another model trips OpenAI's
-            // reasoning/function-call pairing validation; omit them.
-            id: native && msg.model === model.id ? itemId : undefined,
+            // reasoning/function-call pairing validation; omit them, and the
+            // literal "undefined" a missing item id would stringify to.
+            id: sameModel && itemId && itemId !== "undefined" ? itemId : undefined,
             call_id: callId ?? block.id,
             name: block.name,
             arguments: JSON.stringify(block.arguments),
           });
         } else if (block.type === "hostedToolCall") {
-          if (native) {
-            // Blocks on native messages were produced by this provider.
+          if (sameModel) {
+            // Blocks on native messages were produced by this provider; their
+            // raw items only replay cleanly to the same model.
             items.push(block.raw as HostedToolCallItem);
           }
-          // Foreign hosted-tool blocks cannot be replayed to this API.
+          // Foreign or cross-model hosted-tool blocks cannot be replayed here.
         }
+        blockIndex++;
       }
     } else if (msg.role === "toolResult") {
       const textResult = msg.content
@@ -720,26 +745,19 @@ async function processNativeStream(
         }
       }
     } else if (event.type === "response.completed") {
-      const response = event.response;
-      if (response?.id) {
-        output.responseId = response.id;
-      }
-      if (response?.usage) {
-        const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
-        output.usage = {
-          input: (response.usage.input_tokens || 0) - cachedTokens,
-          output: response.usage.output_tokens || 0,
-          cacheRead: cachedTokens,
-          cacheWrite: 0,
-          totalTokens: response.usage.total_tokens || 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        };
-      }
-      calculateCost(model, output.usage);
-      output.stopReason = mapStopReason(response?.status);
+      finalizeUsage(event.response, output, model);
+      output.stopReason = mapStopReason(event.response?.status);
       if (output.stopReason === "stop" && output.content.some((b) => b.type === "toolCall")) {
         output.stopReason = "toolUse";
       }
+    } else if (event.type === "response.incomplete") {
+      // The response was cut off (typically max_output_tokens). The last tool
+      // call may have truncated arguments; drop any block still carrying the
+      // streaming scratch buffer so a half-formed call is never executed or
+      // persisted, and report length rather than a clean stop.
+      finalizeUsage(event.response, output, model);
+      output.content = output.content.filter((b) => !(b.type === "toolCall" && "partialJson" in b));
+      output.stopReason = "length";
     } else if (event.type === "error") {
       throw new Error(`Error Code ${event.code}: ${event.message}`);
     } else if (event.type === "response.failed") {
@@ -753,6 +771,29 @@ async function processNativeStream(
       throw new Error(msg);
     }
   }
+}
+
+/** Capture token usage and cost from a terminal response object. */
+function finalizeUsage(
+  response: { id?: string; usage?: ResponseUsage } | undefined,
+  output: AssistantMessage,
+  model: Model<typeof OPENAI_NATIVE_API>,
+): void {
+  if (response?.id) {
+    output.responseId = response.id;
+  }
+  if (response?.usage) {
+    const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
+    output.usage = {
+      input: (response.usage.input_tokens || 0) - cachedTokens,
+      output: response.usage.output_tokens || 0,
+      cacheRead: cachedTokens,
+      cacheWrite: 0,
+      totalTokens: response.usage.total_tokens || 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+  }
+  calculateCost(model, output.usage);
 }
 
 function mapStopReason(status: string | undefined): StopReason {

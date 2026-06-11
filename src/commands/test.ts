@@ -30,7 +30,7 @@ export function discoverTests(): IntegrationTest[] {
     return [];
   }
   return entries
-    .filter((f) => f.endsWith(".js") && !f.endsWith(".d.js"))
+    .filter((f) => f.endsWith(".js"))
     .sort()
     .map((f) => ({ name: f.replace(/\.js$/, ""), file: join(dir, f) }));
 }

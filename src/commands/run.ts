@@ -37,7 +37,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
-import { type Command, fullName, helpRequested, helpText } from "../command.js";
+import { type Command, fullName, helpText } from "../command.js";
 import {
   applyCitationTrailer,
   contentBlocks,
@@ -80,7 +80,8 @@ export interface RunFlags {
  */
 export async function loadTools(names: ToolName[], cwd: string): Promise<AgentTool[]> {
   const pi = await import("@earendil-works/pi-coding-agent");
-  const factories: Record<ToolName, (cwd: string) => unknown> = {
+  // Typed as AgentTool so pi-coding-agent API drift fails compilation here.
+  const factories: Record<ToolName, (cwd: string) => AgentTool> = {
     read: pi.createReadTool,
     bash: pi.createBashTool,
     edit: pi.createEditTool,
@@ -89,7 +90,7 @@ export async function loadTools(names: ToolName[], cwd: string): Promise<AgentTo
     find: pi.createFindTool,
     ls: pi.createLsTool,
   };
-  return names.map((name) => factories[name](cwd) as AgentTool);
+  return names.map((name) => factories[name](cwd));
 }
 
 export function resolveModel(spec: string): Model<Api> {
@@ -243,13 +244,23 @@ interface Renderer {
   hadError: () => boolean;
 }
 
-/** Wire plain stdout rendering onto the agent's event stream. */
+/**
+ * Wire plain rendering onto the agent's event stream. The model's answer text
+ * goes to stdout (the deliverable, so `-p > file` captures just that);
+ * thinking, hosted-tool markers, tool-execution lines, and errors go to
+ * stderr as status.
+ */
 function attachRenderer(agent: Agent): Renderer {
-  let openLine = false;
+  // Track which stream has an unterminated line so the next block starts fresh.
+  let openStream: NodeJS.WriteStream | null = null;
+  const write = (stream: NodeJS.WriteStream, text: string) => {
+    stream.write(text);
+    openStream = text.endsWith("\n") ? null : stream;
+  };
   const ensureNewline = () => {
-    if (openLine) {
-      process.stdout.write("\n");
-      openLine = false;
+    if (openStream) {
+      openStream.write("\n");
+      openStream = null;
     }
   };
   const seenHostedCalls = new Set<string>();
@@ -261,11 +272,9 @@ function attachRenderer(agent: Agent): Renderer {
     } else if (event.type === "message_update") {
       const e = event.assistantMessageEvent;
       if (e.type === "text_delta") {
-        process.stdout.write(e.delta);
-        openLine = true;
+        write(process.stdout, e.delta);
       } else if (e.type === "thinking_delta") {
-        process.stdout.write(dim(e.delta));
-        openLine = true;
+        write(process.stderr, dim(e.delta));
       } else if (e.type === "text_end" || e.type === "thinking_end") {
         ensureNewline();
       }
@@ -276,14 +285,15 @@ function attachRenderer(agent: Agent): Renderer {
           if (isHostedToolCall(block) && !seenHostedCalls.has(block.id)) {
             seenHostedCalls.add(block.id);
             ensureNewline();
-            process.stdout.write(`${dim(`[${block.toolName}]`)}\n`);
+            write(process.stderr, `${dim(`[${block.toolName}]`)}\n`);
           }
         }
       }
     } else if (event.type === "tool_execution_start") {
       ensureNewline();
       const args = JSON.stringify(event.args);
-      process.stdout.write(
+      write(
+        process.stderr,
         `${dim(`[${event.toolName}: ${args.length > 120 ? `${args.slice(0, 120)}…` : args}]`)}\n`,
       );
     } else if (event.type === "message_end") {
@@ -291,13 +301,13 @@ function attachRenderer(agent: Agent): Renderer {
       if (message.role === "assistant") {
         ensureNewline();
         if (message.stopReason === "error" || message.stopReason === "aborted") {
-          process.stderr.write(`error: ${message.errorMessage ?? "unknown"}\n`);
+          write(process.stderr, `error: ${message.errorMessage ?? "unknown"}\n`);
           errored = true;
           return;
         }
         const trailer = applyCitationTrailer(message);
         if (trailer) {
-          process.stdout.write(`${dim(trailer)}\n`);
+          write(process.stderr, `${dim(trailer)}\n`);
         }
       }
     }
@@ -379,11 +389,6 @@ export const runCommand: Command = {
     },
   ],
   async run(prefix, argv) {
-    if (helpRequested(argv)) {
-      process.stdout.write(`${helpText(this, prefix)}\n`);
-      return 0;
-    }
-
     const flags: RunFlags = {
       model: `${OPENAI_NATIVE_API}/gpt-5-mini`,
       systemPrompt: "You are a helpful assistant.",
@@ -393,6 +398,7 @@ export const runCommand: Command = {
       tui: false,
     };
     let systemPromptFile: string | undefined;
+    let systemPromptExplicit = false;
     for (let i = 0; i < argv.length; i++) {
       const token = argv[i]!;
       const value = (): string => {
@@ -403,6 +409,12 @@ export const runCommand: Command = {
         return v;
       };
       try {
+        // Help is honored only as a standalone token, so a flag value of
+        // "-h"/"--help" (e.g. --prompt --help) is taken literally.
+        if (token === "-h" || token === "--help") {
+          process.stdout.write(`${helpText(this, prefix)}\n`);
+          return 0;
+        }
         if (token === "-m" || token === "--model") {
           flags.model = value();
         } else if (token === "-p" || token === "--prompt") {
@@ -411,8 +423,10 @@ export const runCommand: Command = {
           flags.tui = true;
         } else if (token === "--system-prompt") {
           flags.systemPrompt = value();
+          systemPromptExplicit = true;
         } else if (token === "--system-prompt-file") {
           systemPromptFile = value();
+          systemPromptExplicit = true;
         } else if (token === "--reasoning") {
           const level = value() as ReasoningLevel;
           if (!REASONING_LEVELS.includes(level)) {
@@ -451,6 +465,10 @@ export const runCommand: Command = {
       }
     }
 
+    if (flags.prompt !== undefined && flags.tui) {
+      process.stderr.write("--tui is ignored with --prompt (one-shot, non-interactive)\n");
+    }
+
     registerOpenAINative();
     let agent: Agent;
     try {
@@ -459,30 +477,50 @@ export const runCommand: Command = {
         flags.systemPrompt = readFileSync(systemPromptFile, "utf8").trim();
       }
       const loaded = flags.loadPath ? loadContext(flags.loadPath) : undefined;
+      // A loaded context supplies the system prompt unless a flag overrides it.
+      const systemPrompt = systemPromptExplicit
+        ? flags.systemPrompt
+        : (loaded?.systemPrompt ?? flags.systemPrompt);
       agent = new Agent({
         initialState: {
-          systemPrompt: loaded?.systemPrompt ?? flags.systemPrompt,
+          systemPrompt,
           model,
           thinkingLevel: flags.reasoning,
           messages: loaded?.messages ?? [],
-          tools: await loadTools(flags.tools, process.cwd()),
+          tools: flags.tools.length > 0 ? await loadTools(flags.tools, process.cwd()) : [],
         },
         streamFn: (m, ctx, options) =>
           streamSimple(m, ctx, {
             ...options,
             webSearch: flags.webSearch,
           } as SimpleStreamOptions),
-        // openai-native replays real annotations; the rendered trailer would
-        // duplicate them. Other providers get the trailer as plain text.
         convertToLlm: (messages) =>
           messages.flatMap((m): Message[] => {
-            if (m.role !== "user" && m.role !== "assistant" && m.role !== "toolResult") {
+            if (m.role === "user" || m.role === "toolResult") {
+              return [m];
+            }
+            if (m.role !== "assistant") {
               return [];
             }
-            if (m.role === "assistant" && agent.state.model.api === OPENAI_NATIVE_API) {
-              return [stripRenderedCitations(m)];
+            // Drop failed turns (empty content, unreplayable state) so a
+            // transient error does not poison every later request.
+            if (m.stopReason === "error" || m.stopReason === "aborted") {
+              return [];
             }
-            return [m];
+            const native = agent.state.model.api === OPENAI_NATIVE_API;
+            // The rendered citation trailer is for display/persistence;
+            // openai-native reconstructs the real annotations itself, so strip
+            // it before replay. Foreign providers get it as plain text.
+            const stripped = native ? stripRenderedCitations(m) : m;
+            // Thinking signatures are provider-specific; a foreign provider
+            // rejects openai-native's. Drop thinking blocks on cross-provider
+            // replay (the proper flatten-on-handoff is a follow-up).
+            if (!native && m.api === OPENAI_NATIVE_API) {
+              return [
+                { ...stripped, content: stripped.content.filter((b) => b.type !== "thinking") },
+              ];
+            }
+            return [stripped];
           }),
       });
     } catch (error) {
@@ -510,44 +548,49 @@ export const runCommand: Command = {
       return code;
     }
 
-    attachRenderer(agent);
+    const renderer = attachRenderer(agent);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | /info /sys /model /lsmodels /reasoning /exit (or Ctrl+D)`)}\n`,
+      `${dim(`model: ${flags.model} | /info /sys /model /lsmodels /reasoning /exit | Ctrl+C / Ctrl+D to quit`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    // Iterating the interface (rather than looping rl.question) queues input
+    // arriving while a turn runs instead of dropping it, and lets Ctrl+C
+    // interrupt: it aborts the active turn, or exits when idle.
+    rl.on("SIGINT", () => {
+      if (agent.state.isStreaming) {
+        agent.abort();
+      } else {
+        rl.close();
+      }
+    });
+    process.stderr.write("rath> ");
     try {
-      while (true) {
-        let line: string;
-        try {
-          line = await rl.question("rath> ");
-        } catch {
-          break; // Ctrl+D / closed input
-        }
+      for await (const line of rl) {
         const trimmed = line.trim();
         if (trimmed.length === 0) {
+          process.stderr.write("rath> ");
           continue;
         }
         const result = handleSlashCommand(trimmed, agent, flags);
         if (result) {
-          if (result.output) {
-            if (result.isError) {
-              process.stderr.write(`${result.output}\n`);
-            } else {
-              process.stderr.write(`${dim(result.output)}\n`);
-            }
+          if (result.output !== undefined) {
+            const text = result.output.length > 0 ? result.output : "(empty)";
+            process.stderr.write(`${result.isError ? text : dim(text)}\n`);
           }
           if (result.exit) {
             break;
           }
+          process.stderr.write("rath> ");
           continue;
         }
         await agent.prompt(trimmed);
+        process.stderr.write("rath> ");
       }
     } finally {
       rl.close();
       save();
     }
-    return 0;
+    return renderer.hadError() ? 1 : 0;
   },
 };
 
@@ -766,6 +809,16 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       loader.stop();
       status.clear();
       toolComponents.clear();
+      // A prompt submitted during the final steering-poll window stays queued.
+      // Drain it once the run has fully settled (continue() throws while the
+      // run is still active), instead of waiting for the next manual prompt.
+      if (agent.hasQueuedMessages()) {
+        setImmediate(() => {
+          if (!agent.state.isStreaming && agent.hasQueuedMessages()) {
+            agent.continue().catch(() => {});
+          }
+        });
+      }
     } else if (event.type === "message_start") {
       if (event.message.role === "user") {
         transcript.addChild(
