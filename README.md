@@ -98,9 +98,9 @@ rath development itself is meant to happen inside `rath run`.
 - In-session commands (both frontends): `/info` shows the session
   configuration, `/sys` shows the system prompt, `/model` shows or switches
   the model, `/lsmodels [filter]` lists available models, `/reasoning`
-  shows or sets the reasoning level (clamped to the model's supported levels
-  by the provider), `/exit` quits. In the TUI, bare `/model` and `/reasoning`
-  open selector overlays.
+  shows or sets the reasoning level (openai-native clamps it to the model's
+  supported levels), `/exit` quits. In the TUI, bare `/model` and
+  `/reasoning` open selector overlays.
 - Hosted web search is on by default with openai-native (`--no-web-search`
   disables it). After each reply, citations are rendered into a `Sources:`
   text block appended to the assistant message, marked

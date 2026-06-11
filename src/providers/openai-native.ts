@@ -466,7 +466,12 @@ export function convertNativeMessages(
       for (const block of msg.content as HostedContentBlock[]) {
         if (block.type === "thinking") {
           if (sameModel && block.thinkingSignature) {
-            items.push(JSON.parse(block.thinkingSignature) as ResponseReasoningItem);
+            // A hand-edited or corrupted signature must not crash the turn.
+            try {
+              items.push(JSON.parse(block.thinkingSignature) as ResponseReasoningItem);
+            } catch {
+              // Skip an unparseable reasoning signature.
+            }
           }
           // Foreign or cross-model thinking blocks cannot be replayed here.
         } else if (block.type === "text") {
@@ -476,21 +481,25 @@ export function convertNativeMessages(
             continue;
           }
           const signature = native ? parseTextSignature(block.textSignature) : undefined;
+          // Ids are per text item; key fabricated ids by block, not message,
+          // so multi-text messages do not collide. Real ids belong to the
+          // producing model — fabricate one on cross-model replay.
+          const fabricatedId = `msg_${msgIndex}_${blockIndex}`;
           items.push({
             type: "message",
             role: "assistant",
             status: "completed",
-            // Ids are per text item; key fabricated ids by block, not message,
-            // so multi-text messages do not collide.
-            id: signature?.id ?? `msg_${msgIndex}_${blockIndex}`,
+            id: sameModel ? (signature?.id ?? fabricatedId) : fabricatedId,
             content: [
               {
                 type: "output_text",
                 text: block.text,
-                annotations: getCitations(block).map(citationToAnnotation),
+                // Citations reference the hosted search call, which is dropped
+                // on cross-model replay; drop the annotations with it.
+                annotations: sameModel ? getCitations(block).map(citationToAnnotation) : [],
               },
             ],
-            ...(signature?.phase ? { phase: signature.phase } : {}),
+            ...(sameModel && signature?.phase ? { phase: signature.phase } : {}),
           } as ResponseInputItem);
         } else if (block.type === "toolCall") {
           const [callId, itemId] = block.id.split("|");
@@ -746,17 +755,32 @@ async function processNativeStream(
       }
     } else if (event.type === "response.completed") {
       finalizeUsage(event.response, output, model);
+      // A function call that received argument deltas but no output_item.done
+      // (rare, but the SDK does not guarantee one) would otherwise persist its
+      // scratch buffer; finalize and strip it here too.
+      for (const block of output.content) {
+        if (block.type === "toolCall" && "partialJson" in block) {
+          const tool = block as ToolCall & { partialJson?: string };
+          tool.arguments = parseStreamingJson(tool.partialJson || "{}");
+          delete tool.partialJson;
+        }
+      }
       output.stopReason = mapStopReason(event.response?.status);
       if (output.stopReason === "stop" && output.content.some((b) => b.type === "toolCall")) {
         output.stopReason = "toolUse";
       }
     } else if (event.type === "response.incomplete") {
-      // The response was cut off (typically max_output_tokens). The last tool
-      // call may have truncated arguments; drop any block still carrying the
-      // streaming scratch buffer so a half-formed call is never executed or
-      // persisted, and report length rather than a clean stop.
+      // The response was cut off (typically max_output_tokens). Drop any tool
+      // call still carrying the streaming scratch buffer, and any hosted tool
+      // call that never completed — replaying either (truncated arguments, or
+      // an in-progress hosted item) is rejected by the API and wedges the
+      // session. Report length rather than a clean stop.
       finalizeUsage(event.response, output, model);
-      output.content = output.content.filter((b) => !(b.type === "toolCall" && "partialJson" in b));
+      output.content = (output.content as HostedContentBlock[]).filter(
+        (b) =>
+          !(b.type === "toolCall" && "partialJson" in b) &&
+          !(isHostedToolCall(b) && b.status !== "completed"),
+      ) as AssistantMessage["content"];
       output.stopReason = "length";
     } else if (event.type === "error") {
       throw new Error(`Error Code ${event.code}: ${event.message}`);

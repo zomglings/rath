@@ -139,7 +139,12 @@ export function loadContext(path: string): SerializedContext {
 
 export function saveContext(agent: Agent, path: string): void {
   const messages = agent.state.messages.filter(
-    (m): m is Message => m.role === "user" || m.role === "assistant" || m.role === "toolResult",
+    (m): m is Message =>
+      m.role === "user" ||
+      m.role === "toolResult" ||
+      // Skip failed turns so they do not accumulate as empty bubbles across
+      // saved sessions or replay as malformed items on --load.
+      (m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted"),
   );
   writeFileSync(
     path,
@@ -326,7 +331,7 @@ export const runCommand: Command = {
     "\n" +
     "Without --prompt, reads prompts interactively (plain REPL, or pi-tui\n" +
     "with -T/--tui). In-session commands: /info shows the configuration,\n" +
-    "/model [provider/model-id] shows or\n" +
+    "/sys shows the system prompt, /model [provider/model-id] shows or\n" +
     "switches the model, /lsmodels [filter] lists available models,\n" +
     "/reasoning [level] shows or sets the reasoning level, /exit quits.\n" +
     "With --prompt, runs one prompt and exits (0 on success).",
@@ -494,9 +499,28 @@ export const runCommand: Command = {
             ...options,
             webSearch: flags.webSearch,
           } as SimpleStreamOptions),
-        convertToLlm: (messages) =>
-          messages.flatMap((m): Message[] => {
-            if (m.role === "user" || m.role === "toolResult") {
+        convertToLlm: (messages) => {
+          // Failed turns are dropped below; their tool results must be dropped
+          // too, or a function_call_output is left orphaned and the API
+          // rejects every subsequent request.
+          const droppedToolCallIds = new Set<string>();
+          for (const m of messages) {
+            if (
+              m.role === "assistant" &&
+              (m.stopReason === "error" || m.stopReason === "aborted")
+            ) {
+              for (const b of m.content) {
+                if (b.type === "toolCall") {
+                  droppedToolCallIds.add(b.id);
+                }
+              }
+            }
+          }
+          return messages.flatMap((m): Message[] => {
+            if (m.role === "toolResult") {
+              return droppedToolCallIds.has(m.toolCallId) ? [] : [m];
+            }
+            if (m.role === "user") {
               return [m];
             }
             if (m.role !== "assistant") {
@@ -521,7 +545,8 @@ export const runCommand: Command = {
               ];
             }
             return [stripped];
-          }),
+          });
+        },
       });
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
@@ -741,13 +766,14 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     };
   };
 
-  const echoCommandResult = (input: string) => {
-    const result = handleSlashCommand(input, agent, flags);
-    if (result?.output) {
-      transcript.addChild(
-        new Text(result.isError ? redLine(result.output) : dimLine(result.output)),
-      );
+  const showCommandOutput = (result: { output?: string; isError?: boolean }) => {
+    if (result.output !== undefined) {
+      const text = result.output.length > 0 ? result.output : "(empty)";
+      transcript.addChild(new Text(result.isError ? redLine(text) : dimLine(text)));
     }
+  };
+  const echoCommandResult = (input: string) => {
+    showCommandOutput(handleSlashCommand(input, agent, flags) ?? {});
     refreshBanner();
   };
 
@@ -835,7 +861,8 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     } else if (event.type === "message_end") {
       if (event.message.role === "assistant") {
         const message = event.message as AssistantMessage;
-        if (message.stopReason !== "error" && message.stopReason !== "aborted") {
+        const failed = message.stopReason === "error" || message.stopReason === "aborted";
+        if (!failed) {
           applyCitationTrailer(message);
         }
         if (current) {
@@ -844,7 +871,14 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           transcript.removeChild(current);
           current = null;
         }
-        addAssistant(message);
+        // pi-agent-core resolves prompt() normally on provider errors and
+        // emits them here, not as a rejection — render the error explicitly
+        // instead of an empty assistant bubble.
+        if (failed) {
+          transcript.addChild(new Text(redLine(`error: ${message.errorMessage ?? "unknown"}`)));
+        } else {
+          addAssistant(message);
+        }
       }
     } else if (event.type === "tool_execution_start") {
       const component = new ToolExecutionComponent(
@@ -892,11 +926,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       if (!handleTuiCommand(trimmed)) {
         const result = handleSlashCommand(trimmed, agent, flags);
         if (result) {
-          if (result.output) {
-            transcript.addChild(
-              new Text(result.isError ? redLine(result.output) : dimLine(result.output)),
-            );
-          }
+          showCommandOutput(result);
           refreshBanner();
           if (result.exit) {
             tui.stop();
