@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { type Command, runSubcommands } from "./command.js";
+import { runCommand } from "./commands/run.js";
 import { testCommand } from "./commands/test.js";
 
 const root: Command = {
   name: "rath",
   summary: "An agent harness",
   description: "rath is an agent harness built on pi-ai with custom API providers.",
-  subcommands: [testCommand],
+  subcommands: [runCommand, testCommand],
   run: runSubcommands,
 };
 

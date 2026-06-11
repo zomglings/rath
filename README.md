@@ -73,11 +73,46 @@ The `rath` CLI exists for people developing or using rath to:
    harness while it works.
 
 ```
+rath run                  # generic agent loop, interactive
+rath run -p <prompt>      # one prompt, then exit
 rath test                 # run all integration tests
 rath test -n <name>       # run specific tests (repeatable; --name)
 rath test --list          # list available tests
 rath <command> -h         # help for any (sub)command
 ```
+
+### rath run
+
+`rath run` starts a generic agent loop with nothing implicit: no skill
+discovery, no context-file walking (AGENTS.md is never read), no tools unless
+explicitly enabled with `--tools`. The model sees exactly what the flags
+specify; the provider API key is the only input taken from the environment.
+rath development itself is meant to happen inside `rath run`.
+
+- Two interactive frontends: a plain readline REPL (default; also handles
+  `-p` one-shots) and a pi-tui interface (`-T`/`--tui`) with differential
+  rendering, an editor input, selector overlays for the session commands,
+  and Ctrl+C interrupting the current turn instead of killing the session.
+- Models are explicit: `-m <provider>/<model-id>` (default
+  `openai-native/gpt-5-mini`; any registered pi-ai provider works).
+- In-session commands (both frontends): `/info` shows the session
+  configuration, `/sys` shows the system prompt, `/model` shows or switches
+  the model, `/lsmodels [filter]` lists available models, `/reasoning`
+  shows or sets the reasoning level (openai-native clamps it to the model's
+  supported levels), `/exit` quits. In the TUI, bare `/model` and
+  `/reasoning` open selector overlays.
+- Hosted web search is on by default with openai-native (`--no-web-search`
+  disables it). After each reply, citations are rendered into a `Sources:`
+  text block appended to the assistant message, marked
+  `renderedCitations: true`: it persists in saved contexts and flattens for
+  free when the context is handed to a provider that does not understand
+  citations, and it is stripped before replay to openai-native, which
+  reconstructs the real annotations itself.
+- `--tools read,bash,edit,write,grep,find,ls` enables client-side tools from
+  `@earendil-works/pi-coding-agent`. They run with your privileges in the
+  current directory.
+- `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
+  from one.
 
 ## Integration tests
 
@@ -123,9 +158,9 @@ to prove what was actually sent to the API.
   captured and the answer exact, then replays it losslessly after a JSON
   round-trip.
 - `openai-native-agent-loop` — interop with pi's stock agent loop
-  (`@earendil-works/pi-agent-core`, a dev dependency). Hosted tools disabled;
-  a client-side tool is executed by the loop and only `function` tools appear
-  in request payloads.
+  (`@earendil-works/pi-agent-core`). Hosted tools disabled; a client-side
+  tool is executed by the loop and only `function` tools appear in request
+  payloads.
 - `openai-native-client-tool` — client-side tool parsing through plain
   `stream()`: ToolCall block shape (structured arguments, `callId|itemId`
   id, `stopReason "toolUse"`), then `function_call`/`function_call_output`

@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
 
+# Serialize releases: two quick merges must not both try to publish.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: write
   id-token: write

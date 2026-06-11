@@ -25,6 +25,7 @@ import {
   type AssistantMessageEventStream,
   type Context,
   calculateCost,
+  clampThinkingLevel,
   createAssistantMessageEventStream,
   getEnvApiKey,
   getModel,
@@ -35,8 +36,6 @@ import {
   type StopReason,
   type StreamFunction,
   type StreamOptions,
-  type TextContent,
-  type ThinkingContent,
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import OpenAI from "openai";
@@ -54,52 +53,20 @@ import type {
   ResponseOutputText,
   ResponseReasoningItem,
   ResponseStreamEvent,
+  ResponseUsage,
   WebSearchTool,
 } from "openai/resources/responses/responses.js";
+import {
+  type Citation,
+  getCitations,
+  type HostedContentBlock,
+  type HostedTextContent,
+  type HostedToolCallContent,
+  isHostedToolCall,
+  isRenderedCitations,
+} from "../hosted-tools.js";
 
 export const OPENAI_NATIVE_API = "openai-native";
-
-/** Structured citation extracted from a `url_citation` annotation (web search). */
-export interface UrlCitation {
-  type: "url_citation";
-  url: string;
-  title: string;
-  /** Index of the first character of the cited span in the text block. */
-  startIndex: number;
-  /** Index one past the last character of the cited span in the text block. */
-  endIndex: number;
-}
-
-/** Structured citation extracted from a `file_citation` annotation (file search). */
-export interface FileCitation {
-  type: "file_citation";
-  fileId: string;
-  filename: string;
-  /** Index of the file in the list of files. */
-  index: number;
-}
-
-/**
- * Structured citation extracted from a `container_file_citation` annotation
- * (a file produced by the code interpreter).
- */
-export interface ContainerFileCitation {
-  type: "container_file_citation";
-  containerId: string;
-  fileId: string;
-  filename: string;
-  /** Index of the first character of the cited span in the text block. */
-  startIndex: number;
-  /** Index one past the last character of the cited span in the text block. */
-  endIndex: number;
-}
-
-export type Citation = UrlCitation | FileCitation | ContainerFileCitation;
-
-/** Text block extended with citations. Structurally still a TextContent. */
-export interface HostedTextContent extends TextContent {
-  citations?: Citation[];
-}
 
 /**
  * Hosted (server-side) tools this provider supports. The full enumeration of
@@ -118,44 +85,11 @@ export type HostedToolCallItem =
   | ResponseCodeInterpreterToolCall
   | ResponseOutputItem.ImageGenerationCall;
 
-/**
- * A server-side tool call (e.g. web search) executed by OpenAI. `raw` is the
- * verbatim Responses API output item; it is replayed to the API on later
- * turns. This block type is not part of pi-ai's content union: only
- * openai-native (and rath code) understands it.
- */
-export interface HostedToolCallContent {
-  type: "hostedToolCall";
-  id: string;
+/** A hosted tool call block as produced by this provider. */
+export type OpenAINativeHostedToolCall = HostedToolCallContent<HostedToolCallItem> & {
   toolName: HostedToolName;
   status: HostedToolCallItem["status"];
-  raw: HostedToolCallItem;
-}
-
-export type HostedContentBlock = TextContent | ThinkingContent | ToolCall | HostedToolCallContent;
-
-export function isHostedToolCall(block: { type: string }): block is HostedToolCallContent {
-  return block.type === "hostedToolCall";
-}
-
-/**
- * View an assistant message's content as the extended block union. pi-ai
- * types content as (TextContent | ThinkingContent | ToolCall)[]; messages
- * produced by openai-native additionally carry HostedToolCallContent blocks.
- */
-export function contentBlocks(message: AssistantMessage): HostedContentBlock[] {
-  return message.content as unknown as HostedContentBlock[];
-}
-
-/** Hosted (server-side) tool call blocks on an assistant message. */
-export function getHostedToolCalls(message: AssistantMessage): HostedToolCallContent[] {
-  return contentBlocks(message).filter(isHostedToolCall);
-}
-
-/** Citations on a text block, if any. */
-export function getCitations(block: TextContent): Citation[] {
-  return (block as HostedTextContent).citations ?? [];
-}
+};
 
 export interface OpenAINativeOptions extends StreamOptions {
   reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -210,11 +144,23 @@ export function registerOpenAINative(): void {
   registerApiProvider({
     api: OPENAI_NATIVE_API,
     stream: streamOpenAINative,
-    streamSimple: (model, context, options) =>
-      streamOpenAINative(model, context, {
+    streamSimple: (model, context, options) => {
+      // Clamp to the model's supported levels so an unsupported request (e.g.
+      // "xhigh" on a model without it) does not 400 every turn. "off" is
+      // excluded from clamping: clamping it would map to the model's lowest
+      // supported level (e.g. "minimal"), silently forcing reasoning on
+      // against an explicit request to disable it. (SimpleStreamOptions types
+      // reasoning without "off", but a JS caller can still pass it.)
+      const requested = options?.reasoning as string | undefined;
+      const reasoningEffort =
+        options?.reasoning && requested !== "off"
+          ? clampThinkingLevel(model, options.reasoning)
+          : undefined;
+      return streamOpenAINative(model, context, {
         ...options,
-        reasoningEffort: options?.reasoning,
-      }),
+        reasoningEffort: reasoningEffort as OpenAINativeOptions["reasoningEffort"],
+      });
+    },
   });
   registered = true;
 }
@@ -310,7 +256,10 @@ function buildParams(
   context: Context,
   options?: OpenAINativeOptions,
 ): ResponseCreateParamsStreaming {
-  const include: ResponseIncludable[] = ["web_search_call.action.sources"];
+  const include: ResponseIncludable[] = [];
+  if (options?.webSearch !== false) {
+    include.push("web_search_call.action.sources");
+  }
   if (options?.fileSearch) {
     include.push("file_search_call.results");
   }
@@ -518,45 +467,79 @@ export function convertNativeMessages(
       }
     } else if (msg.role === "assistant") {
       const native = msg.api === OPENAI_NATIVE_API && msg.provider === model.provider;
+      // Reasoning items and item ids carry encrypted, model-specific state;
+      // replaying them to a different model fails the API's pairing/decryption
+      // checks. Only replay them when the producing model matches.
+      const sameModel = native && msg.model === model.id;
+      let blockIndex = 0;
       for (const block of msg.content as HostedContentBlock[]) {
         if (block.type === "thinking") {
-          if (native && block.thinkingSignature) {
-            items.push(JSON.parse(block.thinkingSignature) as ResponseReasoningItem);
+          if (sameModel && block.thinkingSignature) {
+            // A hand-edited or corrupted signature must not crash the turn.
+            try {
+              items.push(JSON.parse(block.thinkingSignature) as ResponseReasoningItem);
+            } catch {
+              // Skip an unparseable reasoning signature.
+            }
           }
-          // Foreign thinking blocks carry signatures this API cannot verify; drop them.
+          // Foreign or cross-model thinking blocks cannot be replayed here.
         } else if (block.type === "text") {
+          // The rendered-citations trailer is a display/persistence artifact;
+          // never replay it (it would duplicate text the model never produced
+          // and perturb the cached prefix). Strip it here so every caller of
+          // this provider is protected, not only the CLI.
+          if (isRenderedCitations(block)) {
+            blockIndex++;
+            continue;
+          }
+          // Empty text blocks (e.g. from an errored turn) are rejected by the
+          // API as malformed message items.
+          if (block.text.length === 0) {
+            blockIndex++;
+            continue;
+          }
           const signature = native ? parseTextSignature(block.textSignature) : undefined;
+          // Ids are per text item; key fabricated ids by block, not message,
+          // so multi-text messages do not collide. Real ids belong to the
+          // producing model — fabricate one on cross-model replay.
+          const fabricatedId = `msg_${msgIndex}_${blockIndex}`;
           items.push({
             type: "message",
             role: "assistant",
             status: "completed",
-            id: signature?.id ?? `msg_${msgIndex}`,
+            id: sameModel ? (signature?.id ?? fabricatedId) : fabricatedId,
             content: [
               {
                 type: "output_text",
                 text: block.text,
-                annotations: getCitations(block).map(citationToAnnotation),
+                // Citations reference the hosted search call, which is dropped
+                // on cross-model replay; drop the annotations with it.
+                annotations: sameModel ? getCitations(block).map(citationToAnnotation) : [],
               },
             ],
-            ...(signature?.phase ? { phase: signature.phase } : {}),
+            ...(sameModel && signature?.phase ? { phase: signature.phase } : {}),
           } as ResponseInputItem);
         } else if (block.type === "toolCall") {
           const [callId, itemId] = block.id.split("|");
           items.push({
             type: "function_call",
             // Replaying item ids from another model trips OpenAI's
-            // reasoning/function-call pairing validation; omit them.
-            id: native && msg.model === model.id ? itemId : undefined,
+            // reasoning/function-call pairing validation; omit them, and the
+            // literal "undefined" a missing item id would stringify to.
+            id: sameModel && itemId && itemId !== "undefined" ? itemId : undefined,
             call_id: callId ?? block.id,
             name: block.name,
             arguments: JSON.stringify(block.arguments),
           });
         } else if (block.type === "hostedToolCall") {
-          if (native) {
-            items.push(block.raw);
+          if (sameModel) {
+            // Blocks on native messages were produced by this provider; their
+            // raw items only replay cleanly to the same model.
+            items.push(block.raw as HostedToolCallItem);
           }
-          // Foreign hosted-tool blocks cannot be replayed to this API.
+          // Foreign or cross-model hosted-tool blocks cannot be replayed here.
         }
+        blockIndex++;
       }
     } else if (msg.role === "toolResult") {
       const textResult = msg.content
@@ -740,13 +723,17 @@ async function processNativeStream(
           .map((c) => (c.type === "output_text" ? c.text : c.type === "refusal" ? c.refusal : ""))
           .join("");
         textBlock.textSignature = encodeTextSignature(item.id, (item as { phase?: string }).phase);
-        // The completed item carries the authoritative annotation list.
+        // The completed item carries the authoritative annotation list when it
+        // has any. If it reports none, keep whatever streamed in rather than
+        // wiping it — the API normally populates annotations on the done item,
+        // but a stream that only delivered them via annotation events would
+        // otherwise lose them.
         const finalCitations = item.content.flatMap((c) =>
           c.type === "output_text"
             ? c.annotations.flatMap((a) => annotationToCitation(a) ?? [])
             : [],
         );
-        if (finalCitations.length > 0 || (textBlock.citations?.length ?? 0) > 0) {
+        if (finalCitations.length > 0) {
           textBlock.citations = finalCitations;
         }
         stream.push({
@@ -789,26 +776,34 @@ async function processNativeStream(
         }
       }
     } else if (event.type === "response.completed") {
-      const response = event.response;
-      if (response?.id) {
-        output.responseId = response.id;
+      finalizeUsage(event.response, output, model);
+      // A function call that received argument deltas but no output_item.done
+      // (rare, but the SDK does not guarantee one) would otherwise persist its
+      // scratch buffer; finalize and strip it here too.
+      for (const block of output.content) {
+        if (block.type === "toolCall" && "partialJson" in block) {
+          const tool = block as ToolCall & { partialJson?: string };
+          tool.arguments = parseStreamingJson(tool.partialJson || "{}");
+          delete tool.partialJson;
+        }
       }
-      if (response?.usage) {
-        const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
-        output.usage = {
-          input: (response.usage.input_tokens || 0) - cachedTokens,
-          output: response.usage.output_tokens || 0,
-          cacheRead: cachedTokens,
-          cacheWrite: 0,
-          totalTokens: response.usage.total_tokens || 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        };
-      }
-      calculateCost(model, output.usage);
-      output.stopReason = mapStopReason(response?.status);
+      output.stopReason = mapStopReason(event.response?.status);
       if (output.stopReason === "stop" && output.content.some((b) => b.type === "toolCall")) {
         output.stopReason = "toolUse";
       }
+    } else if (event.type === "response.incomplete") {
+      // The response was cut off (typically max_output_tokens). Drop any tool
+      // call still carrying the streaming scratch buffer, and any hosted tool
+      // call that never completed — replaying either (truncated arguments, or
+      // an in-progress hosted item) is rejected by the API and wedges the
+      // session. Report length rather than a clean stop.
+      finalizeUsage(event.response, output, model);
+      output.content = (output.content as HostedContentBlock[]).filter(
+        (b) =>
+          !(b.type === "toolCall" && "partialJson" in b) &&
+          !(isHostedToolCall(b) && b.status !== "completed"),
+      ) as AssistantMessage["content"];
+      output.stopReason = "length";
     } else if (event.type === "error") {
       throw new Error(`Error Code ${event.code}: ${event.message}`);
     } else if (event.type === "response.failed") {
@@ -822,6 +817,29 @@ async function processNativeStream(
       throw new Error(msg);
     }
   }
+}
+
+/** Capture token usage and cost from a terminal response object. */
+function finalizeUsage(
+  response: { id?: string; usage?: ResponseUsage } | undefined,
+  output: AssistantMessage,
+  model: Model<typeof OPENAI_NATIVE_API>,
+): void {
+  if (response?.id) {
+    output.responseId = response.id;
+  }
+  if (response?.usage) {
+    const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
+    output.usage = {
+      input: (response.usage.input_tokens || 0) - cachedTokens,
+      output: response.usage.output_tokens || 0,
+      cacheRead: cachedTokens,
+      cacheWrite: 0,
+      totalTokens: response.usage.total_tokens || 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+  }
+  calculateCost(model, output.usage);
 }
 
 function mapStopReason(status: string | undefined): StopReason {
