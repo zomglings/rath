@@ -60,9 +60,9 @@ async function main(): Promise<void> {
   );
 
   // Case 1: list_models, unfiltered then filtered.
-  const all = await byName.get("list_models")!.execute("m1", {});
+  const all = await byName.get("list_models")!.execute("list-all", {});
   assert.ok(all.details.models.length > 0, "lists some models");
-  const filtered = await byName.get("list_models")!.execute("m2", { filter: "gpt-5.5" });
+  const filtered = await byName.get("list_models")!.execute("list-filtered", { filter: "gpt-5.5" });
   assert.ok(filtered.details.models.length > 0, "filter matches");
   assert.ok(
     filtered.details.models.every((m: string) => m.includes("gpt-5.5")),
@@ -73,7 +73,7 @@ async function main(): Promise<void> {
 
   // Case 2: save_context writes JSON and sets the save-on-exit path.
   const outPath = join(work, "session.json");
-  const saved = await byName.get("save_context")!.execute("s1", { path: outPath });
+  const saved = await byName.get("save_context")!.execute("save", { path: outPath });
   assert.equal(saved.details.path, outPath);
   assert.equal(flags.savePath, outPath, "save path recorded for save-on-exit");
   const parsed = JSON.parse(readFileSync(outPath, "utf8"));
@@ -82,7 +82,7 @@ async function main(): Promise<void> {
   log("Case 2 OK: save_context writes session JSON and sets save-on-exit");
 
   // Case 3: end_session requests exit and terminates the loop.
-  const ended = await byName.get("end_session")!.execute("e1", {});
+  const ended = await byName.get("end_session")!.execute("end", {});
   assert.equal(exitCalls, 1, "requestExit called once");
   assert.equal(ended.terminate, true, "tool result asks the agent loop to stop");
   log("Case 3 OK: end_session requests exit and terminates");

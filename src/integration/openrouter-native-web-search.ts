@@ -35,7 +35,7 @@ import {
   registerOpenRouterNative,
 } from "../index.js";
 
-const MODEL_ID = process.env.RATH_TEST_MODEL || "openai/gpt-4o-mini";
+const MODEL_ID = process.env.RATH_TEST_MODEL || "openai/gpt-5.5";
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);

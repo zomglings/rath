@@ -13,7 +13,7 @@
  * needs none and uses the pass-through default).
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -163,43 +163,57 @@ export function createRequestHumanEditTool(
 
       const given = params.path?.trim();
       const isTemp = !given;
-      const targetPath = given
-        ? isAbsolute(given)
-          ? given
-          : join(cwd, given)
-        : join(mkdtempSync(join(tmpdir(), "rath-edit-")), "document.txt");
-
-      // Seed the file: explicit content wins; otherwise ensure the file exists
-      // so the editor opens cleanly (a fresh temp file or a brand-new path).
-      if (params.content !== undefined) {
-        writeFileSync(targetPath, params.content);
-      } else if (!existsSync(targetPath)) {
-        writeFileSync(targetPath, "");
+      // A temp-mode file lives in its own dir; track it so we can remove it if
+      // the edit fails. On success the dir is kept (its path is returned for
+      // the model to reference).
+      let tempDir: string | undefined;
+      let targetPath: string;
+      if (given) {
+        targetPath = isAbsolute(given) ? given : join(cwd, given);
+      } else {
+        tempDir = mkdtempSync(join(tmpdir(), "rath-edit-"));
+        targetPath = join(tempDir, "document.txt");
       }
 
-      const before = readFileSync(targetPath, "utf8");
-      const ran = suspend(() => openEditor(editorArgv, targetPath));
-      if (!ran) {
-        throw new Error(`Editor exited abnormally: ${editorArgv.join(" ")} ${targetPath}`);
-      }
-      const after = readFileSync(targetPath, "utf8");
-      const changed = after !== before;
-      const name = basename(targetPath);
-      const diff = changed ? createPatch(name, before, after, "before", "after") : "";
+      try {
+        // Seed the file: explicit content wins; otherwise ensure the file
+        // exists so the editor opens cleanly (a fresh temp file or new path).
+        if (params.content !== undefined) {
+          writeFileSync(targetPath, params.content);
+        } else if (!existsSync(targetPath)) {
+          writeFileSync(targetPath, "");
+        }
 
-      const header = changed
-        ? `The human edited ${targetPath}.`
-        : `The human made no changes to ${targetPath}.`;
-      const sections = [header];
-      if (changed) {
-        sections.push(`Diff:\n${diff}`);
-      }
-      sections.push(`Final contents of ${name}:\n${after}`);
+        const before = readFileSync(targetPath, "utf8");
+        const ran = suspend(() => openEditor(editorArgv, targetPath));
+        if (!ran) {
+          throw new Error(`Editor exited abnormally: ${editorArgv.join(" ")} ${targetPath}`);
+        }
+        const after = readFileSync(targetPath, "utf8");
+        const changed = after !== before;
+        const name = basename(targetPath);
+        const diff = changed ? createPatch(name, before, after, "before", "after") : "";
 
-      return {
-        content: [{ type: "text", text: sections.join("\n\n") }],
-        details: { path: targetPath, changed, diff, temp: isTemp },
-      };
+        const header = changed
+          ? `The human edited ${targetPath}.`
+          : `The human made no changes to ${targetPath}.`;
+        const sections = [header];
+        if (changed) {
+          sections.push(`Diff:\n${diff}`);
+        }
+        sections.push(`Final contents of ${name}:\n${after}`);
+
+        return {
+          content: [{ type: "text", text: sections.join("\n\n") }],
+          details: { path: targetPath, changed, diff, temp: isTemp },
+        };
+      } catch (error) {
+        // Don't leak the temp dir when the edit could not complete.
+        if (tempDir) {
+          rmSync(tempDir, { recursive: true, force: true });
+        }
+        throw error;
+      }
     },
   };
 }

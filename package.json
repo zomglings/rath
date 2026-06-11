@@ -1,6 +1,6 @@
 {
   "name": "@zomglings/rath",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "publishConfig": {
     "access": "public"
   },
@@ -12,7 +12,7 @@
     "url": "git+https://github.com/zomglings/rath.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "bin": {
     "rath": "dist/cli.js"
