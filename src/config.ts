@@ -92,6 +92,13 @@ const MIGRATIONS: Array<(db: SqliteDatabase) => void> = [
   (db) => {
     db.exec("CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   },
+  // v2: a generic TTL cache (used for the live model catalogue). value is JSON;
+  // fetched_at is epoch millis so callers can apply their own freshness window.
+  (db) => {
+    db.exec(
+      "CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, fetched_at INTEGER NOT NULL)",
+    );
+  },
 ];
 
 /** Apply any migrations the database has not yet seen. */
@@ -214,6 +221,49 @@ export function clearDefaultModel(): boolean {
   }
   try {
     db.prepare("DELETE FROM preferences WHERE key = ?").run(KEY_DEFAULT_MODEL);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    db.close();
+  }
+}
+
+/** A cached value with the epoch-millis time it was fetched. */
+export interface CacheEntry {
+  value: string;
+  fetchedAt: number;
+}
+
+/** Read a cache entry, or undefined when absent or the store is unavailable. */
+export function getCacheEntry(key: string): CacheEntry | undefined {
+  const db = openDb();
+  if (!db) {
+    return undefined;
+  }
+  try {
+    const row = db.prepare("SELECT value, fetched_at FROM cache WHERE key = ?").get(key) as
+      | { value: string; fetched_at: number }
+      | undefined;
+    return row ? { value: row.value, fetchedAt: row.fetched_at } : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    db.close();
+  }
+}
+
+/** Write a cache entry. Best-effort; returns whether it persisted. */
+export function setCacheEntry(key: string, value: string, fetchedAt: number): boolean {
+  const db = openDb();
+  if (!db) {
+    return false;
+  }
+  try {
+    db.prepare(
+      "INSERT INTO cache (key, value, fetched_at) VALUES (?, ?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, fetched_at = excluded.fetched_at",
+    ).run(key, value, fetchedAt);
     return true;
   } catch {
     return false;

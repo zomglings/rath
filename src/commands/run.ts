@@ -48,6 +48,7 @@ import {
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { ensureCatalogue, openRouterCatalogue } from "../catalogue.js";
 import { type Command, fullName, helpText } from "../command.js";
 import { clearDefaultModel, loadPreferences, setDefaultModel } from "../config.js";
 import {
@@ -537,14 +538,23 @@ export function resolveModel(spec: string): Model<Api> {
   return model;
 }
 
-/** All selectable model specs, native providers first. */
+/**
+ * All selectable model specs, native providers first. openrouter-native comes
+ * from the live catalogue (ensureCatalogue) when it has been primed, falling
+ * back to pi-ai's bundled registry otherwise; openai-native and the stock
+ * providers come from the bundled registry (what they validate against).
+ */
 export function listModels(filter?: string): string[] {
   const specs: string[] = [];
   for (const model of getModels("openai")) {
     specs.push(`${OPENAI_NATIVE_API}/${model.id}`);
   }
-  for (const model of getModels("openrouter")) {
-    specs.push(`${OPENROUTER_NATIVE_API}/${model.id}`);
+  const liveOpenRouter = openRouterCatalogue();
+  const openRouterIds = liveOpenRouter
+    ? [...liveOpenRouter.keys()].sort()
+    : getModels("openrouter").map((m) => m.id);
+  for (const id of openRouterIds) {
+    specs.push(`${OPENROUTER_NATIVE_API}/${id}`);
   }
   for (const provider of getProviders()) {
     for (const model of getModels(provider)) {
@@ -1333,6 +1343,11 @@ export const runCommand: Command = {
 
     registerOpenAINative();
     registerOpenRouterNative();
+    // Prime the live model catalogue before resolving models, so openrouter-
+    // native validates against the current OpenRouter list and /lsmodels is
+    // up to date. Best-effort: a network/timeout failure falls back to the
+    // cached or bundled registry. Cached results make this a no-op most runs.
+    await ensureCatalogue();
     // Shared with request_human_edit (via loadTools) so the editor can take the
     // terminal; the TUI replaces .suspend with a tui.stop/start wrapper.
     const terminal: TerminalController = { suspend: (fn) => fn() };

@@ -54,6 +54,7 @@ import {
   getModel,
   type KnownProvider,
   type Model,
+  type Provider,
   parseStreamingJson,
   registerApiProvider,
   type StopReason,
@@ -70,6 +71,7 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions/completions.js";
 import type { CompletionUsage } from "openai/resources/completions.js";
+import { openRouterCatalogue, type RawOpenRouterModel } from "../catalogue.js";
 import {
   type HostedContentBlock,
   type HostedTextContent,
@@ -145,11 +147,56 @@ export interface OpenRouterNativeOptions extends StreamOptions {
  * registry (e.g. "openai/gpt-4o", "anthropic/claude-haiku-4.5").
  */
 export function openrouterNativeModel(modelId: string): Model<typeof OPENROUTER_NATIVE_API> {
+  // When the live catalogue has been loaded it is the source of truth: validate
+  // against it and build the model from its metadata, so ids newer than pi-ai's
+  // bundled registry (e.g. anthropic/claude-fable-5 before a pi-ai bump) work.
+  const live = openRouterCatalogue();
+  if (live) {
+    const raw = live.get(modelId);
+    if (!raw) {
+      throw new Error(`Unknown OpenRouter model: ${modelId}`);
+    }
+    return liveOpenRouterModel(raw);
+  }
+  // No live catalogue (offline, or used as a library without priming): fall
+  // back to pi-ai's bundled registry.
   const base = getModel("openrouter" as KnownProvider, modelId as never) as Model<string>;
   if (!base) {
     throw new Error(`Unknown OpenRouter model: ${modelId}`);
   }
   return { ...base, api: OPENROUTER_NATIVE_API } as Model<typeof OPENROUTER_NATIVE_API>;
+}
+
+/** Build a provider Model from a live OpenRouter /models entry. */
+function liveOpenRouterModel(raw: RawOpenRouterModel): Model<typeof OPENROUTER_NATIVE_API> {
+  // OpenRouter prices per token (USD, as strings); pi-ai's cost is per million.
+  // Negative values are OpenRouter's sentinel for dynamic-priced auto-routers
+  // (e.g. openrouter/auto, "prompt":"-1"); treat those (and non-numbers) as 0 so
+  // cost accounting never goes negative.
+  const perMillion = (price?: string): number => {
+    const n = price === undefined ? 0 : Number(price);
+    return Number.isFinite(n) && n > 0 ? n * 1_000_000 : 0;
+  };
+  const input = (raw.architecture?.input_modalities ?? []).filter(
+    (m): m is "text" | "image" => m === "text" || m === "image",
+  );
+  return {
+    id: raw.id,
+    name: raw.name ?? raw.id,
+    api: OPENROUTER_NATIVE_API,
+    provider: "openrouter" as Provider,
+    baseUrl: "https://openrouter.ai/api/v1",
+    reasoning: raw.supported_parameters?.includes("reasoning") ?? false,
+    input: input.length > 0 ? input : ["text"],
+    cost: {
+      input: perMillion(raw.pricing?.prompt),
+      output: perMillion(raw.pricing?.completion),
+      cacheRead: perMillion(raw.pricing?.input_cache_read),
+      cacheWrite: perMillion(raw.pricing?.input_cache_write),
+    },
+    contextWindow: raw.top_provider?.context_length ?? raw.context_length ?? 0,
+    maxTokens: raw.top_provider?.max_completion_tokens ?? 0,
+  };
 }
 
 // ---------------------------------------------------------------------------

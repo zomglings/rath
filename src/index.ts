@@ -1,8 +1,17 @@
 export {
+  ensureCatalogue,
+  openRouterCatalogue,
+  type RawOpenRouterModel,
+  resetCatalogue,
+} from "./catalogue.js";
+export {
+  type CacheEntry,
   clearDefaultModel,
   configDir,
+  getCacheEntry,
   loadPreferences,
   type Preferences,
+  setCacheEntry,
   setDefaultModel,
 } from "./config.js";
 export {

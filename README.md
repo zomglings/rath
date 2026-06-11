@@ -73,9 +73,18 @@ Chat Completions API, capturing its `url_citation` annotations as the same
 structured `citations`. pi-ai routes OpenRouter through the stock
 `openai-completions` api, which drops those annotations; this provider
 preserves them. Register with `registerOpenRouterNative()` and use
-`openrouterNativeModel("openai/gpt-4o")` (any id from pi-ai's `openrouter`
-registry). It reuses the shared `hosted-tools` machinery, so citations,
-trailers, and flatten-on-handoff work identically.
+`openrouterNativeModel("openai/gpt-4o")`. It reuses the shared `hosted-tools`
+machinery, so citations, trailers, and flatten-on-handoff work identically.
+
+`openrouterNativeModel` validates the id against the **live** OpenRouter
+catalogue when it has been primed (`ensureCatalogue()` fetches OpenRouter's
+keyless `/api/v1/models`, cached in the SQLite config store with a freshness
+window),
+building the model from the live pricing/context metadata. This means ids
+newer than pi-ai's bundled registry (e.g. `anthropic/claude-fable-5` before a
+pi-ai bump) work, and unknown ids are rejected against the current list. When
+the catalogue has not been primed (used as a library without `ensureCatalogue`,
+or offline), it falls back to pi-ai's bundled `openrouter` registry.
 
 ## CLI
 
@@ -111,10 +120,18 @@ list to choose), since rath development inside `rath run` wants them on hand.
   and Ctrl+C interrupting the current turn instead of killing the session.
 - Models are explicit: `-m <provider>/<model-id>`. Without `-m`, the pinned
   default model (`/config default-model`) is used, falling back to the
-  built-in `openai-native/gpt-5.5`. Any registered pi-ai provider works.
+  built-in `openai-native/gpt-5.5`. Any registered pi-ai provider works. At
+  startup rath primes a live OpenRouter model catalogue (the keyless
+  `/api/v1/models`), cached in the config store, so `/lsmodels` and
+  openrouter-native model resolution reflect OpenRouter's current list rather
+  than pi-ai's bundled snapshot. (openai-native and the stock providers use
+  pi-ai's bundled registry, which carries the pricing/context metadata they
+  need; OpenAI's `/v1/models` is unfiltered and metadata-less, so it is not a
+  usable live source.)
 - Every startup setting is also settable in-session (both frontends), so a
-  session never has to be restarted to change configuration: `/info` shows
-  the configuration, `/sys [text]` shows or sets the system prompt,
+  session never has to be restarted to change configuration: `/config` shows
+  the configuration (`/config default-model [spec|none]` pins or clears the
+  persisted default model), `/sys [text]` shows or sets the system prompt,
   `/model [spec]` shows or switches the model, `/lsmodels [filter]` lists
   models, `/reasoning [level]` shows or sets the reasoning level
   (openai-native clamps it to the model's supported levels),
@@ -195,7 +212,9 @@ tools such as web search and code interpreter containers), which is why they
 are not part of the pre-commit checks. (Several tests are the exception:
 `request-human-edit`, `config-preferences`, `configure-tool`, `session-tools`,
 and `slow-mode-gate` call no API and need no key — they exercise the CLI tools
-and config store directly.) `RATH_TEST_MODEL` overrides the model used by the
+and config store directly; `catalogue` needs network but no key, hitting
+OpenRouter's keyless `/api/v1/models`, and skips cleanly when offline.)
+`RATH_TEST_MODEL` overrides the model used by the
 API tests (default: `gpt-5.5`; the OpenRouter test uses `openai/gpt-5.5`).
 Tests log a per-run token cost on success, and
 assert on request payloads via the provider's `onPayload` hook when they need
@@ -225,7 +244,11 @@ to prove what was actually sent to the API.
   precedence, `--wait` injection for GUI editors, no-editor error).
 - `config-preferences` — the SQLite config store (no API, no key): config-dir
   resolution, default-model set/update/clear round-trip, automatic schema
-  migration to v1, re-open idempotency, and forward-compatibility.
+  migration, re-open idempotency, and forward-compatibility.
+- `catalogue` — the live model catalogue (network, no key): fetches and caches
+  OpenRouter's `/api/v1/models`, validates openrouter-native against the live
+  list (builds a model with per-million costs; rejects unknown ids), and reuses
+  the cache within the freshness window. Skips cleanly when offline.
 - `configure-tool` — the configure tool (no API, no key): every field applied
   to agent state and flags, rebuilding the tool set including configure
   itself, per-field error reporting, the empty-call no-op, and pinning/clearing
