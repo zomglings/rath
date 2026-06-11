@@ -99,17 +99,19 @@ rath <command> -h         # help for any (sub)command
 ### rath run
 
 `rath run` starts a generic agent loop with nothing implicit: no skill
-discovery, no context-file walking (AGENTS.md is never read), no tools unless
-explicitly enabled with `--tools`. The model sees exactly what the flags
-specify; the provider API key is the only input taken from the environment.
-rath development itself is meant to happen inside `rath run`.
+discovery, no context-file walking (AGENTS.md is never read). The model sees
+exactly what the flags specify; the provider API key is the only input taken
+from the environment. The one convenience default is tools: `--tools` enables
+all client-side tools when omitted (pass `--tools none` to disable them, or a
+list to choose), since rath development inside `rath run` wants them on hand.
 
 - Two interactive frontends: a plain readline REPL (default; also handles
   `-p` one-shots) and a pi-tui interface (`-T`/`--tui`) with differential
   rendering, an editor input, selector overlays for the session commands,
   and Ctrl+C interrupting the current turn instead of killing the session.
-- Models are explicit: `-m <provider>/<model-id>` (default
-  `openai-native/gpt-5-mini`; any registered pi-ai provider works).
+- Models are explicit: `-m <provider>/<model-id>`. Without `-m`, the pinned
+  default model (`/config default-model`) is used, falling back to the
+  built-in `openai-native/gpt-5.5`. Any registered pi-ai provider works.
 - Every startup setting is also settable in-session (both frontends), so a
   session never has to be restarted to change configuration: `/info` shows
   the configuration, `/sys [text]` shows or sets the system prompt,
@@ -136,9 +138,29 @@ rath development itself is meant to happen inside `rath run`.
   free when the context is handed to a provider that does not understand
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
-- `--tools read,bash,edit,write,grep,find,ls` enables client-side tools from
-  `@earendil-works/pi-coding-agent`. They run with your privileges in the
-  current directory.
+- `--tools` enables client-side tools (the full set:
+  `read,bash,edit,write,grep,find,ls,request_human_edit,configure,list_models,save_context,end_session`).
+  Omitting `--tools` enables all of them; `--tools none` disables them. The
+  first seven come from `@earendil-works/pi-coding-agent` and run with your
+  privileges in the current directory; the rest are rath's own tools, which
+  give the model the same controls over the session that you have through the
+  slash commands — the agent operates the harness as a peer, not a passenger.
+- `request_human_edit` is rath's human-in-the-loop tool: it opens a file in
+  your editor (`$VISUAL`/`$EDITOR`, falling back to the first of `code`, `vim`,
+  `emacs`, `nano` on PATH; GUI editors like `code`/`cursor` get `--wait`
+  appended so the call blocks) and waits for you to save and quit, then returns
+  the final contents and a unified diff of your changes. The agent can seed the
+  file with a draft via `content`, name a `path`, or let it use a temp file
+  (whose path is returned either way). The TUI suspends while the editor runs.
+- `configure` lets the model inspect or change its own session settings (model,
+  reasoning, web search, mode, active tools, system prompt) and pin the
+  persisted default model (`defaultModel`) for future sessions; calling it with
+  no fields just reads the configuration. `list_models` enumerates the model
+  catalog (the tool form of `/lsmodels`). `save_context` writes the session
+  JSON to a path (the tool form of `/save`). `end_session` ends the session
+  (the tool form of `/exit`). All are ordinary tool calls, so in slow mode they
+  are gated behind the per-call confirmation — the model proposes, you approve
+  — and in go mode they apply immediately.
 - `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
   from one.
 
@@ -166,11 +188,13 @@ rebuild — no registration step.
 
 ### Requirements and conventions
 
-The current tests call the live OpenAI API: they require `OPENAI_API_KEY` in
+Most tests call the live OpenAI API: they require `OPENAI_API_KEY` in
 the environment and fail fast with a clear error when it is missing. They
 cost real money (fractions of a cent in tokens, plus per-use fees for hosted
 tools such as web search and code interpreter containers), which is why they
-are not part of the pre-commit checks. `RATH_TEST_MODEL` overrides the model
+are not part of the pre-commit checks. (`request-human-edit` is the exception:
+it calls no API and needs no key — it drives the editor tool with a fake
+editor script.) `RATH_TEST_MODEL` overrides the model
 (default: `gpt-5-mini`). Tests log a per-run token cost on success, and
 assert on request payloads via the provider's `onPayload` hook when they need
 to prove what was actually sent to the API.
@@ -193,6 +217,20 @@ to prove what was actually sent to the API.
   `stream()`: ToolCall block shape (structured arguments, `callId|itemId`
   id, `stopReason "toolUse"`), then `function_call`/`function_call_output`
   replay with matching `call_id`.
+- `request-human-edit` — the request_human_edit tool, driven by a fake editor
+  (no API, no key). Covers temp-file vs given-path round-trips (consistent
+  return shape), the no-change case, and editor resolution ($VISUAL/$EDITOR
+  precedence, `--wait` injection for GUI editors, no-editor error).
+- `config-preferences` — the SQLite config store (no API, no key): config-dir
+  resolution, default-model set/update/clear round-trip, automatic schema
+  migration to v1, re-open idempotency, and forward-compatibility.
+- `configure-tool` — the configure tool (no API, no key): every field applied
+  to agent state and flags, rebuilding the tool set including configure
+  itself, per-field error reporting, the empty-call no-op, and pinning/clearing
+  the persisted default model.
+- `session-tools` — the session-operating tools (no API, no key): list_models
+  enumerates and filters the catalog, save_context writes the session JSON and
+  sets the save-on-exit path, and end_session requests exit and terminates.
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

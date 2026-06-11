@@ -1,11 +1,12 @@
 /**
  * `rath run`: a generic agent loop with nothing implicit.
  *
- * No skill discovery, no context-file walking (AGENTS.md is never read), no
- * tools unless explicitly enabled via --tools. The model sees exactly what
- * the flags specify: the system prompt, the loaded context, and the user's
- * prompts. The only thing taken from the environment is the provider API
- * key. rath development itself is meant to happen inside `rath run`.
+ * No skill discovery, no context-file walking (AGENTS.md is never read). The
+ * model sees exactly what the flags specify: the system prompt, the loaded
+ * context, and the user's prompts. The only thing taken from the environment
+ * is the provider API key. Client-side tools are the one convenience default:
+ * --tools defaults to all of them (pass --tools none to disable, or a list to
+ * choose), since rath development inside `rath run` wants them on hand.
  *
  * Built on pi-agent-core's Agent (the stateful loop wrapper: transcript,
  * lifecycle events, tool execution, model switching via state.model) and
@@ -20,13 +21,14 @@
  * time and cost nothing.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import {
   Agent,
   type AgentTool,
+  type AgentToolResult,
   type BeforeToolCallContext,
   type BeforeToolCallResult,
 } from "@earendil-works/pi-agent-core";
@@ -45,7 +47,9 @@ import {
 } from "@earendil-works/pi-ai";
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { type Command, fullName, helpText } from "../command.js";
+import { clearDefaultModel, loadPreferences, setDefaultModel } from "../config.js";
 import {
   applyCitationTrailer,
   contentBlocks,
@@ -61,6 +65,8 @@ import {
   stripRenderedCitations,
   uniqueUrlCitations,
 } from "../index.js";
+import { createRequestHumanEditTool } from "../tools/request-human-edit.js";
+import { isOnPath } from "../which.js";
 
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
@@ -75,8 +81,33 @@ function dim(text: string): string {
 export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
-export const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+export const TOOL_NAMES = [
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+  "request_human_edit",
+  "configure",
+  "list_models",
+  "save_context",
+  "end_session",
+] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
+
+// rath's own tools, which operate the running session rather than the
+// filesystem. Everything else comes from @earendil-works/pi-coding-agent.
+const RATH_TOOLS = [
+  "request_human_edit",
+  "configure",
+  "list_models",
+  "save_context",
+  "end_session",
+] as const;
+type RathToolName = (typeof RATH_TOOLS)[number];
+type PiToolName = Exclude<ToolName, RathToolName>;
 
 // Interaction modes for `rath run`:
 // - "go": full speed, no inspection. Stream everything, never block, tools run
@@ -87,6 +118,11 @@ export type ToolName = (typeof TOOL_NAMES)[number];
 //   per-call confirmation before it runs.
 export const MODES = ["go", "slow"] as const;
 export type Mode = (typeof MODES)[number];
+
+// The default for the (DB-stored) default model: used when neither -m nor a
+// pinned default model (preferences, set via /config default-model) supplies
+// one. Hence the doubled name — it is the default of the default.
+export const DEFAULT_DEFAULT_MODEL = `${OPENAI_NATIVE_API}/gpt-5.5`;
 
 export interface RunFlags {
   model: string;
@@ -119,22 +155,345 @@ export function isLongOutput(text: string): boolean {
 }
 
 /**
- * Load the requested client-side tools from @earendil-works/pi-coding-agent.
- * Imported lazily: the package is large and only needed when --tools is used.
+ * Context rath's own tools need to operate the running session: the editor
+ * takes the terminal (suspendTerminal); configure/save_context reach the live
+ * Agent (getAgent, set once it exists) and mutate flags in place; end_session
+ * asks the frontend to quit (requestExit). The session-coupled tools are
+ * skipped when their required context is absent.
  */
-export async function loadTools(names: ToolName[], cwd: string): Promise<AgentTool[]> {
-  const pi = await import("@earendil-works/pi-coding-agent");
-  // Typed as AgentTool so pi-coding-agent API drift fails compilation here.
-  const factories: Record<ToolName, (cwd: string) => AgentTool> = {
-    read: pi.createReadTool,
-    bash: pi.createBashTool,
-    edit: pi.createEditTool,
-    write: pi.createWriteTool,
-    grep: pi.createGrepTool,
-    find: pi.createFindTool,
-    ls: pi.createLsTool,
+export interface ToolContext {
+  suspendTerminal?: <T>(fn: () => T) => T;
+  getAgent?: () => Agent;
+  flags?: RunFlags;
+  requestExit?: () => void;
+}
+
+/**
+ * Load the requested client-side tools, preserving the requested order. The
+ * pi-coding-agent tools are imported lazily (the package is large) and only
+ * when at least one is requested. rath's own tools (RATH_TOOLS) are built from
+ * `ctx`; a tool whose required context is missing is skipped.
+ */
+export async function loadTools(
+  names: ToolName[],
+  cwd: string,
+  ctx: ToolContext = {},
+): Promise<AgentTool[]> {
+  const piNames = names.filter((n): n is PiToolName => !RATH_TOOLS.includes(n as RathToolName));
+  let piFactories: Record<PiToolName, (cwd: string) => AgentTool> | undefined;
+  if (piNames.length > 0) {
+    const pi = await import("@earendil-works/pi-coding-agent");
+    // Typed as AgentTool so pi-coding-agent API drift fails compilation here.
+    piFactories = {
+      read: pi.createReadTool,
+      bash: pi.createBashTool,
+      edit: pi.createEditTool,
+      write: pi.createWriteTool,
+      grep: pi.createGrepTool,
+      find: pi.createFindTool,
+      ls: pi.createLsTool,
+    };
+  }
+  const tools: AgentTool[] = [];
+  for (const name of names) {
+    switch (name) {
+      case "request_human_edit":
+        tools.push(
+          createRequestHumanEditTool({ cwd, suspendTerminal: ctx.suspendTerminal }) as AgentTool,
+        );
+        break;
+      case "configure":
+        if (ctx.getAgent && ctx.flags) {
+          tools.push(
+            createConfigureTool({
+              getAgent: ctx.getAgent,
+              flags: ctx.flags,
+              suspendTerminal: ctx.suspendTerminal,
+            }),
+          );
+        }
+        break;
+      case "list_models":
+        tools.push(createListModelsTool());
+        break;
+      case "save_context":
+        if (ctx.getAgent && ctx.flags) {
+          tools.push(createSaveContextTool({ getAgent: ctx.getAgent, flags: ctx.flags }));
+        }
+        break;
+      case "end_session":
+        if (ctx.requestExit) {
+          tools.push(createEndSessionTool({ requestExit: ctx.requestExit }));
+        }
+        break;
+      default:
+        tools.push(piFactories![name](cwd));
+    }
+  }
+  return tools;
+}
+
+/**
+ * Lets a tool that must own the terminal (request_human_edit's editor) suspend
+ * whatever UI the active frontend is running. The plain REPL holds no UI
+ * mid-turn, so its controller is a pass-through; the TUI swaps in a
+ * tui.stop()/start() wrapper once it is up.
+ */
+interface TerminalController {
+  suspend: <T>(fn: () => T) => T;
+}
+
+const CONFIGURE_PARAMETERS = Type.Object({
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Switch the session model, as <provider>/<model-id> (e.g. openai-native/gpt-5.5).",
+    }),
+  ),
+  reasoning: Type.Optional(
+    Type.Union(
+      REASONING_LEVELS.map((level) => Type.Literal(level)),
+      { description: "Reasoning effort for models that support it." },
+    ),
+  ),
+  webSearch: Type.Optional(
+    Type.Boolean({
+      description: "Enable or disable hosted web search (openai-native / openrouter-native).",
+    }),
+  ),
+  mode: Type.Optional(
+    Type.Union(
+      MODES.map((mode) => Type.Literal(mode)),
+      {
+        description:
+          "Interaction mode: 'go' (full speed) or 'slow' (page output, confirm each tool call).",
+      },
+    ),
+  ),
+  tools: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Replace the active client-side tools with exactly these names (empty array disables all).",
+    }),
+  ),
+  systemPrompt: Type.Optional(Type.String({ description: "Replace the system prompt." })),
+  defaultModel: Type.Optional(
+    Type.String({
+      description:
+        "Pin the persisted default model for FUTURE sessions, as <provider>/<model-id>; " +
+        "'none' clears it. Unlike `model` (this session only), this is saved across sessions.",
+    }),
+  ),
+});
+
+export interface ConfigureDetails {
+  /** Human-readable description of each applied change. */
+  changes: string[];
+  /** Per-field errors for changes that were rejected. */
+  errors: string[];
+}
+
+/**
+ * The `configure` tool: lets the model inspect or change its own session
+ * settings (model, reasoning, web search, mode, tools, system prompt) and pin
+ * the persisted default model for future sessions. Changes take effect on the
+ * next turn, like the slash commands. It is an ordinary tool call, so in slow
+ * mode it is gated behind the per-call confirmation (the human approves the
+ * model's proposed change); in go mode it applies immediately. Takes the full
+ * ToolContext so a tools rebuild keeps every rath tool wired (getAgent and
+ * flags are guaranteed by the loadTools call site).
+ */
+function createConfigureTool(
+  ctx: ToolContext,
+): AgentTool<typeof CONFIGURE_PARAMETERS, ConfigureDetails> {
+  const getAgent = ctx.getAgent!;
+  const flags = ctx.flags!;
+  const msg = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+  return {
+    name: "configure",
+    label: "Configure session",
+    description:
+      "Inspect or change your own session settings: model, reasoning level, web search, " +
+      "interaction mode, active client-side tools, and system prompt. Call with no fields to " +
+      "just read the current configuration; provide only the fields you want to change (they " +
+      "take effect on the next turn). Either way the result reports the full configuration. " +
+      "Use `defaultModel` to pin the model for future sessions (persisted), distinct from " +
+      "`model` which changes only this session.",
+    parameters: CONFIGURE_PARAMETERS,
+    execute: async (_toolCallId, params): Promise<AgentToolResult<ConfigureDetails>> => {
+      const agent = getAgent();
+      const changes: string[] = [];
+      const errors: string[] = [];
+
+      if (params.model !== undefined) {
+        try {
+          agent.state.model = resolveModel(params.model);
+          flags.model = params.model;
+          changes.push(`model -> ${params.model}`);
+        } catch (error) {
+          errors.push(`model: ${msg(error)}`);
+        }
+      }
+      if (params.reasoning !== undefined) {
+        agent.state.thinkingLevel = params.reasoning;
+        flags.reasoning = params.reasoning;
+        changes.push(`reasoning -> ${params.reasoning}`);
+      }
+      if (params.webSearch !== undefined) {
+        flags.webSearch = params.webSearch;
+        changes.push(`web search -> ${params.webSearch ? "on" : "off"}`);
+      }
+      if (params.mode !== undefined) {
+        flags.mode = params.mode;
+        changes.push(`mode -> ${params.mode}`);
+      }
+      if (params.tools !== undefined) {
+        const invalid = params.tools.filter((n) => !TOOL_NAMES.includes(n as ToolName));
+        if (invalid.length > 0) {
+          errors.push(`tools: unknown ${invalid.join(", ")} (use ${TOOL_NAMES.join(", ")})`);
+        } else {
+          const names = params.tools as ToolName[];
+          try {
+            agent.state.tools = await loadTools(names, process.cwd(), ctx);
+            flags.tools = names;
+            changes.push(`tools -> ${names.length > 0 ? names.join(", ") : "none"}`);
+          } catch (error) {
+            errors.push(`tools: ${msg(error)}`);
+          }
+        }
+      }
+      if (params.systemPrompt !== undefined) {
+        agent.state.systemPrompt = params.systemPrompt;
+        flags.systemPrompt = params.systemPrompt;
+        changes.push(`system prompt -> set (${params.systemPrompt.length} chars)`);
+      }
+      if (params.defaultModel !== undefined) {
+        const spec = params.defaultModel.trim();
+        if (spec === "" || spec === "none") {
+          clearDefaultModel();
+          changes.push(`default model -> cleared (built-in ${DEFAULT_DEFAULT_MODEL})`);
+        } else {
+          try {
+            resolveModel(spec);
+            setDefaultModel(spec);
+            changes.push(`default model -> ${spec} (persisted, future sessions)`);
+          } catch (error) {
+            errors.push(`defaultModel: ${msg(error)}`);
+          }
+        }
+      }
+
+      const snapshot = sessionInfo(agent, flags)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join("\n");
+      const header =
+        changes.length > 0
+          ? `Applied (effective next turn): ${changes.join("; ")}.`
+          : "No changes requested.";
+      const errorLine = errors.length > 0 ? `\n\nErrors: ${errors.join("; ")}` : "";
+      return {
+        content: [
+          { type: "text", text: `${header}${errorLine}\n\nCurrent configuration:\n${snapshot}` },
+        ],
+        details: { changes, errors },
+      };
+    },
   };
-  return names.map((name) => factories[name](cwd));
+}
+
+const LIST_MODELS_PARAMETERS = Type.Object({
+  filter: Type.Optional(
+    Type.String({
+      description: "Substring filter on <provider>/<model-id> (e.g. 'gpt-5', 'openrouter').",
+    }),
+  ),
+});
+
+export interface ListModelsDetails {
+  models: string[];
+}
+
+/** The `list_models` tool: the model enumerates the model specs it can switch to. */
+function createListModelsTool(): AgentTool<typeof LIST_MODELS_PARAMETERS, ListModelsDetails> {
+  return {
+    name: "list_models",
+    label: "List models",
+    description:
+      "List the model specs you can switch to, as <provider>/<model-id>, optionally filtered by " +
+      "a substring. Use these ids with configure's `model` or `defaultModel`.",
+    parameters: LIST_MODELS_PARAMETERS,
+    execute: async (_toolCallId, params): Promise<AgentToolResult<ListModelsDetails>> => {
+      const filter = params.filter && params.filter.length > 0 ? params.filter : undefined;
+      const specs = listModels(filter);
+      const footer = `${specs.length} model${specs.length === 1 ? "" : "s"}${
+        filter ? ` matching "${filter}"` : ""
+      }`;
+      const text = specs.length > 0 ? `${specs.join("\n")}\n${footer}` : footer;
+      return { content: [{ type: "text", text }], details: { models: specs } };
+    },
+  };
+}
+
+const SAVE_CONTEXT_PARAMETERS = Type.Object({
+  path: Type.String({
+    description: "Path to write the session context (JSON) to; also becomes the save-on-exit path.",
+  }),
+});
+
+export interface SaveContextDetails {
+  path: string;
+}
+
+/** The `save_context` tool: the model persists the session for later --load. */
+function createSaveContextTool(opts: {
+  getAgent: () => Agent;
+  flags: RunFlags;
+}): AgentTool<typeof SAVE_CONTEXT_PARAMETERS, SaveContextDetails> {
+  return {
+    name: "save_context",
+    label: "Save context",
+    description:
+      "Save the current session context (messages and system prompt) as JSON to a path, so it " +
+      "can be resumed later with --load. The path also becomes the save-on-exit path.",
+    parameters: SAVE_CONTEXT_PARAMETERS,
+    execute: async (_toolCallId, params): Promise<AgentToolResult<SaveContextDetails>> => {
+      saveContext(opts.getAgent(), params.path);
+      opts.flags.savePath = params.path;
+      return {
+        content: [{ type: "text", text: `Saved context to ${params.path}.` }],
+        details: { path: params.path },
+      };
+    },
+  };
+}
+
+const END_SESSION_PARAMETERS = Type.Object({});
+
+export interface EndSessionDetails {
+  ended: true;
+}
+
+/** The `end_session` tool: the model ends the rath session (like /exit). */
+function createEndSessionTool(opts: {
+  requestExit: () => void;
+}): AgentTool<typeof END_SESSION_PARAMETERS, EndSessionDetails> {
+  return {
+    name: "end_session",
+    label: "End session",
+    description:
+      "End the rath session, as the human would with /exit. Save-on-exit still runs if set. Use " +
+      "when the work is complete and there is nothing left to do.",
+    parameters: END_SESSION_PARAMETERS,
+    execute: async (): Promise<AgentToolResult<EndSessionDetails>> => {
+      opts.requestExit();
+      return {
+        content: [{ type: "text", text: "Ending the session." }],
+        details: { ended: true },
+        // Stop the agent loop after this batch; the frontend then exits.
+        terminate: true,
+      };
+    },
+  };
 }
 
 export function resolveModel(spec: string): Model<Api> {
@@ -202,15 +561,21 @@ export function saveContext(agent: Agent, path: string): void {
   );
 }
 
-/** Current session configuration as key/value pairs, for /info displays. */
+/** Current configuration as key/value pairs, for the /config display. */
 export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
   const tools = agent.state.tools.map((t) => t.name);
+  const pinnedDefault = loadPreferences().defaultModel;
   return [
-    ["model", flags.model],
+    ["model (session)", flags.model],
+    [
+      "default model",
+      pinnedDefault ?? `built-in: ${DEFAULT_DEFAULT_MODEL} (/config default-model to pin)`,
+    ],
     ["mode", flags.mode === "slow" ? "slow (paging + tool confirmation)" : "go (full speed)"],
     ["reasoning", String(agent.state.thinkingLevel)],
     ["web search", flags.webSearch ? "on (hosted, openai-native / openrouter-native only)" : "off"],
-    ["tools", tools.length > 0 ? tools.join(", ") : "none"],
+    ["tools (active)", tools.length > 0 ? tools.join(", ") : "none"],
+    ["tools (available)", TOOL_NAMES.join(", ")],
     ["skills", "none (rath run loads no skills or context files)"],
     ["system prompt", "/sys to view or set"],
     ["messages in context", String(agent.state.messages.length)],
@@ -233,6 +598,8 @@ export async function handleSlashCommand(
   input: string,
   agent: Agent,
   flags: RunFlags,
+  terminal: TerminalController,
+  requestExit: () => void = () => {},
 ): Promise<SlashResult | undefined> {
   if (!input.startsWith("/")) {
     return undefined;
@@ -244,12 +611,43 @@ export async function handleSlashCommand(
   switch (command) {
     case "/exit":
       return { exit: true };
-    case "/info":
+    case "/config": {
+      // Subcommands manage persisted preferences; bare /config shows everything.
+      const [sub = "", ...subRest] = arg.split(/\s+/).filter((s) => s.length > 0);
+      if (sub === "default-model") {
+        const spec = subRest.join(" ").trim();
+        if (spec.length === 0) {
+          const pinned = loadPreferences().defaultModel;
+          return {
+            output: pinned
+              ? `default model: ${pinned}`
+              : `default model: (none pinned; built-in ${DEFAULT_DEFAULT_MODEL})`,
+          };
+        }
+        if (spec === "none" || spec === "clear") {
+          clearDefaultModel();
+          return { output: `default model cleared (built-in ${DEFAULT_DEFAULT_MODEL})` };
+        }
+        try {
+          resolveModel(spec);
+        } catch (error) {
+          return { output: error instanceof Error ? error.message : String(error), isError: true };
+        }
+        setDefaultModel(spec);
+        return { output: `default model pinned: ${spec} (applies to new sessions)` };
+      }
+      if (sub.length > 0) {
+        return {
+          output: `Unknown /config subcommand: ${sub} (use /config or /config default-model [spec|none])`,
+          isError: true,
+        };
+      }
       return {
         output: sessionInfo(agent, flags)
           .map(([key, value]) => `${key}: ${value}`)
           .join("\n"),
       };
+    }
     case "/sys": {
       if (arg.length === 0) {
         const prompt = agent.state.systemPrompt;
@@ -294,7 +692,12 @@ export async function handleSlashCommand(
       }
       const names = requested as ToolName[];
       try {
-        agent.state.tools = await loadTools(names, process.cwd());
+        agent.state.tools = await loadTools(names, process.cwd(), {
+          suspendTerminal: (fn) => terminal.suspend(fn),
+          getAgent: () => agent,
+          flags,
+          requestExit,
+        });
         flags.tools = names;
         return { output: `tools: ${names.join(", ")}${deferred}` };
       } catch (error) {
@@ -321,7 +724,9 @@ export async function handleSlashCommand(
       try {
         agent.state.model = resolveModel(arg);
         flags.model = arg;
-        return { output: `model: ${arg}${deferred}` };
+        return {
+          output: `model: ${arg}${deferred} (/config default-model to pin across sessions)`,
+        };
       } catch (error) {
         return { output: error instanceof Error ? error.message : String(error), isError: true };
       }
@@ -373,9 +778,10 @@ export async function handleSlashCommand(
     default:
       return {
         output:
-          `Unknown command: ${command} (commands: /info, /sys [text], /model [spec], ` +
-          "/lsmodels [filter], /reasoning [level], /websearch [on|off], /tools [names|none], " +
-          "/mode [go|slow], /go, /slow, /save [path], /exit)",
+          `Unknown command: ${command} (commands: /config [default-model [spec|none]], ` +
+          "/sys [text], /model [spec], /lsmodels [filter], /reasoning [level], " +
+          "/websearch [on|off], /tools [names|none], /mode [go|slow], /go, /slow, " +
+          "/save [path], /exit)",
         isError: true,
       };
   }
@@ -592,6 +998,22 @@ export function buildPagedTurnText(message: AssistantMessage): string {
 }
 
 /**
+ * The pager command (argv array) to use: $PAGER split on spaces if set,
+ * otherwise the first detected default among `less -R` and `more`. Returns []
+ * when nothing usable is found, which makes runExternalPager a no-op so the
+ * caller renders inline.
+ */
+export function resolvePagerCommand(): string[] {
+  const pagerEnv = (process.env.PAGER ?? "").trim();
+  if (pagerEnv.length > 0) {
+    // Split on spaces so PAGER="less -R" works (the common shell convention).
+    return pagerEnv.split(/\s+/);
+  }
+  const defaults = [["less", "-R"], ["more"]];
+  return defaults.find((argv) => argv[0] !== undefined && isOnPath(argv[0])) ?? [];
+}
+
+/**
  * Run the external pager ($PAGER, default `less -R`) on `text`, full-screen,
  * with vim/arrow/PgUp-PgDn navigation and search — i.e. real less behavior.
  * Returns true when the pager ran, false when no usable pager was found or it
@@ -610,50 +1032,6 @@ export function buildPagedTurnText(message: AssistantMessage): string {
  * caller must own the terminal first (the plain REPL is between reads; the TUI
  * suspends itself with tui.stop()).
  */
-/**
- * Resolve `cmd` against PATH the way a shell would, returning true if an
- * executable by that name exists. A name containing a path separator is
- * checked directly. On Windows, PATHEXT extensions (.exe/.cmd/...) are tried
- * for names without their own extension. This only checks existence; it never
- * runs the candidate.
- */
-function isOnPath(cmd: string): boolean {
-  const exts =
-    process.platform === "win32"
-      ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
-      : [""];
-  const hasExt = exts.some((e) => e !== "" && cmd.toLowerCase().endsWith(e.toLowerCase()));
-  const names = hasExt ? [cmd] : exts.map((e) => cmd + e);
-  const isFile = (p: string): boolean => {
-    try {
-      return existsSync(p) && statSync(p).isFile();
-    } catch {
-      return false;
-    }
-  };
-  if (cmd.includes("/") || cmd.includes("\\") || isAbsolute(cmd)) {
-    return names.some(isFile);
-  }
-  const dirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
-  return dirs.some((dir) => names.some((n) => isFile(join(dir, n))));
-}
-
-/**
- * The pager command (argv array) to use: $PAGER split on spaces if set,
- * otherwise the first detected default among `less -R` and `more`. Returns []
- * when nothing usable is found, which makes runExternalPager a no-op so the
- * caller renders inline.
- */
-export function resolvePagerCommand(): string[] {
-  const pagerEnv = (process.env.PAGER ?? "").trim();
-  if (pagerEnv.length > 0) {
-    // Split on spaces so PAGER="less -R" works (the common shell convention).
-    return pagerEnv.split(/\s+/);
-  }
-  const defaults = [["less", "-R"], ["more"]];
-  return defaults.find((argv) => argv[0] !== undefined && isOnPath(argv[0])) ?? [];
-}
-
 export function runExternalPager(text: string): boolean {
   const parts = resolvePagerCommand();
   const [cmd, ...rest] = parts;
@@ -695,15 +1073,17 @@ export const runCommand: Command = {
   summary: "Run a generic agent loop",
   description:
     "Starts an agent loop with nothing implicit: no skill discovery, no\n" +
-    "context-file walking, no tools unless explicitly enabled. The model sees\n" +
-    "exactly what the flags specify. The provider API key (e.g.\n" +
-    "OPENAI_API_KEY) is the only input taken from the environment.\n" +
+    "context-file walking. The model sees exactly what the flags specify. The\n" +
+    "provider API key (e.g. OPENAI_API_KEY) is the only input taken from the\n" +
+    "environment. Tools are the one convenience default: --tools enables all\n" +
+    "client-side tools when omitted (--tools none to disable, or a list).\n" +
     "\n" +
     "Without --prompt, reads prompts interactively (plain REPL, or pi-tui\n" +
     "with -T/--tui). Every startup setting is also settable in-session:\n" +
-    "  /info                  show the session configuration\n" +
+    "  /config                show the configuration\n" +
+    "  /config default-model [spec|none]  pin or clear the default model\n" +
     "  /sys [text]            show or set the system prompt\n" +
-    "  /model [provider/id]   show or switch the model\n" +
+    "  /model [provider/id]   show or switch the session model\n" +
     "  /lsmodels [filter]     list available models\n" +
     "  /reasoning [level]     show or set the reasoning level\n" +
     "  /websearch [on|off]    show or toggle hosted web search\n" +
@@ -764,8 +1144,9 @@ export const runCommand: Command = {
       takesValue: true,
       repeatable: true,
       description:
-        "Enable client-side tools (comma-separated or repeated): read, bash, edit, write, " +
-        "grep, find, ls. They run with your privileges in the current directory.",
+        "Client-side tools to enable (comma-separated or repeated): read, bash, edit, write, " +
+        "grep, find, ls, request_human_edit. Omit to enable all of them; pass --tools none to " +
+        "disable. They run with your privileges in the current directory.",
     },
     {
       long: "load",
@@ -780,7 +1161,7 @@ export const runCommand: Command = {
   ],
   async run(prefix, argv) {
     const flags: RunFlags = {
-      model: `${OPENAI_NATIVE_API}/gpt-5-mini`,
+      model: DEFAULT_DEFAULT_MODEL,
       systemPrompt: "You are a helpful assistant.",
       reasoning: "low",
       webSearch: true,
@@ -790,6 +1171,12 @@ export const runCommand: Command = {
     };
     let systemPromptFile: string | undefined;
     let systemPromptExplicit = false;
+    // Tools default to all when --tools is omitted; an explicit --tools (even
+    // "none") opts out of that default.
+    let toolsExplicit = false;
+    // -m wins; otherwise the last-used model from preferences becomes the
+    // default, falling back to the built-in default below.
+    let modelExplicit = false;
     for (let i = 0; i < argv.length; i++) {
       const token = argv[i]!;
       const value = (): string => {
@@ -808,6 +1195,7 @@ export const runCommand: Command = {
         }
         if (token === "-m" || token === "--model") {
           flags.model = value();
+          modelExplicit = true;
         } else if (token === "-p" || token === "--prompt") {
           flags.prompt = value();
         } else if (token === "-T" || token === "--tui") {
@@ -837,14 +1225,25 @@ export const runCommand: Command = {
         } else if (token === "--no-web-search") {
           flags.webSearch = false;
         } else if (token === "--tools") {
-          for (const name of value().split(",")) {
-            const trimmed = name.trim() as ToolName;
-            if (!TOOL_NAMES.includes(trimmed)) {
-              process.stderr.write(`Unknown tool: ${trimmed} (use ${TOOL_NAMES.join(", ")})\n`);
-              return 1;
-            }
-            if (!flags.tools.includes(trimmed)) {
-              flags.tools.push(trimmed);
+          toolsExplicit = true;
+          const raw = value();
+          // "none" disables tools entirely (the way to opt out of the all-tools
+          // default); otherwise the value is a comma-separated tool list.
+          if (raw.trim() === "none") {
+            flags.tools = [];
+          } else {
+            for (const name of raw.split(",")) {
+              const trimmed = name.trim() as ToolName;
+              if (trimmed.length === 0) {
+                continue;
+              }
+              if (!TOOL_NAMES.includes(trimmed)) {
+                process.stderr.write(`Unknown tool: ${trimmed} (use ${TOOL_NAMES.join(", ")})\n`);
+                return 1;
+              }
+              if (!flags.tools.includes(trimmed)) {
+                flags.tools.push(trimmed);
+              }
             }
           }
         } else if (token === "--load") {
@@ -863,15 +1262,45 @@ export const runCommand: Command = {
       }
     }
 
+    // Default to all tools when --tools was not given at all.
+    if (!toolsExplicit) {
+      flags.tools = [...TOOL_NAMES];
+    }
+
+    // Without -m, use the pinned default model from preferences (built-in
+    // default if none pinned or the store is unavailable).
+    if (!modelExplicit) {
+      flags.model = loadPreferences().defaultModel ?? DEFAULT_DEFAULT_MODEL;
+    }
+
     if (flags.prompt !== undefined && flags.tui) {
       process.stderr.write("--tui is ignored with --prompt (one-shot, non-interactive)\n");
     }
 
     registerOpenAINative();
     registerOpenRouterNative();
+    // Shared with request_human_edit (via loadTools) so the editor can take the
+    // terminal; the TUI replaces .suspend with a tui.stop/start wrapper.
+    const terminal: TerminalController = { suspend: (fn) => fn() };
+    // end_session calls requestExit; each frontend installs its own quit below.
+    const sessionControl = { requestExit: () => {} };
     let agent: Agent;
     try {
-      const model = resolveModel(flags.model);
+      let model: Model<Api>;
+      try {
+        model = resolveModel(flags.model);
+      } catch (error) {
+        // An explicit -m (or the built-in default) failing is a hard error; a
+        // remembered model that no longer resolves falls back to the default.
+        if (modelExplicit || flags.model === DEFAULT_DEFAULT_MODEL) {
+          throw error;
+        }
+        process.stderr.write(
+          `${dim(`pinned default model ${flags.model} unavailable (${error instanceof Error ? error.message : error}); using ${DEFAULT_DEFAULT_MODEL}`)}\n`,
+        );
+        flags.model = DEFAULT_DEFAULT_MODEL;
+        model = resolveModel(flags.model);
+      }
       if (systemPromptFile) {
         flags.systemPrompt = readFileSync(systemPromptFile, "utf8").trim();
       }
@@ -886,7 +1315,15 @@ export const runCommand: Command = {
           model,
           thinkingLevel: flags.reasoning,
           messages: loaded?.messages ?? [],
-          tools: flags.tools.length > 0 ? await loadTools(flags.tools, process.cwd()) : [],
+          tools:
+            flags.tools.length > 0
+              ? await loadTools(flags.tools, process.cwd(), {
+                  suspendTerminal: (fn) => terminal.suspend(fn),
+                  getAgent: () => agent,
+                  flags,
+                  requestExit: () => sessionControl.requestExit(),
+                })
+              : [],
         },
         streamFn: (m, ctx, options) =>
           streamSimple(m, ctx, {
@@ -986,7 +1423,7 @@ export const runCommand: Command = {
     }
 
     if (flags.tui) {
-      const code = await runTui(agent, flags);
+      const code = await runTui(agent, flags, terminal, sessionControl);
       save();
       return code;
     }
@@ -994,7 +1431,7 @@ export const runCommand: Command = {
     // Interactive REPL: in slow mode, page long replies (pageReplies = true).
     const renderer = attachRenderer(agent, flags, true);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | mode: ${flags.mode} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
+      `${dim(`model: ${flags.model} | mode: ${flags.mode} | /config for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     // Slow-mode tool confirmation. The hook fires while agent.prompt() is being
@@ -1039,6 +1476,11 @@ export const runCommand: Command = {
         abortRequested = false;
       }
     });
+    // end_session sets this mid-turn; the loop breaks once the turn returns.
+    let exitRequested = false;
+    sessionControl.requestExit = () => {
+      exitRequested = true;
+    };
     process.stderr.write("rath> ");
     try {
       for await (const line of rl) {
@@ -1047,7 +1489,13 @@ export const runCommand: Command = {
           process.stderr.write("rath> ");
           continue;
         }
-        const result = await handleSlashCommand(trimmed, agent, flags);
+        const result = await handleSlashCommand(
+          trimmed,
+          agent,
+          flags,
+          terminal,
+          sessionControl.requestExit,
+        );
         if (result) {
           if (result.output !== undefined) {
             const text = result.output.length > 0 ? result.output : "(empty)";
@@ -1065,6 +1513,9 @@ export const runCommand: Command = {
           continue;
         }
         await agent.prompt(trimmed);
+        if (exitRequested) {
+          break;
+        }
         process.stderr.write("rath> ");
       }
     } finally {
@@ -1114,7 +1565,12 @@ function messageText(content: string | { type: string; text?: string }[]): strin
  * markers and clickable citation sources. Messages stream as they arrive
  * and are re-rendered in full on completion.
  */
-async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
+async function runTui(
+  agent: Agent,
+  flags: RunFlags,
+  terminal: TerminalController,
+  sessionControl: { requestExit: () => void },
+): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     process.stderr.write("--tui requires an interactive terminal\n");
     return 1;
@@ -1184,7 +1640,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     banner.setText(
       `${cyanLine("rath")} ${dimLine(
         `| ${flags.model} | mode: ${flags.mode} | reasoning: ${agent.state.thinkingLevel} | ` +
-          "/info for commands | Ctrl+C interrupts",
+          "/config for commands | Ctrl+C interrupts",
       )}`,
     );
   };
@@ -1247,6 +1703,18 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     return paged;
   };
 
+  // request_human_edit's editor needs sole ownership of the terminal; suspend
+  // the TUI for its duration the same way the pager does, then redraw.
+  terminal.suspend = <T>(fn: () => T): T => {
+    tui.stop();
+    try {
+      return fn();
+    } finally {
+      tui.start();
+      tui.requestRender();
+    }
+  };
+
   // In slow mode, page long text; otherwise (or if no usable pager) add it
   // inline. The `addInline` callback owns the non-paged rendering so callers
   // keep their own styling (dim vs red, padding, etc.).
@@ -1274,7 +1742,9 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     }
   };
   const echoCommandResult = async (input: string) => {
-    showCommandOutput((await handleSlashCommand(input, agent, flags)) ?? {});
+    showCommandOutput(
+      (await handleSlashCommand(input, agent, flags, terminal, sessionControl.requestExit)) ?? {},
+    );
     refreshBanner();
     tui.requestRender();
   };
@@ -1376,7 +1846,9 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       );
       return true;
     }
-    if (command === "/info") {
+    // Bare /config renders the panel; /config <subcommand> falls through to
+    // handleSlashCommand (default-model, etc.).
+    if (command === "/config" && arg.length === 0) {
       const pairs = sessionInfo(agent, flags);
       const width = Math.max(...pairs.map(([key]) => key.length));
       const panel = pairs
@@ -1401,6 +1873,12 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve;
   });
+
+  // end_session quits the TUI the same way /exit does.
+  sessionControl.requestExit = () => {
+    tui.stop();
+    resolveDone(0);
+  };
 
   let current: PiCodingAgent.AssistantMessageComponent | null = null;
   const toolComponents = new Map<string, PiCodingAgent.ToolExecutionComponent>();
@@ -1532,17 +2010,19 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     if (trimmed.startsWith("/")) {
       transcript.addChild(new Text(`\n${cyanLine("›")} ${trimmed}`));
       if (!handleTuiCommand(trimmed)) {
-        handleSlashCommand(trimmed, agent, flags).then((result) => {
-          if (result) {
-            showCommandOutput(result);
-            refreshBanner();
-            if (result.exit) {
-              tui.stop();
-              resolveDone(0);
+        handleSlashCommand(trimmed, agent, flags, terminal, sessionControl.requestExit).then(
+          (result) => {
+            if (result) {
+              showCommandOutput(result);
+              refreshBanner();
+              if (result.exit) {
+                tui.stop();
+                resolveDone(0);
+              }
             }
-          }
-          tui.requestRender();
-        });
+            tui.requestRender();
+          },
+        );
       }
       tui.requestRender();
       return;
