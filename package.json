@@ -1,6 +1,6 @@
 {
   "name": "@zomglings/rath",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publishConfig": {
     "access": "public"
   },
@@ -29,7 +29,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && chmod +x dist/cli.js",
     "check": "tsc --noEmit && biome check .",
     "fix": "biome check --write ."
   },

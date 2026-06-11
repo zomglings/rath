@@ -95,12 +95,16 @@ rath development itself is meant to happen inside `rath run`.
   and Ctrl+C interrupting the current turn instead of killing the session.
 - Models are explicit: `-m <provider>/<model-id>` (default
   `openai-native/gpt-5-mini`; any registered pi-ai provider works).
-- In-session commands (both frontends): `/info` shows the session
-  configuration, `/sys` shows the system prompt, `/model` shows or switches
-  the model, `/lsmodels [filter]` lists available models, `/reasoning`
-  shows or sets the reasoning level (openai-native clamps it to the model's
-  supported levels), `/exit` quits. In the TUI, bare `/model` and
-  `/reasoning` open selector overlays.
+- Every startup setting is also settable in-session (both frontends), so a
+  session never has to be restarted to change configuration: `/info` shows
+  the configuration, `/sys [text]` shows or sets the system prompt,
+  `/model [spec]` shows or switches the model, `/lsmodels [filter]` lists
+  models, `/reasoning [level]` shows or sets the reasoning level
+  (openai-native clamps it to the model's supported levels),
+  `/websearch [on|off]` toggles hosted web search, `/tools [names|none]`
+  shows or sets client-side tools, `/save [path]` writes the context now and
+  saves there on exit, `/exit` quits. Changes take effect on the next turn.
+  In the TUI, bare `/model` and `/reasoning` open selector overlays.
 - Hosted web search is on by default with openai-native (`--no-web-search`
   disables it). After each reply, citations are rendered into a `Sources:`
   text block appended to the assistant message, marked
