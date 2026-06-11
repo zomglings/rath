@@ -411,26 +411,24 @@ function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Ren
   };
   const seenHostedCalls = new Set<string>();
   let errored = false;
-  // True for the duration of a reply whose answer text is being buffered for
-  // paging rather than streamed live.
-  const bufferingReply = () => pageReplies && flags.mode === "slow";
-  let replyBuffer = "";
+  // In slow mode (interactive only) the thinking and answer are not streamed
+  // live; the finished turn is paged at message_end so it can be read at
+  // leisure. Tool-call markers still stream as progress.
+  const paging = () => pageReplies && flags.mode === "slow";
 
   agent.subscribe((event) => {
     if (event.type === "agent_start") {
       errored = false;
-    } else if (event.type === "message_start") {
-      replyBuffer = "";
     } else if (event.type === "message_update") {
       const e = event.assistantMessageEvent;
       if (e.type === "text_delta") {
-        if (bufferingReply()) {
-          replyBuffer += e.delta;
-        } else {
+        if (!paging()) {
           write(process.stdout, e.delta);
         }
       } else if (e.type === "thinking_delta") {
-        write(process.stderr, dim(e.delta));
+        if (!paging()) {
+          write(process.stderr, dim(e.delta));
+        }
       } else if (e.type === "text_end" || e.type === "thinking_end") {
         ensureNewline();
       }
@@ -469,14 +467,14 @@ function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Ren
           return;
         }
         const trailer = applyCitationTrailer(message);
-        if (bufferingReply()) {
-          // Page the finished answer (with sources) through $PAGER; if it is
-          // not long enough to page (or stdout is not a TTY), print it.
-          const full = trailer ? `${replyBuffer}\n\n${trailer}` : replyBuffer;
+        if (paging()) {
+          // Page the finished turn — thinking, answer, and sources — through
+          // $PAGER; if it is not long enough to page (or stdout is not a TTY),
+          // print it.
+          const full = buildPagedTurnText(message);
           if (!pagePlain(full, flags)) {
             write(process.stdout, full.endsWith("\n") ? full : `${full}\n`);
           }
-          replyBuffer = "";
         } else if (trailer) {
           write(process.stderr, `${dim(trailer)}\n`);
         }
@@ -554,6 +552,30 @@ export function makeBeforeToolCall(
  * exits, so this is only called between turns (the readline interface is
  * suspended, not actively reading), then the temp file is removed.
  */
+/**
+ * Build the readable text of a finished assistant turn for the pager: thinking
+ * (labeled), the answer, and the rendered Sources trailer, in content order.
+ * Hosted/function tool-call blocks are omitted (their results are paged
+ * separately); call after applyCitationTrailer so the trailer is included.
+ */
+export function buildPagedTurnText(message: AssistantMessage): string {
+  const parts: string[] = [];
+  for (const block of contentBlocks(message)) {
+    if (block.type === "thinking") {
+      const t = block.thinking.trim();
+      if (t.length > 0) {
+        parts.push(`Thinking:\n${t}`);
+      }
+    } else if (block.type === "text") {
+      const t = block.text.trim();
+      if (t.length > 0) {
+        parts.push(t);
+      }
+    }
+  }
+  return parts.join("\n\n");
+}
+
 export function pagePlain(text: string, flags: RunFlags): boolean {
   if (flags.mode !== "slow" || !isLongOutput(text)) {
     return false;
@@ -1471,21 +1493,16 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           transcript.addChild(new Text(redLine(`error: ${message.errorMessage ?? "unknown"}`)));
         } else {
           addAssistant(message);
-          // Slow mode: a long reply streamed into the transcript scrolls off
-          // and the transcript is not scrollable in place, so open it in the
-          // pager for deliberate reading. It stays in the transcript too.
-          const replyText = contentBlocks(message)
-            .filter((b) => b.type === "text")
-            .map((b) => (b as { text: string }).text)
-            .join("\n\n")
-            .trim();
-          if (flags.mode === "slow" && isLongOutput(replyText)) {
+          // Slow mode: a long turn streamed into the transcript scrolls off
+          // and the transcript is not scrollable in place, so open the whole
+          // turn (thinking, answer, sources) in the pager for deliberate
+          // reading. It stays in the transcript too.
+          const turnText = buildPagedTurnText(message);
+          if (flags.mode === "slow" && isLongOutput(turnText)) {
             transcript.addChild(
-              new Text(
-                dimLine(`[reply paged (${replyText.split("\n").length} lines) — q to close]`),
-              ),
+              new Text(dimLine(`[turn paged (${turnText.split("\n").length} lines) — q to close]`)),
             );
-            openPager(replyText);
+            openPager(turnText);
           }
         }
       }
