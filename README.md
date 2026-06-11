@@ -136,9 +136,17 @@ rath development itself is meant to happen inside `rath run`.
   free when the context is handed to a provider that does not understand
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
-- `--tools read,bash,edit,write,grep,find,ls` enables client-side tools from
-  `@earendil-works/pi-coding-agent`. They run with your privileges in the
-  current directory.
+- `--tools read,bash,edit,write,grep,find,ls,request_human_edit` enables
+  client-side tools. The first seven come from
+  `@earendil-works/pi-coding-agent`; they run with your privileges in the
+  current directory. `request_human_edit` is rath's own human-in-the-loop
+  tool: it opens a file in your editor (`$VISUAL`/`$EDITOR`, falling back to
+  the first of `code`, `vim`, `emacs`, `nano` on PATH; GUI editors like
+  `code`/`cursor` get `--wait` appended so the call blocks) and waits for you
+  to save and quit, then returns the final contents and a unified diff of your
+  changes. The agent can seed the file with a draft via `content`, name a
+  `path`, or let it use a temp file (whose path is returned either way). The
+  TUI suspends while the editor runs.
 - `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
   from one.
 
@@ -166,11 +174,13 @@ rebuild — no registration step.
 
 ### Requirements and conventions
 
-The current tests call the live OpenAI API: they require `OPENAI_API_KEY` in
+Most tests call the live OpenAI API: they require `OPENAI_API_KEY` in
 the environment and fail fast with a clear error when it is missing. They
 cost real money (fractions of a cent in tokens, plus per-use fees for hosted
 tools such as web search and code interpreter containers), which is why they
-are not part of the pre-commit checks. `RATH_TEST_MODEL` overrides the model
+are not part of the pre-commit checks. (`request-human-edit` is the exception:
+it calls no API and needs no key — it drives the editor tool with a fake
+editor script.) `RATH_TEST_MODEL` overrides the model
 (default: `gpt-5-mini`). Tests log a per-run token cost on success, and
 assert on request payloads via the provider's `onPayload` hook when they need
 to prove what was actually sent to the API.
@@ -193,6 +203,10 @@ to prove what was actually sent to the API.
   `stream()`: ToolCall block shape (structured arguments, `callId|itemId`
   id, `stopReason "toolUse"`), then `function_call`/`function_call_output`
   replay with matching `call_id`.
+- `request-human-edit` — the request_human_edit tool, driven by a fake editor
+  (no API, no key). Covers temp-file vs given-path round-trips (consistent
+  return shape), the no-change case, and editor resolution ($VISUAL/$EDITOR
+  precedence, `--wait` injection for GUI editors, no-editor error).
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

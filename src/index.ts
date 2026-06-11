@@ -42,3 +42,10 @@ export {
   registerOpenRouterNative,
   streamOpenRouterNative,
 } from "./providers/openrouter-native.js";
+export {
+  createRequestHumanEditTool,
+  type RequestHumanEditDetails,
+  type RequestHumanEditOptions,
+  resolveEditorCommand,
+} from "./tools/request-human-edit.js";
+export { isOnPath } from "./which.js";

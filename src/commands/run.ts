@@ -20,9 +20,9 @@
  * time and cost nothing.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import {
   Agent,
@@ -61,6 +61,8 @@ import {
   stripRenderedCitations,
   uniqueUrlCitations,
 } from "../index.js";
+import { createRequestHumanEditTool } from "../tools/request-human-edit.js";
+import { isOnPath } from "../which.js";
 
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
@@ -75,8 +77,21 @@ function dim(text: string): string {
 export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
-export const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+export const TOOL_NAMES = [
+  "read",
+  "bash",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+  "request_human_edit",
+] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
+
+// Client-side tools sourced from @earendil-works/pi-coding-agent (everything
+// except rath's own request_human_edit).
+type PiToolName = Exclude<ToolName, "request_human_edit">;
 
 // Interaction modes for `rath run`:
 // - "go": full speed, no inspection. Stream everything, never block, tools run
@@ -119,22 +134,48 @@ export function isLongOutput(text: string): boolean {
 }
 
 /**
- * Load the requested client-side tools from @earendil-works/pi-coding-agent.
- * Imported lazily: the package is large and only needed when --tools is used.
+ * Load the requested client-side tools, preserving the requested order. The
+ * pi-coding-agent tools are imported lazily (the package is large) and only
+ * when at least one is requested. request_human_edit is rath's own tool; it
+ * needs `suspendTerminal` so it can take the terminal from the active frontend
+ * while the editor runs (the TUI passes a tui.stop/start wrapper; the plain
+ * REPL needs none).
  */
-export async function loadTools(names: ToolName[], cwd: string): Promise<AgentTool[]> {
-  const pi = await import("@earendil-works/pi-coding-agent");
-  // Typed as AgentTool so pi-coding-agent API drift fails compilation here.
-  const factories: Record<ToolName, (cwd: string) => AgentTool> = {
-    read: pi.createReadTool,
-    bash: pi.createBashTool,
-    edit: pi.createEditTool,
-    write: pi.createWriteTool,
-    grep: pi.createGrepTool,
-    find: pi.createFindTool,
-    ls: pi.createLsTool,
-  };
-  return names.map((name) => factories[name](cwd));
+export async function loadTools(
+  names: ToolName[],
+  cwd: string,
+  suspendTerminal?: <T>(fn: () => T) => T,
+): Promise<AgentTool[]> {
+  const piNames = names.filter((n): n is PiToolName => n !== "request_human_edit");
+  let piFactories: Record<PiToolName, (cwd: string) => AgentTool> | undefined;
+  if (piNames.length > 0) {
+    const pi = await import("@earendil-works/pi-coding-agent");
+    // Typed as AgentTool so pi-coding-agent API drift fails compilation here.
+    piFactories = {
+      read: pi.createReadTool,
+      bash: pi.createBashTool,
+      edit: pi.createEditTool,
+      write: pi.createWriteTool,
+      grep: pi.createGrepTool,
+      find: pi.createFindTool,
+      ls: pi.createLsTool,
+    };
+  }
+  return names.map((name) =>
+    name === "request_human_edit"
+      ? (createRequestHumanEditTool({ cwd, suspendTerminal }) as AgentTool)
+      : piFactories![name](cwd),
+  );
+}
+
+/**
+ * Lets a tool that must own the terminal (request_human_edit's editor) suspend
+ * whatever UI the active frontend is running. The plain REPL holds no UI
+ * mid-turn, so its controller is a pass-through; the TUI swaps in a
+ * tui.stop()/start() wrapper once it is up.
+ */
+interface TerminalController {
+  suspend: <T>(fn: () => T) => T;
 }
 
 export function resolveModel(spec: string): Model<Api> {
@@ -233,6 +274,7 @@ export async function handleSlashCommand(
   input: string,
   agent: Agent,
   flags: RunFlags,
+  terminal: TerminalController,
 ): Promise<SlashResult | undefined> {
   if (!input.startsWith("/")) {
     return undefined;
@@ -294,7 +336,7 @@ export async function handleSlashCommand(
       }
       const names = requested as ToolName[];
       try {
-        agent.state.tools = await loadTools(names, process.cwd());
+        agent.state.tools = await loadTools(names, process.cwd(), (fn) => terminal.suspend(fn));
         flags.tools = names;
         return { output: `tools: ${names.join(", ")}${deferred}` };
       } catch (error) {
@@ -592,6 +634,22 @@ export function buildPagedTurnText(message: AssistantMessage): string {
 }
 
 /**
+ * The pager command (argv array) to use: $PAGER split on spaces if set,
+ * otherwise the first detected default among `less -R` and `more`. Returns []
+ * when nothing usable is found, which makes runExternalPager a no-op so the
+ * caller renders inline.
+ */
+export function resolvePagerCommand(): string[] {
+  const pagerEnv = (process.env.PAGER ?? "").trim();
+  if (pagerEnv.length > 0) {
+    // Split on spaces so PAGER="less -R" works (the common shell convention).
+    return pagerEnv.split(/\s+/);
+  }
+  const defaults = [["less", "-R"], ["more"]];
+  return defaults.find((argv) => argv[0] !== undefined && isOnPath(argv[0])) ?? [];
+}
+
+/**
  * Run the external pager ($PAGER, default `less -R`) on `text`, full-screen,
  * with vim/arrow/PgUp-PgDn navigation and search — i.e. real less behavior.
  * Returns true when the pager ran, false when no usable pager was found or it
@@ -610,50 +668,6 @@ export function buildPagedTurnText(message: AssistantMessage): string {
  * caller must own the terminal first (the plain REPL is between reads; the TUI
  * suspends itself with tui.stop()).
  */
-/**
- * Resolve `cmd` against PATH the way a shell would, returning true if an
- * executable by that name exists. A name containing a path separator is
- * checked directly. On Windows, PATHEXT extensions (.exe/.cmd/...) are tried
- * for names without their own extension. This only checks existence; it never
- * runs the candidate.
- */
-function isOnPath(cmd: string): boolean {
-  const exts =
-    process.platform === "win32"
-      ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
-      : [""];
-  const hasExt = exts.some((e) => e !== "" && cmd.toLowerCase().endsWith(e.toLowerCase()));
-  const names = hasExt ? [cmd] : exts.map((e) => cmd + e);
-  const isFile = (p: string): boolean => {
-    try {
-      return existsSync(p) && statSync(p).isFile();
-    } catch {
-      return false;
-    }
-  };
-  if (cmd.includes("/") || cmd.includes("\\") || isAbsolute(cmd)) {
-    return names.some(isFile);
-  }
-  const dirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
-  return dirs.some((dir) => names.some((n) => isFile(join(dir, n))));
-}
-
-/**
- * The pager command (argv array) to use: $PAGER split on spaces if set,
- * otherwise the first detected default among `less -R` and `more`. Returns []
- * when nothing usable is found, which makes runExternalPager a no-op so the
- * caller renders inline.
- */
-export function resolvePagerCommand(): string[] {
-  const pagerEnv = (process.env.PAGER ?? "").trim();
-  if (pagerEnv.length > 0) {
-    // Split on spaces so PAGER="less -R" works (the common shell convention).
-    return pagerEnv.split(/\s+/);
-  }
-  const defaults = [["less", "-R"], ["more"]];
-  return defaults.find((argv) => argv[0] !== undefined && isOnPath(argv[0])) ?? [];
-}
-
 export function runExternalPager(text: string): boolean {
   const parts = resolvePagerCommand();
   const [cmd, ...rest] = parts;
@@ -869,6 +883,9 @@ export const runCommand: Command = {
 
     registerOpenAINative();
     registerOpenRouterNative();
+    // Shared with request_human_edit (via loadTools) so the editor can take the
+    // terminal; the TUI replaces .suspend with a tui.stop/start wrapper.
+    const terminal: TerminalController = { suspend: (fn) => fn() };
     let agent: Agent;
     try {
       const model = resolveModel(flags.model);
@@ -886,7 +903,10 @@ export const runCommand: Command = {
           model,
           thinkingLevel: flags.reasoning,
           messages: loaded?.messages ?? [],
-          tools: flags.tools.length > 0 ? await loadTools(flags.tools, process.cwd()) : [],
+          tools:
+            flags.tools.length > 0
+              ? await loadTools(flags.tools, process.cwd(), (fn) => terminal.suspend(fn))
+              : [],
         },
         streamFn: (m, ctx, options) =>
           streamSimple(m, ctx, {
@@ -986,7 +1006,7 @@ export const runCommand: Command = {
     }
 
     if (flags.tui) {
-      const code = await runTui(agent, flags);
+      const code = await runTui(agent, flags, terminal);
       save();
       return code;
     }
@@ -1047,7 +1067,7 @@ export const runCommand: Command = {
           process.stderr.write("rath> ");
           continue;
         }
-        const result = await handleSlashCommand(trimmed, agent, flags);
+        const result = await handleSlashCommand(trimmed, agent, flags, terminal);
         if (result) {
           if (result.output !== undefined) {
             const text = result.output.length > 0 ? result.output : "(empty)";
@@ -1114,7 +1134,11 @@ function messageText(content: string | { type: string; text?: string }[]): strin
  * markers and clickable citation sources. Messages stream as they arrive
  * and are re-rendered in full on completion.
  */
-async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
+async function runTui(
+  agent: Agent,
+  flags: RunFlags,
+  terminal: TerminalController,
+): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     process.stderr.write("--tui requires an interactive terminal\n");
     return 1;
@@ -1247,6 +1271,18 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     return paged;
   };
 
+  // request_human_edit's editor needs sole ownership of the terminal; suspend
+  // the TUI for its duration the same way the pager does, then redraw.
+  terminal.suspend = <T>(fn: () => T): T => {
+    tui.stop();
+    try {
+      return fn();
+    } finally {
+      tui.start();
+      tui.requestRender();
+    }
+  };
+
   // In slow mode, page long text; otherwise (or if no usable pager) add it
   // inline. The `addInline` callback owns the non-paged rendering so callers
   // keep their own styling (dim vs red, padding, etc.).
@@ -1274,7 +1310,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     }
   };
   const echoCommandResult = async (input: string) => {
-    showCommandOutput((await handleSlashCommand(input, agent, flags)) ?? {});
+    showCommandOutput((await handleSlashCommand(input, agent, flags, terminal)) ?? {});
     refreshBanner();
     tui.requestRender();
   };
@@ -1532,7 +1568,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     if (trimmed.startsWith("/")) {
       transcript.addChild(new Text(`\n${cyanLine("›")} ${trimmed}`));
       if (!handleTuiCommand(trimmed)) {
-        handleSlashCommand(trimmed, agent, flags).then((result) => {
+        handleSlashCommand(trimmed, agent, flags, terminal).then((result) => {
           if (result) {
             showCommandOutput(result);
             refreshBanner();
