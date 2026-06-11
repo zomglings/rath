@@ -465,10 +465,11 @@ export function toolArgsPreview(args: unknown, max = 120): string {
 }
 
 /**
- * Build a beforeToolCall hook for the Agent. In go mode (and whenever the
- * frontend cannot confirm) the hook is a pass-through, so go mode keeps the
- * current "tools run immediately" behavior exactly. In slow mode it asks
- * `confirm` before every tool call and blocks the call when the user declines.
+ * Build a beforeToolCall hook for the Agent. In go mode the hook is a
+ * pass-through, so go mode keeps the current "tools run immediately" behavior
+ * exactly. In slow mode it asks `confirm` before every tool call and blocks
+ * the call when the user declines; a frontend that cannot confirm (non-TTY
+ * plain REPL, or -p one-shot) denies rather than passing through.
  *
  * The hook reads flags.mode on every call, so /slow mid-session starts gating
  * and /go stops it — no agent rebuild needed.
@@ -1150,7 +1151,11 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
         this.top = 0;
       } else if (matchesKey(data, "shift+g") || matchesKey(data, "end")) {
         this.top = this.wrapped.length;
-      } else if (matchesKey(data, "q") || matchesKey(data, "escape")) {
+      } else if (
+        matchesKey(data, "q") ||
+        matchesKey(data, "shift+q") ||
+        matchesKey(data, "escape")
+      ) {
         this.onClose();
         return;
       } else {
@@ -1287,9 +1292,13 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           return [head, args, "", help].map((l) => truncateToWidth(l, width));
         },
         handleInput: (data: string): void => {
-          if (matchesKey(data, "y")) {
+          if (matchesKey(data, "y") || matchesKey(data, "shift+y")) {
             decide(true);
-          } else if (matchesKey(data, "n") || matchesKey(data, "escape")) {
+          } else if (
+            matchesKey(data, "n") ||
+            matchesKey(data, "shift+n") ||
+            matchesKey(data, "escape")
+          ) {
             decide(false);
           }
         },
