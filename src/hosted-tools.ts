@@ -168,9 +168,9 @@ function citationLine(c: Citation): string {
     case "url_citation":
       return `- ${c.title ? `${c.title} — ` : ""}${c.url}`;
     case "file_citation":
-      return `- ${c.filename}`;
+      return `- ${c.filename || c.fileId}`;
     case "container_file_citation":
-      return `- ${c.filename} (container ${c.containerId})`;
+      return `- ${c.filename || c.fileId} (container ${c.containerId})`;
   }
 }
 
