@@ -51,6 +51,7 @@ import {
   contentBlocks,
   flattenHostedContent,
   isHostedToolCall,
+  isRenderedCitations,
   OPENAI_NATIVE_API,
   OPENROUTER_NATIVE_API,
   openaiNativeModel,
@@ -415,6 +416,30 @@ function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Ren
   // live; the finished turn is paged at message_end so it can be read at
   // leisure. Tool-call markers still stream as progress.
   const paging = () => pageReplies && flags.mode === "slow";
+  // Print a (possibly partial) turn with the same stream split as live
+  // streaming: answer to stdout, thinking and the sources trailer to stderr.
+  // Used when slow mode suppressed the live stream but cannot page (short
+  // output, no TTY) or the turn was interrupted.
+  const printTurnSplit = (message: AssistantMessage) => {
+    for (const block of contentBlocks(message)) {
+      if (block.type === "thinking") {
+        const t = block.thinking.trim();
+        if (t.length > 0) {
+          write(process.stderr, `${dim(t)}\n`);
+        }
+      } else if (block.type === "text") {
+        const t = block.text.trim();
+        if (t.length === 0) {
+          continue;
+        }
+        if (isRenderedCitations(block)) {
+          write(process.stderr, `${dim(t)}\n`);
+        } else {
+          write(process.stdout, `${t}\n`);
+        }
+      }
+    }
+  };
 
   agent.subscribe((event) => {
     if (event.type === "agent_start") {
@@ -455,6 +480,12 @@ function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Ren
       if (message.role === "assistant") {
         ensureNewline();
         if (message.stopReason === "error" || message.stopReason === "aborted") {
+          // Slow mode suppressed the live stream; surface whatever partial
+          // content was generated before the interrupt/error rather than
+          // discarding it.
+          if (paging()) {
+            printTurnSplit(message);
+          }
           write(
             process.stderr,
             `${message.stopReason}: ${message.errorMessage ?? "interrupted"}\n`,
@@ -469,11 +500,11 @@ function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Ren
         const trailer = applyCitationTrailer(message);
         if (paging()) {
           // Page the finished turn — thinking, answer, and sources — through
-          // $PAGER; if it is not long enough to page (or stdout is not a TTY),
-          // print it.
-          const full = buildPagedTurnText(message);
-          if (!pagePlain(full, flags)) {
-            write(process.stdout, full.endsWith("\n") ? full : `${full}\n`);
+          // $PAGER. If it cannot page (short output, or stdout is not a TTY),
+          // print with the normal stream split so thinking does not land on
+          // stdout.
+          if (!pagePlain(buildPagedTurnText(message), flags)) {
+            printTurnSplit(message);
           }
         } else if (trailer) {
           write(process.stderr, `${dim(trailer)}\n`);
@@ -548,9 +579,11 @@ export function makeBeforeToolCall(
  * with full "inherit" stdio. This is deliberate: piping the text on the pager's
  * stdin would steal the keyboard (less detects a non-TTY stdin and dumps the
  * content like cat instead of paging). With the content in a file, stdin stays
- * the terminal so the pager reads keypresses. spawnSync blocks until the pager
- * exits, so this is only called between turns (the readline interface is
- * suspended, not actively reading), then the temp file is removed.
+ * the terminal so the pager reads keypresses. The synchronous `spawnSync`
+ * blocks the event loop for the pager's lifetime — so even though this is now
+ * called from the message_end handler mid-`agent.prompt()` (not only between
+ * turns), the readline interface's line callback cannot fire while the pager
+ * owns the terminal. The temp file is removed afterward.
  */
 /**
  * Build the readable text of a finished assistant turn for the pager: thinking
