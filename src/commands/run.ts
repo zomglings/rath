@@ -237,9 +237,12 @@ export function handleSlashCommand(
       }
       agent.state.thinkingLevel = arg as ReasoningLevel;
       flags.reasoning = arg as ReasoningLevel;
-      const clampNote = supported.includes(arg as ReasoningLevel)
-        ? ""
-        : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
+      // "off" is honored as-is (reasoning disabled), not clamped up to a
+      // supported level — only positive levels outside the set are clamped.
+      const clampNote =
+        arg === "off" || supported.includes(arg as ReasoningLevel)
+          ? ""
+          : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
       const deferNote = agent.state.isStreaming ? " (applies after the current turn)" : "";
       return { output: `reasoning: ${arg}${clampNote}${deferNote}` };
     }

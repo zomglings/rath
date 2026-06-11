@@ -63,6 +63,7 @@ import {
   type HostedTextContent,
   type HostedToolCallContent,
   isHostedToolCall,
+  isRenderedCitations,
 } from "../hosted-tools.js";
 
 export const OPENAI_NATIVE_API = "openai-native";
@@ -483,9 +484,18 @@ export function convertNativeMessages(
           }
           // Foreign or cross-model thinking blocks cannot be replayed here.
         } else if (block.type === "text") {
+          // The rendered-citations trailer is a display/persistence artifact;
+          // never replay it (it would duplicate text the model never produced
+          // and perturb the cached prefix). Strip it here so every caller of
+          // this provider is protected, not only the CLI.
+          if (isRenderedCitations(block)) {
+            blockIndex++;
+            continue;
+          }
           // Empty text blocks (e.g. from an errored turn) are rejected by the
           // API as malformed message items.
           if (block.text.length === 0) {
+            blockIndex++;
             continue;
           }
           const signature = native ? parseTextSignature(block.textSignature) : undefined;
@@ -713,13 +723,17 @@ async function processNativeStream(
           .map((c) => (c.type === "output_text" ? c.text : c.type === "refusal" ? c.refusal : ""))
           .join("");
         textBlock.textSignature = encodeTextSignature(item.id, (item as { phase?: string }).phase);
-        // The completed item carries the authoritative annotation list.
+        // The completed item carries the authoritative annotation list when it
+        // has any. If it reports none, keep whatever streamed in rather than
+        // wiping it — the API normally populates annotations on the done item,
+        // but a stream that only delivered them via annotation events would
+        // otherwise lose them.
         const finalCitations = item.content.flatMap((c) =>
           c.type === "output_text"
             ? c.annotations.flatMap((a) => annotationToCitation(a) ?? [])
             : [],
         );
-        if (finalCitations.length > 0 || (textBlock.citations?.length ?? 0) > 0) {
+        if (finalCitations.length > 0) {
           textBlock.citations = finalCitations;
         }
         stream.push({
