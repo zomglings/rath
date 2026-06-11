@@ -544,8 +544,10 @@ export function pagePlain(text: string, flags: RunFlags): boolean {
       // the screen and reads the keyboard from the real stdin TTY.
       stdio: "inherit",
     });
-    if (result.error) {
-      return false; // pager missing/unspawnable: caller prints plainly.
+    // Pager missing/unspawnable, or it exited abnormally (broken $PAGER): fall
+    // back to the caller printing plainly so the content is never lost.
+    if (result.error || (typeof result.status === "number" && result.status !== 0)) {
+      return false;
     }
     return true;
   } catch {
@@ -1171,7 +1173,9 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     const text = pagerQueue.shift();
     if (text === undefined) {
       pagerOpen = false;
-      tui.setFocus(editor);
+      // The last pager's handle.hide() already restored focus to the overlay
+      // underneath (or the editor); do not force it to the editor here, which
+      // would strand a still-open overlay (e.g. a confirm) unfocused.
       tui.requestRender();
       return;
     }
@@ -1253,8 +1257,9 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
         }
         settled = true;
         signal?.removeEventListener("abort", onAbort);
+        // handle.hide() restores focus to the overlay underneath (e.g. an open
+        // pager) or the editor; forcing the editor here would strand it.
         handle.hide();
-        tui.setFocus(editor);
         transcript.addChild(
           new Text(
             approved
