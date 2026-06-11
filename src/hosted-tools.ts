@@ -212,8 +212,10 @@ function stringList(value: unknown): string[] {
 
 /**
  * Pull human-readable detail out of a raw hosted-tool item. Knows the OpenAI
- * Responses API web/file/code/image shapes structurally; returns "" when it
- * recognizes nothing, so the caller still emits the generic label line.
+ * Responses API web_search / file_search / code_interpreter shapes
+ * structurally; returns "" when it recognizes nothing (e.g. an
+ * image_generation_call, which has no text to surface), so the caller still
+ * emits the generic label line.
  */
 function hostedToolDetail(raw: Record<string, unknown>): string {
   // web_search_call: query/queries + sources live under `action`.
