@@ -15,7 +15,7 @@ export {
   stripRenderedCitations,
   type UrlCitation,
   uniqueUrlCitations,
-} from "./content.js";
+} from "./hosted-tools.js";
 export {
   convertNativeMessages,
   type HostedToolCallItem,

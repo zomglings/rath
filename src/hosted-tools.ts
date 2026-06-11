@@ -1,8 +1,8 @@
 /**
- * Extended content blocks shared by rath providers, and utilities for
- * working with them. Provider-agnostic: openai-native produces these today;
- * an Anthropic provider with server-side tools will produce the same shapes
- * with its own raw items.
+ * Hosted (server-side) tool machinery shared by rath providers: the extended
+ * content blocks and utilities for working with them. Provider-agnostic:
+ * openai-native produces these today; an Anthropic provider will produce
+ * the same shapes with its own raw items.
  *
  * The conventions:
  * - Citations ride along as a `citations` array on text blocks.

@@ -61,7 +61,7 @@ import {
   type HostedTextContent,
   type HostedToolCallContent,
   isHostedToolCall,
-} from "../content.js";
+} from "../hosted-tools.js";
 
 export const OPENAI_NATIVE_API = "openai-native";
 
