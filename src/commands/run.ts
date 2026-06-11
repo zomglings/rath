@@ -47,6 +47,7 @@ import {
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { type Command, fullName, helpText } from "../command.js";
+import { clearDefaultModel, loadPreferences, setDefaultModel } from "../config.js";
 import {
   applyCitationTrailer,
   contentBlocks,
@@ -103,6 +104,11 @@ type PiToolName = Exclude<ToolName, "request_human_edit">;
 //   per-call confirmation before it runs.
 export const MODES = ["go", "slow"] as const;
 export type Mode = (typeof MODES)[number];
+
+// The default for the (DB-stored) default model: used when neither -m nor a
+// pinned default model (preferences, set via /config default-model) supplies
+// one. Hence the doubled name — it is the default of the default.
+export const DEFAULT_DEFAULT_MODEL = `${OPENAI_NATIVE_API}/gpt-5.5`;
 
 export interface RunFlags {
   model: string;
@@ -244,15 +250,21 @@ export function saveContext(agent: Agent, path: string): void {
   );
 }
 
-/** Current session configuration as key/value pairs, for /info displays. */
+/** Current configuration as key/value pairs, for the /config display. */
 export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
   const tools = agent.state.tools.map((t) => t.name);
+  const pinnedDefault = loadPreferences().defaultModel;
   return [
-    ["model", flags.model],
+    ["model (session)", flags.model],
+    [
+      "default model",
+      pinnedDefault ?? `built-in: ${DEFAULT_DEFAULT_MODEL} (/config default-model to pin)`,
+    ],
     ["mode", flags.mode === "slow" ? "slow (paging + tool confirmation)" : "go (full speed)"],
     ["reasoning", String(agent.state.thinkingLevel)],
     ["web search", flags.webSearch ? "on (hosted, openai-native / openrouter-native only)" : "off"],
-    ["tools", tools.length > 0 ? tools.join(", ") : "none"],
+    ["tools (active)", tools.length > 0 ? tools.join(", ") : "none"],
+    ["tools (available)", TOOL_NAMES.join(", ")],
     ["skills", "none (rath run loads no skills or context files)"],
     ["system prompt", "/sys to view or set"],
     ["messages in context", String(agent.state.messages.length)],
@@ -287,12 +299,43 @@ export async function handleSlashCommand(
   switch (command) {
     case "/exit":
       return { exit: true };
-    case "/info":
+    case "/config": {
+      // Subcommands manage persisted preferences; bare /config shows everything.
+      const [sub = "", ...subRest] = arg.split(/\s+/).filter((s) => s.length > 0);
+      if (sub === "default-model") {
+        const spec = subRest.join(" ").trim();
+        if (spec.length === 0) {
+          const pinned = loadPreferences().defaultModel;
+          return {
+            output: pinned
+              ? `default model: ${pinned}`
+              : `default model: (none pinned; built-in ${DEFAULT_DEFAULT_MODEL})`,
+          };
+        }
+        if (spec === "none" || spec === "clear") {
+          clearDefaultModel();
+          return { output: `default model cleared (built-in ${DEFAULT_DEFAULT_MODEL})` };
+        }
+        try {
+          resolveModel(spec);
+        } catch (error) {
+          return { output: error instanceof Error ? error.message : String(error), isError: true };
+        }
+        setDefaultModel(spec);
+        return { output: `default model pinned: ${spec} (applies to new sessions)` };
+      }
+      if (sub.length > 0) {
+        return {
+          output: `Unknown /config subcommand: ${sub} (use /config or /config default-model [spec|none])`,
+          isError: true,
+        };
+      }
       return {
         output: sessionInfo(agent, flags)
           .map(([key, value]) => `${key}: ${value}`)
           .join("\n"),
       };
+    }
     case "/sys": {
       if (arg.length === 0) {
         const prompt = agent.state.systemPrompt;
@@ -364,7 +407,9 @@ export async function handleSlashCommand(
       try {
         agent.state.model = resolveModel(arg);
         flags.model = arg;
-        return { output: `model: ${arg}${deferred}` };
+        return {
+          output: `model: ${arg}${deferred} (/config default-model to pin across sessions)`,
+        };
       } catch (error) {
         return { output: error instanceof Error ? error.message : String(error), isError: true };
       }
@@ -416,9 +461,10 @@ export async function handleSlashCommand(
     default:
       return {
         output:
-          `Unknown command: ${command} (commands: /info, /sys [text], /model [spec], ` +
-          "/lsmodels [filter], /reasoning [level], /websearch [on|off], /tools [names|none], " +
-          "/mode [go|slow], /go, /slow, /save [path], /exit)",
+          `Unknown command: ${command} (commands: /config [default-model [spec|none]], ` +
+          "/sys [text], /model [spec], /lsmodels [filter], /reasoning [level], " +
+          "/websearch [on|off], /tools [names|none], /mode [go|slow], /go, /slow, " +
+          "/save [path], /exit)",
         isError: true,
       };
   }
@@ -710,15 +756,17 @@ export const runCommand: Command = {
   summary: "Run a generic agent loop",
   description:
     "Starts an agent loop with nothing implicit: no skill discovery, no\n" +
-    "context-file walking, no tools unless explicitly enabled. The model sees\n" +
-    "exactly what the flags specify. The provider API key (e.g.\n" +
-    "OPENAI_API_KEY) is the only input taken from the environment.\n" +
+    "context-file walking. The model sees exactly what the flags specify. The\n" +
+    "provider API key (e.g. OPENAI_API_KEY) is the only input taken from the\n" +
+    "environment. Tools are the one convenience default: --tools enables all\n" +
+    "client-side tools when omitted (--tools none to disable, or a list).\n" +
     "\n" +
     "Without --prompt, reads prompts interactively (plain REPL, or pi-tui\n" +
     "with -T/--tui). Every startup setting is also settable in-session:\n" +
-    "  /info                  show the session configuration\n" +
+    "  /config                show the configuration\n" +
+    "  /config default-model [spec|none]  pin or clear the default model\n" +
     "  /sys [text]            show or set the system prompt\n" +
-    "  /model [provider/id]   show or switch the model\n" +
+    "  /model [provider/id]   show or switch the session model\n" +
     "  /lsmodels [filter]     list available models\n" +
     "  /reasoning [level]     show or set the reasoning level\n" +
     "  /websearch [on|off]    show or toggle hosted web search\n" +
@@ -796,7 +844,7 @@ export const runCommand: Command = {
   ],
   async run(prefix, argv) {
     const flags: RunFlags = {
-      model: `${OPENAI_NATIVE_API}/gpt-5-mini`,
+      model: DEFAULT_DEFAULT_MODEL,
       systemPrompt: "You are a helpful assistant.",
       reasoning: "low",
       webSearch: true,
@@ -809,6 +857,9 @@ export const runCommand: Command = {
     // Tools default to all when --tools is omitted; an explicit --tools (even
     // "none") opts out of that default.
     let toolsExplicit = false;
+    // -m wins; otherwise the last-used model from preferences becomes the
+    // default, falling back to the built-in default below.
+    let modelExplicit = false;
     for (let i = 0; i < argv.length; i++) {
       const token = argv[i]!;
       const value = (): string => {
@@ -827,6 +878,7 @@ export const runCommand: Command = {
         }
         if (token === "-m" || token === "--model") {
           flags.model = value();
+          modelExplicit = true;
         } else if (token === "-p" || token === "--prompt") {
           flags.prompt = value();
         } else if (token === "-T" || token === "--tui") {
@@ -898,6 +950,12 @@ export const runCommand: Command = {
       flags.tools = [...TOOL_NAMES];
     }
 
+    // Without -m, use the pinned default model from preferences (built-in
+    // default if none pinned or the store is unavailable).
+    if (!modelExplicit) {
+      flags.model = loadPreferences().defaultModel ?? DEFAULT_DEFAULT_MODEL;
+    }
+
     if (flags.prompt !== undefined && flags.tui) {
       process.stderr.write("--tui is ignored with --prompt (one-shot, non-interactive)\n");
     }
@@ -909,7 +967,21 @@ export const runCommand: Command = {
     const terminal: TerminalController = { suspend: (fn) => fn() };
     let agent: Agent;
     try {
-      const model = resolveModel(flags.model);
+      let model: Model<Api>;
+      try {
+        model = resolveModel(flags.model);
+      } catch (error) {
+        // An explicit -m (or the built-in default) failing is a hard error; a
+        // remembered model that no longer resolves falls back to the default.
+        if (modelExplicit || flags.model === DEFAULT_DEFAULT_MODEL) {
+          throw error;
+        }
+        process.stderr.write(
+          `${dim(`pinned default model ${flags.model} unavailable (${error instanceof Error ? error.message : error}); using ${DEFAULT_DEFAULT_MODEL}`)}\n`,
+        );
+        flags.model = DEFAULT_DEFAULT_MODEL;
+        model = resolveModel(flags.model);
+      }
       if (systemPromptFile) {
         flags.systemPrompt = readFileSync(systemPromptFile, "utf8").trim();
       }
@@ -1035,7 +1107,7 @@ export const runCommand: Command = {
     // Interactive REPL: in slow mode, page long replies (pageReplies = true).
     const renderer = attachRenderer(agent, flags, true);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | mode: ${flags.mode} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
+      `${dim(`model: ${flags.model} | mode: ${flags.mode} | /config for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     // Slow-mode tool confirmation. The hook fires while agent.prompt() is being
@@ -1229,7 +1301,7 @@ async function runTui(
     banner.setText(
       `${cyanLine("rath")} ${dimLine(
         `| ${flags.model} | mode: ${flags.mode} | reasoning: ${agent.state.thinkingLevel} | ` +
-          "/info for commands | Ctrl+C interrupts",
+          "/config for commands | Ctrl+C interrupts",
       )}`,
     );
   };
@@ -1433,7 +1505,9 @@ async function runTui(
       );
       return true;
     }
-    if (command === "/info") {
+    // Bare /config renders the panel; /config <subcommand> falls through to
+    // handleSlashCommand (default-model, etc.).
+    if (command === "/config" && arg.length === 0) {
       const pairs = sessionInfo(agent, flags);
       const width = Math.max(...pairs.map(([key]) => key.length));
       const panel = pairs

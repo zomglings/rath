@@ -1,4 +1,11 @@
 export {
+  clearDefaultModel,
+  configDir,
+  loadPreferences,
+  type Preferences,
+  setDefaultModel,
+} from "./config.js";
+export {
   applyCitationTrailer,
   type Citation,
   type ContainerFileCitation,

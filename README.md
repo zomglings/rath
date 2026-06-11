@@ -109,8 +109,9 @@ list to choose), since rath development inside `rath run` wants them on hand.
   `-p` one-shots) and a pi-tui interface (`-T`/`--tui`) with differential
   rendering, an editor input, selector overlays for the session commands,
   and Ctrl+C interrupting the current turn instead of killing the session.
-- Models are explicit: `-m <provider>/<model-id>` (default
-  `openai-native/gpt-5-mini`; any registered pi-ai provider works).
+- Models are explicit: `-m <provider>/<model-id>`. Without `-m`, the pinned
+  default model (`/config default-model`) is used, falling back to the
+  built-in `openai-native/gpt-5.5`. Any registered pi-ai provider works.
 - Every startup setting is also settable in-session (both frontends), so a
   session never has to be restarted to change configuration: `/info` shows
   the configuration, `/sys [text]` shows or sets the system prompt,
