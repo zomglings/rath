@@ -1,6 +1,5 @@
 export {
   ensureCatalogue,
-  openAiCatalogue,
   openRouterCatalogue,
   type RawOpenRouterModel,
   resetCatalogue,

@@ -76,9 +76,10 @@ preserves them. Register with `registerOpenRouterNative()` and use
 `openrouterNativeModel("openai/gpt-4o")`. It reuses the shared `hosted-tools`
 machinery, so citations, trailers, and flatten-on-handoff work identically.
 
-`openrouterNativeModel` validates the id against the **live** catalogue when
-it has been primed (`ensureCatalogue()` fetches OpenRouter's keyless
-`/api/v1/models`, cached in the SQLite config store with a freshness window),
+`openrouterNativeModel` validates the id against the **live** OpenRouter
+catalogue when it has been primed (`ensureCatalogue()` fetches OpenRouter's
+keyless `/api/v1/models`, cached in the SQLite config store with a freshness
+window),
 building the model from the live pricing/context metadata. This means ids
 newer than pi-ai's bundled registry (e.g. `anthropic/claude-fable-5` before a
 pi-ai bump) work, and unknown ids are rejected against the current list. When
@@ -120,10 +121,13 @@ list to choose), since rath development inside `rath run` wants them on hand.
 - Models are explicit: `-m <provider>/<model-id>`. Without `-m`, the pinned
   default model (`/config default-model`) is used, falling back to the
   built-in `openai-native/gpt-5.5`. Any registered pi-ai provider works. At
-  startup rath primes a live model catalogue (OpenRouter's keyless
-  `/api/v1/models`, and OpenAI's `/v1/models` when the key is set), cached in
-  the config store, so `/lsmodels` and openrouter-native model resolution
-  reflect the current providers rather than pi-ai's bundled snapshot.
+  startup rath primes a live OpenRouter model catalogue (the keyless
+  `/api/v1/models`), cached in the config store, so `/lsmodels` and
+  openrouter-native model resolution reflect OpenRouter's current list rather
+  than pi-ai's bundled snapshot. (openai-native and the stock providers use
+  pi-ai's bundled registry, which carries the pricing/context metadata they
+  need; OpenAI's `/v1/models` is unfiltered and metadata-less, so it is not a
+  usable live source.)
 - Every startup setting is also settable in-session (both frontends), so a
   session never has to be restarted to change configuration: `/info` shows
   the configuration, `/sys [text]` shows or sets the system prompt,
