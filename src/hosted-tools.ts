@@ -140,16 +140,49 @@ export function uniqueUrlCitations(message: AssistantMessage): UrlCitation[] {
   return [...seen.values()];
 }
 
-/** Render the message's unique URL citations to "Sources:" trailer text, or
+/** All citations across the message's text blocks, deduplicated by identity,
+ * in order of first appearance. Covers every citation type (web search, file
+ * search, code interpreter), unlike uniqueUrlCitations which is URL-only. */
+function uniqueCitations(message: AssistantMessage): Citation[] {
+  const seen = new Map<string, Citation>();
+  for (const block of message.content) {
+    if (block.type === "text" && !isRenderedCitations(block)) {
+      for (const citation of getCitations(block)) {
+        const key =
+          citation.type === "url_citation"
+            ? `url:${citation.url}`
+            : citation.type === "file_citation"
+              ? `file:${citation.fileId}`
+              : `container:${citation.containerId}:${citation.fileId}`;
+        if (!seen.has(key)) {
+          seen.set(key, citation);
+        }
+      }
+    }
+  }
+  return [...seen.values()];
+}
+
+function citationLine(c: Citation): string {
+  switch (c.type) {
+    case "url_citation":
+      return `- ${c.title ? `${c.title} — ` : ""}${c.url}`;
+    case "file_citation":
+      return `- ${c.filename}`;
+    case "container_file_citation":
+      return `- ${c.filename} (container ${c.containerId})`;
+  }
+}
+
+/** Render the message's unique citations to "Sources:" trailer text, or
  * undefined when there are none. The single source of truth for trailer text,
  * so the display/persistence trailer and the flattened-handoff trailer match. */
 function renderCitationTrailer(message: AssistantMessage): string | undefined {
-  const citations = uniqueUrlCitations(message);
+  const citations = uniqueCitations(message);
   if (citations.length === 0) {
     return undefined;
   }
-  const lines = citations.map((c) => `- ${c.title ? `${c.title} — ` : ""}${c.url}`);
-  return `Sources:\n${lines.join("\n")}`;
+  return `Sources:\n${citations.map(citationLine).join("\n")}`;
 }
 
 /**
@@ -312,6 +345,11 @@ export function flattenHostedContent(message: AssistantMessage): AssistantMessag
     }
     if (isHostedToolCall(block)) {
       flattened.push({ type: "text", text: renderHostedToolCall(block) });
+      continue;
+    }
+    // Empty text blocks are rejected as malformed message items by both
+    // openai-native and foreign providers; drop them (mirrors the converter).
+    if (block.type === "text" && block.text.length === 0) {
       continue;
     }
     flattened.push(block);

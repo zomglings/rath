@@ -616,23 +616,31 @@ export const runCommand: Command = {
             if (m.stopReason === "error" || m.stopReason === "aborted") {
               return [];
             }
-            // Same-provider replay must stay byte-identical to what the model
-            // produced, or the prompt/KV cache prefix breaks. Compare the
-            // message's PRODUCING api to the currently-selected model's api.
-            const sameProvider = m.api === agent.state.model.api;
-            if (sameProvider) {
+            // Replay is lossless only to the EXACT producing model: the
+            // provider converters key replayability on api+provider+model
+            // (encrypted reasoning and hosted raw items are model-specific),
+            // so two models sharing an api (e.g. openai-native/gpt-5-mini and
+            // openai-native/gpt-5) are NOT interchangeable. Match that triple
+            // here, or a cross-model switch would skip flatten and the
+            // converter would then silently drop the hosted history anyway.
+            const sameModel =
+              m.api === agent.state.model.api &&
+              m.provider === agent.state.model.provider &&
+              m.model === agent.state.model.id;
+            if (sameModel) {
               // The rendered citation trailer is a display/persistence artifact;
               // the producing provider reconstructs the real annotations itself,
               // so strip the trailer before replay. (For openai-native the
               // provider's converter also strips it defensively; doing it here
-              // keeps the wire payload identical for any same-provider replay.)
+              // keeps the wire payload identical for same-model replay.)
               return [stripRenderedCitations(m)];
             }
-            // Cross-provider handoff: the foreign provider's converter only
-            // understands text | thinking | toolCall and would silently drop
-            // hostedToolCall blocks, ignore inline citations, and reject the
-            // producing provider's thinking signatures. Flatten the extended
-            // content to plain text the foreign provider preserves.
+            // Handoff to a different model (foreign provider, or another model
+            // of the same provider): the target converter only understands
+            // text | thinking | toolCall and would silently drop hostedToolCall
+            // blocks, ignore inline citations, and reject the producing model's
+            // thinking signatures. Flatten the extended content to plain text
+            // the target preserves.
             return [flattenHostedContent(m)];
           });
         },
