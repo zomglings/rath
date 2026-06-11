@@ -203,14 +203,10 @@ export async function loadTools(
         );
         break;
       case "configure":
+        // Pass the WHOLE ctx (incl. requestExit) so a configure-driven tools
+        // rebuild can still wire end_session and the rest.
         if (ctx.getAgent && ctx.flags) {
-          tools.push(
-            createConfigureTool({
-              getAgent: ctx.getAgent,
-              flags: ctx.flags,
-              suspendTerminal: ctx.suspendTerminal,
-            }),
-          );
+          tools.push(createConfigureTool(ctx));
         }
         break;
       case "list_models":
@@ -335,17 +331,29 @@ function createConfigureTool(
         }
       }
       if (params.reasoning !== undefined) {
-        agent.state.thinkingLevel = params.reasoning;
-        flags.reasoning = params.reasoning;
-        changes.push(`reasoning -> ${params.reasoning}`);
+        // execute() is a public entry point; do not trust the schema layer to
+        // have rejected an out-of-set value.
+        if (REASONING_LEVELS.includes(params.reasoning as ReasoningLevel)) {
+          agent.state.thinkingLevel = params.reasoning;
+          flags.reasoning = params.reasoning as ReasoningLevel;
+          changes.push(`reasoning -> ${params.reasoning}`);
+        } else {
+          errors.push(
+            `reasoning: invalid ${params.reasoning} (use ${REASONING_LEVELS.join(", ")})`,
+          );
+        }
       }
       if (params.webSearch !== undefined) {
         flags.webSearch = params.webSearch;
         changes.push(`web search -> ${params.webSearch ? "on" : "off"}`);
       }
       if (params.mode !== undefined) {
-        flags.mode = params.mode;
-        changes.push(`mode -> ${params.mode}`);
+        if (MODES.includes(params.mode as Mode)) {
+          flags.mode = params.mode as Mode;
+          changes.push(`mode -> ${params.mode}`);
+        } else {
+          errors.push(`mode: invalid ${params.mode} (use ${MODES.join(", ")})`);
+        }
       }
       if (params.tools !== undefined) {
         const invalid = params.tools.filter((n) => !TOOL_NAMES.includes(n as ToolName));
@@ -355,8 +363,15 @@ function createConfigureTool(
           const names = params.tools as ToolName[];
           try {
             agent.state.tools = await loadTools(names, process.cwd(), ctx);
-            flags.tools = names;
-            changes.push(`tools -> ${names.length > 0 ? names.join(", ") : "none"}`);
+            // Report what was actually built: a tool whose required context is
+            // absent is silently skipped by loadTools, so requested != built.
+            const built = agent.state.tools.map((t) => t.name) as ToolName[];
+            flags.tools = built;
+            const dropped = names.filter((n) => !built.includes(n));
+            changes.push(`tools -> ${built.length > 0 ? built.join(", ") : "none"}`);
+            if (dropped.length > 0) {
+              errors.push(`tools: could not enable ${dropped.join(", ")} (unavailable here)`);
+            }
           } catch (error) {
             errors.push(`tools: ${msg(error)}`);
           }
@@ -370,13 +385,19 @@ function createConfigureTool(
       if (params.defaultModel !== undefined) {
         const spec = params.defaultModel.trim();
         if (spec === "" || spec === "none") {
-          clearDefaultModel();
-          changes.push(`default model -> cleared (built-in ${DEFAULT_DEFAULT_MODEL})`);
+          changes.push(
+            clearDefaultModel()
+              ? `default model -> cleared (built-in ${DEFAULT_DEFAULT_MODEL})`
+              : `default model -> clear requested but not persisted (no config store)`,
+          );
         } else {
           try {
             resolveModel(spec);
-            setDefaultModel(spec);
-            changes.push(`default model -> ${spec} (persisted, future sessions)`);
+            changes.push(
+              setDefaultModel(spec)
+                ? `default model -> ${spec} (persisted, future sessions)`
+                : `default model -> ${spec} requested but NOT persisted (no config store)`,
+            );
           } catch (error) {
             errors.push(`defaultModel: ${msg(error)}`);
           }
@@ -625,16 +646,24 @@ export async function handleSlashCommand(
           };
         }
         if (spec === "none" || spec === "clear") {
-          clearDefaultModel();
-          return { output: `default model cleared (built-in ${DEFAULT_DEFAULT_MODEL})` };
+          return clearDefaultModel()
+            ? { output: `default model cleared (built-in ${DEFAULT_DEFAULT_MODEL})` }
+            : {
+                output: "default model clear requested, but not persisted (no config store)",
+                isError: true,
+              };
         }
         try {
           resolveModel(spec);
         } catch (error) {
           return { output: error instanceof Error ? error.message : String(error), isError: true };
         }
-        setDefaultModel(spec);
-        return { output: `default model pinned: ${spec} (applies to new sessions)` };
+        return setDefaultModel(spec)
+          ? { output: `default model pinned: ${spec} (applies to new sessions)` }
+          : {
+              output: `default model NOT persisted (no config store): ${spec}`,
+              isError: true,
+            };
       }
       if (sub.length > 0) {
         return {
@@ -698,8 +727,16 @@ export async function handleSlashCommand(
           flags,
           requestExit,
         });
-        flags.tools = names;
-        return { output: `tools: ${names.join(", ")}${deferred}` };
+        // Report (and record) what was actually built — a tool whose context
+        // is unavailable is skipped, so requested may differ from built.
+        const built = agent.state.tools.map((t) => t.name) as ToolName[];
+        flags.tools = built;
+        const dropped = names.filter((n) => !built.includes(n));
+        const note = dropped.length > 0 ? ` (could not enable: ${dropped.join(", ")})` : "";
+        return {
+          output: `tools: ${built.length > 0 ? built.join(", ") : "none"}${note}${deferred}`,
+          isError: dropped.length > 0,
+        };
       } catch (error) {
         return { output: error instanceof Error ? error.message : String(error), isError: true };
       }
@@ -941,22 +978,33 @@ export function toolArgsPreview(args: unknown, max = 120): string {
  * the call when the user declines; a frontend that cannot confirm (non-TTY
  * plain REPL, or -p one-shot) denies rather than passing through.
  *
- * The hook reads flags.mode on every call, so /slow mid-session starts gating
- * and /go stops it — no agent rebuild needed.
+ * The gating mode is snapshotted at each turn's start (agent_start), not read
+ * live per call. A human's /go|/slow between turns is captured at the next
+ * turn; but a tool that flips mode mid-turn (e.g. configure({mode:"go"}))
+ * cannot disarm the gate for the rest of that same turn — otherwise the model
+ * could self-approve one mode change and then run everything else unconfirmed.
  *
- * This is also the security mitigation for prompt injection: with hosted web
- * search on, a malicious page can try to steer the model into running tools.
- * Slow mode forces a human to approve each tool call before it executes.
+ * This is the security mitigation for prompt injection: with hosted web search
+ * on, a malicious page can try to steer the model into running tools. Slow mode
+ * forces a human to approve each tool call before it executes.
  */
 export function makeBeforeToolCall(
+  agent: Agent,
   flags: RunFlags,
   confirm: (toolName: string, argsPreview: string, signal?: AbortSignal) => Promise<boolean>,
 ): (ctx: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined> {
+  // Frozen at agent_start; refreshed only between turns, never mid-turn.
+  let gatedMode: Mode = flags.mode;
+  agent.subscribe((event) => {
+    if (event.type === "agent_start") {
+      gatedMode = flags.mode;
+    }
+  });
   return async (
     ctx: BeforeToolCallContext,
     signal?: AbortSignal,
   ): Promise<BeforeToolCallResult | undefined> => {
-    if (flags.mode !== "slow") {
+    if (gatedMode !== "slow") {
       return undefined; // go mode: pass-through, no gating.
     }
     const toolName = ctx.toolCall.name;
@@ -1144,9 +1192,9 @@ export const runCommand: Command = {
       takesValue: true,
       repeatable: true,
       description:
-        "Client-side tools to enable (comma-separated or repeated): read, bash, edit, write, " +
-        "grep, find, ls, request_human_edit. Omit to enable all of them; pass --tools none to " +
-        "disable. They run with your privileges in the current directory.",
+        `Client-side tools to enable (comma-separated or repeated): ${TOOL_NAMES.join(", ")}. ` +
+        "Omit to enable all of them (request_human_edit excluded in a -p one-shot); pass " +
+        "--tools none to disable. They run with your privileges in the current directory.",
     },
     {
       long: "load",
@@ -1262,9 +1310,15 @@ export const runCommand: Command = {
       }
     }
 
-    // Default to all tools when --tools was not given at all.
+    // Default to all tools when --tools was not given at all. In a -p one-shot
+    // there is no human at the terminal, so drop tools that need one:
+    // request_human_edit would spawn an editor and block the pipeline. An
+    // explicit --tools is honored verbatim (the caller asked for it).
     if (!toolsExplicit) {
       flags.tools = [...TOOL_NAMES];
+      if (flags.prompt !== undefined) {
+        flags.tools = flags.tools.filter((t) => t !== "request_human_edit");
+      }
     }
 
     // Without -m, use the pinned default model from preferences (built-in
@@ -1411,7 +1465,7 @@ export const runCommand: Command = {
       // One-shot is non-interactive: there is no human to confirm tool calls,
       // so slow mode denies them rather than running them unattended. go mode
       // (the default) keeps the pass-through, so -p behavior is unchanged.
-      agent.beforeToolCall = makeBeforeToolCall(flags, async (toolName, argsPreview) => {
+      agent.beforeToolCall = makeBeforeToolCall(agent, flags, async (toolName, argsPreview) => {
         process.stderr.write(
           `${dim(`run ${toolName} ${argsPreview}? [y/N] (non-interactive — denied)`)}\n`,
         );
@@ -1441,21 +1495,25 @@ export const runCommand: Command = {
     // corrupt line buffering). Non-TTY stdin (piped/-p) cannot answer a
     // prompt, so default to deny there — slow mode without a human present must
     // not auto-run tools.
-    agent.beforeToolCall = makeBeforeToolCall(flags, async (toolName, argsPreview, signal) => {
-      const question = `run ${toolName} ${argsPreview}? [y/N] `;
-      if (!process.stdin.isTTY) {
-        process.stderr.write(`${dim(`${question}(no TTY — denied)`)}\n`);
-        return false;
-      }
-      try {
-        // Ctrl+C during the prompt aborts the turn; the signal cancels the
-        // question so we do not block on a line that will never come.
-        const answer = (await rl.question(dim(question), { signal })).trim().toLowerCase();
-        return answer === "y" || answer === "yes";
-      } catch {
-        return false; // aborted question -> deny.
-      }
-    });
+    agent.beforeToolCall = makeBeforeToolCall(
+      agent,
+      flags,
+      async (toolName, argsPreview, signal) => {
+        const question = `run ${toolName} ${argsPreview}? [y/N] `;
+        if (!process.stdin.isTTY) {
+          process.stderr.write(`${dim(`${question}(no TTY — denied)`)}\n`);
+          return false;
+        }
+        try {
+          // Ctrl+C during the prompt aborts the turn; the signal cancels the
+          // question so we do not block on a line that will never come.
+          const answer = (await rl.question(dim(question), { signal })).trim().toLowerCase();
+          return answer === "y" || answer === "yes";
+        } catch {
+          return false; // aborted question -> deny.
+        }
+      },
+    );
     // Iterating the interface (rather than looping rl.question) queues input
     // arriving while a turn runs instead of dropping it. Ctrl+C aborts the
     // active response; a second Ctrl+C before it settles (or one while idle)
@@ -1820,7 +1878,7 @@ async function runTui(
       tui.requestRender();
     });
 
-  agent.beforeToolCall = makeBeforeToolCall(flags, (toolName, argsPreview, signal) =>
+  agent.beforeToolCall = makeBeforeToolCall(agent, flags, (toolName, argsPreview, signal) =>
     confirmTool(toolName, argsPreview, signal),
   );
 

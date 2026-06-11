@@ -19,7 +19,7 @@ import {
   registerOpenAINative,
 } from "../index.js";
 
-const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
+const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5.5";
 const FIB_100 = "354224848179261915075";
 
 function log(message: string): void {

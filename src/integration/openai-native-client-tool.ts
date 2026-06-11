@@ -20,7 +20,7 @@ import {
   registerOpenAINative,
 } from "../index.js";
 
-const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
+const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5.5";
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);
@@ -126,11 +126,11 @@ async function main(): Promise<void> {
   assert.equal(replayedOutputs.length, 1, "the function_call_output must be replayed");
   assert.equal(replayedOutputs[0]!.call_id, expectedCallId);
   assert.equal(replayedOutputs[0]!.output, "Printed successfully.");
+  // The point of this test is the replay (call_id matching) above. Turn 2 only
+  // needs to complete normally; whether the model adds a text reply after the
+  // tool result is model-dependent (a reasoning model may not), so do not
+  // assert on it.
   assert.equal(turn2.stopReason, "stop", "turn 2 must complete normally");
-  assert.ok(
-    turn2.content.some((b) => b.type === "text" && b.text.length > 0),
-    "turn 2 must produce a text reply",
-  );
   log("Turn 2 OK: function_call and function_call_output replayed with matching call_id");
 
   const totalCost = [turn1, turn2].reduce((sum, m) => sum + m.usage.cost.total, 0);

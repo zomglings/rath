@@ -17,7 +17,7 @@ import { type AgentContext, type AgentTool, agentLoop } from "@earendil-works/pi
 import { type Message, type SimpleStreamOptions, streamSimple, Type } from "@earendil-works/pi-ai";
 import { getHostedToolCalls, openaiNativeModel, registerOpenAINative } from "../index.js";
 
-const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
+const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5.5";
 const CODEWORD = "PERIWINKLE-42";
 
 function log(message: string): void {

@@ -26,7 +26,7 @@ import {
   registerOpenAINative,
 } from "../index.js";
 
-const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5-mini";
+const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5.5";
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);

@@ -87,8 +87,10 @@ function getSqlite(): SqliteModule | null {
  */
 const MIGRATIONS: Array<(db: SqliteDatabase) => void> = [
   // v1: preferences as a key/value table (extensible without schema churn).
+  // IF NOT EXISTS so a DB that already has the table (e.g. user_version reset)
+  // re-applies cleanly instead of wedging on "table already exists".
   (db) => {
-    db.exec("CREATE TABLE preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.exec("CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   },
 ];
 
@@ -113,18 +115,28 @@ function migrate(db: SqliteDatabase): void {
 
 /**
  * Open the config database (creating the directory and file as needed) with
- * the schema migrated to the latest version. Returns null when node:sqlite is
- * unavailable, so callers can degrade to no persistence.
+ * the schema migrated to the latest version. Returns null when the store
+ * cannot be opened — node:sqlite missing, the file corrupt, the directory
+ * unwritable, or another process holding the lock past the busy timeout — so
+ * every caller degrades to no persistence rather than crashing the session.
  */
 function openDb(): SqliteDatabase | null {
   const sqlite = getSqlite();
   if (!sqlite) {
     return null;
   }
-  mkdirSync(configDir(), { recursive: true });
-  const db = new sqlite.DatabaseSync(dbPath());
-  migrate(db);
-  return db;
+  let db: SqliteDatabase | undefined;
+  try {
+    mkdirSync(configDir(), { recursive: true });
+    db = new sqlite.DatabaseSync(dbPath());
+    // Wait out a concurrent writer's lock instead of failing instantly.
+    db.exec("PRAGMA busy_timeout = 2000");
+    migrate(db);
+    return db;
+  } catch {
+    db?.close();
+    return null;
+  }
 }
 
 /** Persisted CLI preferences. Optional fields so an empty store is valid. */
@@ -166,34 +178,45 @@ export function loadPreferences(): Preferences {
   }
 }
 
-/** Pin `spec` as the default model for new sessions. Best-effort write. */
-export function setDefaultModel(spec: string): void {
+/**
+ * Pin `spec` as the default model for new sessions. Returns true if it was
+ * actually persisted, false if the store was unavailable — so callers can
+ * report honestly instead of claiming a write that did not happen.
+ */
+export function setDefaultModel(spec: string): boolean {
   const db = openDb();
   if (!db) {
-    return;
+    return false;
   }
   try {
     db.prepare(
       "INSERT INTO preferences (key, value) VALUES (?, ?) " +
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run(KEY_DEFAULT_MODEL, spec);
+    return true;
   } catch {
     // Persistence is best-effort; a failed write must not break the session.
+    return false;
   } finally {
     db.close();
   }
 }
 
-/** Clear the pinned default model, reverting new sessions to the built-in. */
-export function clearDefaultModel(): void {
+/**
+ * Clear the pinned default model, reverting new sessions to the built-in.
+ * Returns true if the store was reachable (the clear took effect), false if
+ * persistence was unavailable.
+ */
+export function clearDefaultModel(): boolean {
   const db = openDb();
   if (!db) {
-    return;
+    return false;
   }
   try {
     db.prepare("DELETE FROM preferences WHERE key = ?").run(KEY_DEFAULT_MODEL);
+    return true;
   } catch {
-    // Best-effort.
+    return false;
   } finally {
     db.close();
   }

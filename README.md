@@ -192,10 +192,12 @@ Most tests call the live OpenAI API: they require `OPENAI_API_KEY` in
 the environment and fail fast with a clear error when it is missing. They
 cost real money (fractions of a cent in tokens, plus per-use fees for hosted
 tools such as web search and code interpreter containers), which is why they
-are not part of the pre-commit checks. (`request-human-edit` is the exception:
-it calls no API and needs no key — it drives the editor tool with a fake
-editor script.) `RATH_TEST_MODEL` overrides the model
-(default: `gpt-5-mini`). Tests log a per-run token cost on success, and
+are not part of the pre-commit checks. (Several tests are the exception:
+`request-human-edit`, `config-preferences`, `configure-tool`, `session-tools`,
+and `slow-mode-gate` call no API and need no key — they exercise the CLI tools
+and config store directly.) `RATH_TEST_MODEL` overrides the model used by the
+API tests (default: `gpt-5.5`; the OpenRouter test uses `openai/gpt-5.5`).
+Tests log a per-run token cost on success, and
 assert on request payloads via the provider's `onPayload` hook when they need
 to prove what was actually sent to the API.
 
