@@ -413,6 +413,7 @@ export function convertNativeMessages(
       }
     } else if (msg.role === "assistant") {
       const toolCalls: NonNullable<ChatCompletionAssistantMessageParam["tool_calls"]> = [];
+      const reasoningDetails: unknown[] = [];
       let text = "";
       for (const block of msg.content as HostedContentBlock[]) {
         if (block.type === "text") {
@@ -429,11 +430,20 @@ export function convertNativeMessages(
             type: "function",
             function: { name: block.name, arguments: JSON.stringify(block.arguments) },
           });
+          if (block.thoughtSignature) {
+            try {
+              reasoningDetails.push(JSON.parse(block.thoughtSignature));
+            } catch {
+              // A hand-edited or corrupted signature must not crash the turn.
+            }
+          }
         }
         // thinking and hostedToolCall blocks are intentionally not replayed to
-        // the wire. Thinking has no Chat Completions assistant-message slot
-        // here; hostedToolCall raw items are output-only annotations OpenRouter
-        // does not accept on a request (see the file header).
+        // the wire. Thinking blocks have no Chat Completions assistant-message
+        // slot here; their encrypted-reasoning continuation, when an upstream
+        // requires it, rides on tool calls via reasoning_details above.
+        // hostedToolCall raw items are output-only annotations OpenRouter does
+        // not accept on a request (see the file header).
       }
       const assistantMsg: ChatCompletionAssistantMessageParam = { role: "assistant" };
       if (text.length > 0) {
@@ -441,6 +451,9 @@ export function convertNativeMessages(
       }
       if (toolCalls.length > 0) {
         assistantMsg.tool_calls = toolCalls;
+      }
+      if (reasoningDetails.length > 0) {
+        (assistantMsg as { reasoning_details?: unknown[] }).reasoning_details = reasoningDetails;
       }
       // Skip empty assistant turns (e.g. an errored turn that produced nothing):
       // the API rejects an assistant message with neither content nor tool_calls.
@@ -467,11 +480,20 @@ export function convertNativeMessages(
 // Chat Completions stream -> pi-ai events
 // ---------------------------------------------------------------------------
 
+/** One entry of OpenRouter's `reasoning_details` array (its reasoning wire). */
+interface OpenRouterReasoningDetail {
+  type?: string;
+  id?: string;
+  data?: string;
+  [key: string]: unknown;
+}
+
 /** A streaming delta, widened for OpenRouter's non-standard extra fields. */
 interface OpenRouterDelta extends ChatCompletionChunk.Choice.Delta {
   annotations?: OpenRouterUrlCitationAnnotation[];
   reasoning?: string | null;
   reasoning_content?: string | null;
+  reasoning_details?: OpenRouterReasoningDetail[];
 }
 
 async function processNativeStream(
@@ -507,6 +529,17 @@ async function processNativeStream(
       continue;
     }
     output.responseId ||= chunk.id;
+    // OpenRouter can surface an in-band error as a top-level `error` field on a
+    // chunk (e.g. upstream provider failure) instead of an HTTP error the SDK
+    // would throw. Treat it as a hard failure.
+    const chunkError = (chunk as { error?: { message?: string; code?: string | number } }).error;
+    if (chunkError) {
+      throw new Error(
+        `OpenRouter error${chunkError.code !== undefined ? ` ${chunkError.code}` : ""}: ${
+          chunkError.message || "unknown error"
+        }`,
+      );
+    }
     if (chunk.usage) {
       finalizeUsage(chunk.usage, output, model);
     }
@@ -516,6 +549,9 @@ async function processNativeStream(
     }
     if (choice.finish_reason) {
       output.stopReason = mapStopReason(choice.finish_reason);
+      if (output.stopReason === "error") {
+        output.errorMessage = `Provider finish_reason: ${choice.finish_reason}`;
+      }
       hasFinishReason = true;
     }
     const delta = choice.delta as OpenRouterDelta | undefined;
@@ -608,6 +644,24 @@ async function processNativeStream(
             delta: toolCall.function.arguments,
             partial: output,
           });
+        }
+      }
+    }
+
+    // OpenRouter carries per-provider encrypted reasoning in reasoning_details,
+    // keyed to a tool call id. Some upstreams (Anthropic, DeepSeek via
+    // OpenRouter) reject a replayed tool call whose paired reasoning is missing,
+    // so stash the verbatim detail on the matching tool call's thoughtSignature
+    // to replay it (mirrors pi-ai's stock openai-completions handling).
+    if (Array.isArray(delta.reasoning_details)) {
+      for (const detail of delta.reasoning_details) {
+        if (detail?.type === "reasoning.encrypted" && detail.id && detail.data) {
+          const target = blocks.find(
+            (b): b is ToolCall => b.type === "toolCall" && b.id === detail.id,
+          );
+          if (target) {
+            target.thoughtSignature = JSON.stringify(detail);
+          }
         }
       }
     }
