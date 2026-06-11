@@ -499,7 +499,12 @@ async function processNativeStream(
   const blocks = output.content as HostedContentBlock[];
   let textBlock: HostedTextContent | null = null;
   let thinkingIndex: number | null = null;
+  // Keyed by both stream index and id: OpenRouter-proxied upstreams may omit
+  // `index` on tool-call deltas, in which case id is the only stable handle
+  // (mirrors pi-ai's stock openai-completions, which a single-index map would
+  // regress by collapsing distinct index-less calls onto index 0).
   const toolCallsByIndex = new Map<number, ToolCall & { partialJson?: string }>();
+  const toolCallsById = new Map<string, ToolCall & { partialJson?: string }>();
   // Accumulate annotations across chunks; OpenRouter may stream them
   // incrementally and/or repeat the full set on the final delta. Dedupe by
   // (url, start, end) so a repeated final set does not double-count.
@@ -630,8 +635,11 @@ async function processNativeStream(
 
     if (Array.isArray(delta.tool_calls)) {
       for (const toolCall of delta.tool_calls) {
-        const streamIndex = typeof toolCall.index === "number" ? toolCall.index : 0;
-        let block = toolCallsByIndex.get(streamIndex);
+        const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
+        let block = streamIndex !== undefined ? toolCallsByIndex.get(streamIndex) : undefined;
+        if (!block && toolCall.id) {
+          block = toolCallsById.get(toolCall.id);
+        }
         if (!block) {
           block = {
             type: "toolCall",
@@ -640,12 +648,18 @@ async function processNativeStream(
             arguments: {},
             partialJson: "",
           } as ToolCall & { partialJson?: string };
-          toolCallsByIndex.set(streamIndex, block);
+          if (streamIndex !== undefined) {
+            toolCallsByIndex.set(streamIndex, block);
+          }
+          if (toolCall.id) {
+            toolCallsById.set(toolCall.id, block);
+          }
           blocks.push(block);
           stream.push({ type: "toolcall_start", contentIndex: indexOf(block), partial: output });
         }
         if (!block.id && toolCall.id) {
           block.id = toolCall.id;
+          toolCallsById.set(toolCall.id, block);
         }
         if (!block.name && toolCall.function?.name) {
           block.name = toolCall.function.name;
@@ -701,13 +715,19 @@ async function processNativeStream(
       partial: output,
     });
   }
-  for (const block of toolCallsByIndex.values()) {
-    block.arguments = parseStreamingJson(block.partialJson || "{}");
-    delete block.partialJson;
+  // Finalize every tool-call block (some are keyed only by id when the
+  // upstream omitted stream indices), in their content order.
+  for (const block of blocks) {
+    if (block.type !== "toolCall") {
+      continue;
+    }
+    const tool = block as ToolCall & { partialJson?: string };
+    tool.arguments = parseStreamingJson(tool.partialJson || "{}");
+    delete tool.partialJson;
     stream.push({
       type: "toolcall_end",
-      contentIndex: indexOf(block),
-      toolCall: block,
+      contentIndex: indexOf(tool),
+      toolCall: tool,
       partial: output,
     });
   }
@@ -743,13 +763,27 @@ function finalizeUsage(
   model: Model<typeof OPENROUTER_NATIVE_API>,
 ): void {
   const promptTokens = usage.prompt_tokens || 0;
-  const cacheRead = usage.prompt_tokens_details?.cached_tokens || 0;
+  const details = usage.prompt_tokens_details as
+    | { cached_tokens?: number; cache_write_tokens?: number }
+    | undefined;
+  // Different OpenRouter upstreams report cache hits/writes under different
+  // fields (OpenAI-style cached_tokens, DeepSeek's prompt_cache_hit_tokens,
+  // Anthropic's cache_write_tokens). Read all so cached tokens are not billed
+  // at the full input rate. Mirrors pi-ai's stock openai-completions.
+  const raw = usage as unknown as {
+    prompt_cache_hit_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+  const cacheRead = details?.cached_tokens ?? raw.prompt_cache_hit_tokens ?? 0;
+  const cacheWrite = details?.cache_write_tokens ?? raw.cache_creation_input_tokens ?? 0;
+  const input = Math.max(0, promptTokens - cacheRead - cacheWrite);
+  const outputTokens = usage.completion_tokens || 0;
   output.usage = {
-    input: Math.max(0, promptTokens - cacheRead),
-    output: usage.completion_tokens || 0,
+    input,
+    output: outputTokens,
     cacheRead,
-    cacheWrite: 0,
-    totalTokens: usage.total_tokens || 0,
+    cacheWrite,
+    totalTokens: usage.total_tokens || input + outputTokens + cacheRead + cacheWrite,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
   calculateCost(model, output.usage);
