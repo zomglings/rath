@@ -20,7 +20,9 @@
  * time and cost nothing.
  */
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import {
   Agent,
@@ -506,11 +508,15 @@ export function makeBeforeToolCall(
  * printing); false when nothing was paged and the caller should print normally.
  *
  * Falls back to no-paging (returns false) when not in slow mode, the output is
- * short, stdout/stdin are not a TTY, or no usable pager is found. The pager
- * inherits the terminal directly (stdio "inherit"); spawnSync blocks until the
- * pager exits, so this is only safe to call when the readline interface is not
- * actively reading (between turns / before re-prompting), which is where we use
- * it. The text is passed on the pager's stdin to avoid temp-file cleanup.
+ * short, stdout/stdin are not a TTY, or no usable pager is found.
+ *
+ * The text is written to a temp file and the pager is run as `pager <file>`
+ * with full "inherit" stdio. This is deliberate: piping the text on the pager's
+ * stdin would steal the keyboard (less detects a non-TTY stdin and dumps the
+ * content like cat instead of paging). With the content in a file, stdin stays
+ * the terminal so the pager reads keypresses. spawnSync blocks until the pager
+ * exits, so this is only called between turns (the readline interface is
+ * suspended, not actively reading), then the temp file is removed.
  */
 export function pagePlain(text: string, flags: RunFlags): boolean {
   if (flags.mode !== "slow" || !isLongOutput(text)) {
@@ -527,13 +533,16 @@ export function pagePlain(text: string, flags: RunFlags): boolean {
   if (!cmd) {
     return false;
   }
-  process.stderr.write(dim(`[paging ${isLongOutput(text) ? "long " : ""}output through ${cmd}]\n`));
+  let dir: string | undefined;
   try {
-    const result = spawnSync(cmd, rest, {
-      // stdin is the text (a pipe); stdout/stderr inherit the terminal so the
-      // pager draws normally and owns the keyboard while it runs.
-      input: text.endsWith("\n") ? text : `${text}\n`,
-      stdio: ["pipe", "inherit", "inherit"],
+    dir = mkdtempSync(join(tmpdir(), "rath-pager-"));
+    const file = join(dir, "output.txt");
+    writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`);
+    process.stderr.write(dim(`[paging long output through ${cmd}]\n`));
+    const result = spawnSync(cmd, [...rest, file], {
+      // Inherit all three streams so the pager owns the terminal: it draws to
+      // the screen and reads the keyboard from the real stdin TTY.
+      stdio: "inherit",
     });
     if (result.error) {
       return false; // pager missing/unspawnable: caller prints plainly.
@@ -541,6 +550,11 @@ export function pagePlain(text: string, flags: RunFlags): boolean {
     return true;
   } catch {
     return false;
+  } finally {
+    if (dir) {
+      // Always remove the temp dir, even if the pager errored.
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -1220,24 +1234,46 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   // returned promise with the decision, which makeBeforeToolCall turns into a
   // pass-through (approve) or a block (deny). The agent loop awaits this hook,
   // so the tool does not run until the user answers.
-  const confirmTool = (toolName: string, argsPreview: string): Promise<boolean> =>
+  //
+  // Ctrl+C is intercepted by the TUI input listener (below), not by this
+  // overlay, so it aborts the agent and fires the abort signal — we listen for
+  // it here to dismiss the overlay and deny, otherwise this promise would hang
+  // the agent loop forever waiting for a y/n that an interrupted user expects
+  // to be unnecessary.
+  const confirmTool = (
+    toolName: string,
+    argsPreview: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> =>
     new Promise<boolean>((resolve) => {
       let settled = false;
-      const decide = (approved: boolean) => {
+      const decide = (approved: boolean, reason: "user" | "abort" = "user") => {
         if (settled) {
           return;
         }
         settled = true;
+        signal?.removeEventListener("abort", onAbort);
         handle.hide();
         tui.setFocus(editor);
         transcript.addChild(
           new Text(
-            approved ? dimLine(`[approved ${toolName}]`) : yellowLine(`[denied ${toolName}]`),
+            approved
+              ? dimLine(`[approved ${toolName}]`)
+              : yellowLine(`[denied ${toolName}${reason === "abort" ? " (interrupted)" : ""}]`),
           ),
         );
         tui.requestRender();
         resolve(approved);
       };
+      const onAbort = () => decide(false, "abort");
+      if (signal?.aborted) {
+        // Already aborted before the overlay even shows: deny without opening.
+        transcript.addChild(new Text(yellowLine(`[denied ${toolName} (interrupted)]`)));
+        tui.requestRender();
+        resolve(false);
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
       const prompt: PiTui.Component = {
         render: (width: number): string[] => {
           const head = yellowLine(`Run tool ${toolName}?`);
@@ -1259,8 +1295,8 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       tui.requestRender();
     });
 
-  agent.beforeToolCall = makeBeforeToolCall(flags, (toolName, argsPreview) =>
-    confirmTool(toolName, argsPreview),
+  agent.beforeToolCall = makeBeforeToolCall(flags, (toolName, argsPreview, signal) =>
+    confirmTool(toolName, argsPreview, signal),
   );
 
   /** TUI-native rendering for selected slash commands. Returns true when handled. */
