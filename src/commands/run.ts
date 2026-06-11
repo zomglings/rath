@@ -1,11 +1,12 @@
 /**
  * `rath run`: a generic agent loop with nothing implicit.
  *
- * No skill discovery, no context-file walking (AGENTS.md is never read), no
- * tools unless explicitly enabled via --tools. The model sees exactly what
- * the flags specify: the system prompt, the loaded context, and the user's
- * prompts. The only thing taken from the environment is the provider API
- * key. rath development itself is meant to happen inside `rath run`.
+ * No skill discovery, no context-file walking (AGENTS.md is never read). The
+ * model sees exactly what the flags specify: the system prompt, the loaded
+ * context, and the user's prompts. The only thing taken from the environment
+ * is the provider API key. Client-side tools are the one convenience default:
+ * --tools defaults to all of them (pass --tools none to disable, or a list to
+ * choose), since rath development inside `rath run` wants them on hand.
  *
  * Built on pi-agent-core's Agent (the stateful loop wrapper: transcript,
  * lifecycle events, tool execution, model switching via state.model) and
@@ -778,8 +779,9 @@ export const runCommand: Command = {
       takesValue: true,
       repeatable: true,
       description:
-        "Enable client-side tools (comma-separated or repeated): read, bash, edit, write, " +
-        "grep, find, ls. They run with your privileges in the current directory.",
+        "Client-side tools to enable (comma-separated or repeated): read, bash, edit, write, " +
+        "grep, find, ls, request_human_edit. Omit to enable all of them; pass --tools none to " +
+        "disable. They run with your privileges in the current directory.",
     },
     {
       long: "load",
@@ -804,6 +806,9 @@ export const runCommand: Command = {
     };
     let systemPromptFile: string | undefined;
     let systemPromptExplicit = false;
+    // Tools default to all when --tools is omitted; an explicit --tools (even
+    // "none") opts out of that default.
+    let toolsExplicit = false;
     for (let i = 0; i < argv.length; i++) {
       const token = argv[i]!;
       const value = (): string => {
@@ -851,14 +856,25 @@ export const runCommand: Command = {
         } else if (token === "--no-web-search") {
           flags.webSearch = false;
         } else if (token === "--tools") {
-          for (const name of value().split(",")) {
-            const trimmed = name.trim() as ToolName;
-            if (!TOOL_NAMES.includes(trimmed)) {
-              process.stderr.write(`Unknown tool: ${trimmed} (use ${TOOL_NAMES.join(", ")})\n`);
-              return 1;
-            }
-            if (!flags.tools.includes(trimmed)) {
-              flags.tools.push(trimmed);
+          toolsExplicit = true;
+          const raw = value();
+          // "none" disables tools entirely (the way to opt out of the all-tools
+          // default); otherwise the value is a comma-separated tool list.
+          if (raw.trim() === "none") {
+            flags.tools = [];
+          } else {
+            for (const name of raw.split(",")) {
+              const trimmed = name.trim() as ToolName;
+              if (trimmed.length === 0) {
+                continue;
+              }
+              if (!TOOL_NAMES.includes(trimmed)) {
+                process.stderr.write(`Unknown tool: ${trimmed} (use ${TOOL_NAMES.join(", ")})\n`);
+                return 1;
+              }
+              if (!flags.tools.includes(trimmed)) {
+                flags.tools.push(trimmed);
+              }
             }
           }
         } else if (token === "--load") {
@@ -875,6 +891,11 @@ export const runCommand: Command = {
         process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
         return 1;
       }
+    }
+
+    // Default to all tools when --tools was not given at all.
+    if (!toolsExplicit) {
+      flags.tools = [...TOOL_NAMES];
     }
 
     if (flags.prompt !== undefined && flags.tui) {

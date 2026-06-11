@@ -99,10 +99,11 @@ rath <command> -h         # help for any (sub)command
 ### rath run
 
 `rath run` starts a generic agent loop with nothing implicit: no skill
-discovery, no context-file walking (AGENTS.md is never read), no tools unless
-explicitly enabled with `--tools`. The model sees exactly what the flags
-specify; the provider API key is the only input taken from the environment.
-rath development itself is meant to happen inside `rath run`.
+discovery, no context-file walking (AGENTS.md is never read). The model sees
+exactly what the flags specify; the provider API key is the only input taken
+from the environment. The one convenience default is tools: `--tools` enables
+all client-side tools when omitted (pass `--tools none` to disable them, or a
+list to choose), since rath development inside `rath run` wants them on hand.
 
 - Two interactive frontends: a plain readline REPL (default; also handles
   `-p` one-shots) and a pi-tui interface (`-T`/`--tui`) with differential
@@ -137,7 +138,8 @@ rath development itself is meant to happen inside `rath run`.
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
 - `--tools read,bash,edit,write,grep,find,ls,request_human_edit` enables
-  client-side tools. The first seven come from
+  client-side tools. Omitting `--tools` enables all of them; `--tools none`
+  disables them. The first seven come from
   `@earendil-works/pi-coding-agent`; they run with your privileges in the
   current directory. `request_human_edit` is rath's own human-in-the-loop
   tool: it opens a file in your editor (`$VISUAL`/`$EDITOR`, falling back to
