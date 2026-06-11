@@ -170,9 +170,12 @@ export function openrouterNativeModel(modelId: string): Model<typeof OPENROUTER_
 /** Build a provider Model from a live OpenRouter /models entry. */
 function liveOpenRouterModel(raw: RawOpenRouterModel): Model<typeof OPENROUTER_NATIVE_API> {
   // OpenRouter prices per token (USD, as strings); pi-ai's cost is per million.
+  // Negative values are OpenRouter's sentinel for dynamic-priced auto-routers
+  // (e.g. openrouter/auto, "prompt":"-1"); treat those (and non-numbers) as 0 so
+  // cost accounting never goes negative.
   const perMillion = (price?: string): number => {
     const n = price === undefined ? 0 : Number(price);
-    return Number.isFinite(n) ? n * 1_000_000 : 0;
+    return Number.isFinite(n) && n > 0 ? n * 1_000_000 : 0;
   };
   const input = (raw.architecture?.input_modalities ?? []).filter(
     (m): m is "text" | "image" => m === "text" || m === "image",

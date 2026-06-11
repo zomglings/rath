@@ -93,12 +93,15 @@ export async function ensureCatalogue(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const now = opts.now ?? Date.now();
 
-  // OpenRouter (keyless).
+  // OpenRouter (keyless). A cached value that parses to nothing usable (corrupt
+  // row, empty array) is treated as "not loaded" so it never poisons the
+  // catalogue into rejecting every id — we refetch, then fall back to bundled.
   if (openRouterModels === undefined) {
     const cached = getCacheEntry(CACHE_KEY_OPENROUTER);
-    const fresh = cached && now - cached.fetchedAt < maxAgeMs;
-    if (fresh) {
-      openRouterModels = indexOpenRouter(safeParseArray(cached.value));
+    const cachedModels = cached ? safeParseArray(cached.value) : [];
+    const fresh = cached !== undefined && now - cached.fetchedAt < maxAgeMs;
+    if (fresh && cachedModels.length > 0) {
+      openRouterModels = indexOpenRouter(cachedModels);
     } else {
       try {
         const payload = (await fetchJson(OPENROUTER_MODELS_URL, timeoutMs)) as {
@@ -108,23 +111,24 @@ export async function ensureCatalogue(
         if (models.length > 0) {
           setCacheEntry(CACHE_KEY_OPENROUTER, JSON.stringify(models), now);
           openRouterModels = indexOpenRouter(models);
-        } else if (cached) {
-          openRouterModels = indexOpenRouter(safeParseArray(cached.value));
+        } else if (cachedModels.length > 0) {
+          openRouterModels = indexOpenRouter(cachedModels);
         }
       } catch {
-        if (cached) {
-          openRouterModels = indexOpenRouter(safeParseArray(cached.value));
+        if (cachedModels.length > 0) {
+          openRouterModels = indexOpenRouter(cachedModels);
         }
       }
     }
   }
 
-  // OpenAI (needs the key; ids only).
+  // OpenAI (needs the key; ids only). Same empty-cache-is-not-loaded rule.
   if (openAiModelIds === undefined && opts.openaiKey) {
     const cached = getCacheEntry(CACHE_KEY_OPENAI);
-    const fresh = cached && now - cached.fetchedAt < maxAgeMs;
-    if (fresh) {
-      openAiModelIds = safeParseStringArray(cached.value);
+    const cachedIds = cached ? safeParseStringArray(cached.value) : [];
+    const fresh = cached !== undefined && now - cached.fetchedAt < maxAgeMs;
+    if (fresh && cachedIds.length > 0) {
+      openAiModelIds = cachedIds;
     } else {
       try {
         const payload = (await fetchJson(OPENAI_MODELS_URL, timeoutMs, opts.openaiKey)) as {
@@ -137,12 +141,12 @@ export async function ensureCatalogue(
         if (ids.length > 0) {
           setCacheEntry(CACHE_KEY_OPENAI, JSON.stringify(ids), now);
           openAiModelIds = ids;
-        } else if (cached) {
-          openAiModelIds = safeParseStringArray(cached.value);
+        } else if (cachedIds.length > 0) {
+          openAiModelIds = cachedIds;
         }
       } catch {
-        if (cached) {
-          openAiModelIds = safeParseStringArray(cached.value);
+        if (cachedIds.length > 0) {
+          openAiModelIds = cachedIds;
         }
       }
     }

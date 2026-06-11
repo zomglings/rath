@@ -14,6 +14,7 @@
  */
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -29,7 +30,22 @@ function log(message: string): void {
   process.stdout.write(`${message}\n`);
 }
 
+function sqliteAvailable(): boolean {
+  try {
+    createRequire(import.meta.url)("node:sqlite");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function main(): Promise<void> {
+  // The catalogue's caching/freshness behavior is the point of this test, and
+  // it needs the SQLite store; skip cleanly on a runtime without node:sqlite.
+  if (!sqliteAvailable()) {
+    log("Skipped: node:sqlite unavailable on this runtime.");
+    return;
+  }
   process.env.RATH_CONFIG_DIR = mkdtempSync(join(tmpdir(), "rath-catalogue-it-"));
   registerOpenRouterNative();
 
