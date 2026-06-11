@@ -43,8 +43,11 @@ import {
   contentBlocks,
   isHostedToolCall,
   OPENAI_NATIVE_API,
+  OPENROUTER_NATIVE_API,
   openaiNativeModel,
+  openrouterNativeModel,
   registerOpenAINative,
+  registerOpenRouterNative,
   stripRenderedCitations,
   uniqueUrlCitations,
 } from "../index.js";
@@ -106,6 +109,9 @@ export function resolveModel(spec: string): Model<Api> {
   if (provider === OPENAI_NATIVE_API) {
     return openaiNativeModel(modelId);
   }
+  if (provider === OPENROUTER_NATIVE_API) {
+    return openrouterNativeModel(modelId) as Model<Api>;
+  }
   const model = getModel(provider as KnownProvider, modelId as never) as Model<Api> | undefined;
   if (!model) {
     throw new Error(`Unknown model: ${spec}`);
@@ -113,11 +119,14 @@ export function resolveModel(spec: string): Model<Api> {
   return model;
 }
 
-/** All selectable model specs, openai-native first. */
+/** All selectable model specs, native providers first. */
 export function listModels(filter?: string): string[] {
   const specs: string[] = [];
   for (const model of getModels("openai")) {
     specs.push(`${OPENAI_NATIVE_API}/${model.id}`);
+  }
+  for (const model of getModels("openrouter")) {
+    specs.push(`${OPENROUTER_NATIVE_API}/${model.id}`);
   }
   for (const provider of getProviders()) {
     for (const model of getModels(provider)) {
@@ -161,7 +170,7 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
   return [
     ["model", flags.model],
     ["reasoning", String(agent.state.thinkingLevel)],
-    ["web search", flags.webSearch ? "on (hosted, openai-native only)" : "off"],
+    ["web search", flags.webSearch ? "on (hosted, openai-native / openrouter-native only)" : "off"],
     ["tools", tools.length > 0 ? tools.join(", ") : "none"],
     ["skills", "none (rath run loads no skills or context files)"],
     ["system prompt", "/sys to view or set"],
@@ -219,7 +228,9 @@ export async function handleSlashCommand(
         return { output: "Usage: /websearch [on|off]", isError: true };
       }
       flags.webSearch = arg === "on";
-      return { output: `web search: ${arg} (openai-native only)${deferred}` };
+      return {
+        output: `web search: ${arg} (openai-native / openrouter-native only)${deferred}`,
+      };
     }
     case "/tools": {
       if (arg.length === 0) {
@@ -301,7 +312,7 @@ export async function handleSlashCommand(
       const clampNote =
         arg === "off" || supported.includes(arg as ReasoningLevel)
           ? ""
-          : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
+          : ` (outside ${flags.model}'s supported levels — the native provider clamps it)`;
       return { output: `reasoning: ${arg}${clampNote}${deferred}` };
     }
     default:
@@ -456,7 +467,7 @@ export const runCommand: Command = {
     {
       long: "no-web-search",
       takesValue: false,
-      description: "Disable hosted web search (openai-native)",
+      description: "Disable hosted web search (openai-native / openrouter-native)",
     },
     {
       long: "tools",
@@ -559,6 +570,7 @@ export const runCommand: Command = {
     }
 
     registerOpenAINative();
+    registerOpenRouterNative();
     let agent: Agent;
     try {
       const model = resolveModel(flags.model);
@@ -615,15 +627,20 @@ export const runCommand: Command = {
             if (m.stopReason === "error" || m.stopReason === "aborted") {
               return [];
             }
-            const native = agent.state.model.api === OPENAI_NATIVE_API;
-            // The rendered citation trailer is for display/persistence;
-            // openai-native reconstructs the real annotations itself, so strip
-            // it before replay. Foreign providers get it as plain text.
-            const stripped = native ? stripRenderedCitations(m) : m;
+            const activeApi = agent.state.model.api;
+            const nativeApis = [OPENAI_NATIVE_API, OPENROUTER_NATIVE_API] as const;
+            // The active provider is one whose messages it produced and can
+            // replay: a native provider replaying its own message.
+            const sameNative =
+              (nativeApis as readonly string[]).includes(activeApi) && m.api === activeApi;
+            // The rendered citation trailer is for display/persistence; a
+            // native provider reconstructs the real annotations itself, so
+            // strip it before replay. Foreign providers get it as plain text.
+            const stripped = sameNative ? stripRenderedCitations(m) : m;
             // Thinking signatures are provider-specific; a foreign provider
-            // rejects openai-native's. Drop thinking blocks on cross-provider
-            // replay (the proper flatten-on-handoff is a follow-up).
-            if (!native && m.api === OPENAI_NATIVE_API) {
+            // rejects another's. Drop thinking blocks on cross-provider replay
+            // of a native message (the proper flatten-on-handoff is a follow-up).
+            if (!sameNative && (nativeApis as readonly string[]).includes(m.api ?? "")) {
               return [
                 { ...stripped, content: stripped.content.filter((b) => b.type !== "thinking") },
               ];
