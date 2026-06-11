@@ -20,9 +20,9 @@
  * time and cost nothing.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 import * as readline from "node:readline/promises";
 import {
   Agent,
@@ -597,6 +597,11 @@ export function buildPagedTurnText(message: AssistantMessage): string {
  * Returns true when the pager ran, false when no usable pager was found or it
  * exited abnormally (the caller should then render the content itself).
  *
+ * The pager command comes from $PAGER if set; otherwise the first of `less -R`
+ * and `more` whose executable is actually on PATH (so we degrade to whatever
+ * the platform has rather than hard-failing on systems without less). See
+ * resolvePagerCommand.
+ *
  * The text is written to a temp file and the pager is run as `pager <file>`
  * with inherited stdio so it owns the terminal (drawing to the screen, reading
  * the keyboard). Piping on the pager's stdin instead would make less detect a
@@ -605,10 +610,52 @@ export function buildPagedTurnText(message: AssistantMessage): string {
  * caller must own the terminal first (the plain REPL is between reads; the TUI
  * suspends itself with tui.stop()).
  */
-export function runExternalPager(text: string): boolean {
+/**
+ * Resolve `cmd` against PATH the way a shell would, returning true if an
+ * executable by that name exists. A name containing a path separator is
+ * checked directly. On Windows, PATHEXT extensions (.exe/.cmd/...) are tried
+ * for names without their own extension. This only checks existence; it never
+ * runs the candidate.
+ */
+function isOnPath(cmd: string): boolean {
+  const exts =
+    process.platform === "win32"
+      ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+      : [""];
+  const hasExt = exts.some((e) => e !== "" && cmd.toLowerCase().endsWith(e.toLowerCase()));
+  const names = hasExt ? [cmd] : exts.map((e) => cmd + e);
+  const isFile = (p: string): boolean => {
+    try {
+      return existsSync(p) && statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (cmd.includes("/") || cmd.includes("\\") || isAbsolute(cmd)) {
+    return names.some(isFile);
+  }
+  const dirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  return dirs.some((dir) => names.some((n) => isFile(join(dir, n))));
+}
+
+/**
+ * The pager command (argv array) to use: $PAGER split on spaces if set,
+ * otherwise the first detected default among `less -R` and `more`. Returns []
+ * when nothing usable is found, which makes runExternalPager a no-op so the
+ * caller renders inline.
+ */
+export function resolvePagerCommand(): string[] {
   const pagerEnv = (process.env.PAGER ?? "").trim();
-  // Split on spaces so PAGER="less -R" works (the common shell convention).
-  const parts = pagerEnv.length > 0 ? pagerEnv.split(/\s+/) : ["less", "-R"];
+  if (pagerEnv.length > 0) {
+    // Split on spaces so PAGER="less -R" works (the common shell convention).
+    return pagerEnv.split(/\s+/);
+  }
+  const defaults = [["less", "-R"], ["more"]];
+  return defaults.find((argv) => argv[0] !== undefined && isOnPath(argv[0])) ?? [];
+}
+
+export function runExternalPager(text: string): boolean {
+  const parts = resolvePagerCommand();
   const [cmd, ...rest] = parts;
   if (!cmd) {
     return false;
