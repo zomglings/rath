@@ -145,11 +145,19 @@ export function registerOpenAINative(): void {
     stream: streamOpenAINative,
     streamSimple: (model, context, options) => {
       // Clamp to the model's supported levels so an unsupported request (e.g.
-      // "xhigh" on a model without it) does not 400 every turn.
-      const clamped = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+      // "xhigh" on a model without it) does not 400 every turn. "off" is
+      // excluded from clamping: clamping it would map to the model's lowest
+      // supported level (e.g. "minimal"), silently forcing reasoning on
+      // against an explicit request to disable it. (SimpleStreamOptions types
+      // reasoning without "off", but a JS caller can still pass it.)
+      const requested = options?.reasoning as string | undefined;
+      const reasoningEffort =
+        options?.reasoning && requested !== "off"
+          ? clampThinkingLevel(model, options.reasoning)
+          : undefined;
       return streamOpenAINative(model, context, {
         ...options,
-        reasoningEffort: clamped === "off" ? undefined : clamped,
+        reasoningEffort: reasoningEffort as OpenAINativeOptions["reasoningEffort"],
       });
     },
   });

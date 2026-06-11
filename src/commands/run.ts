@@ -52,8 +52,11 @@ import {
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
+// dim() wraps status text, which the plain frontend writes to stderr; gate the
+// escape codes on stderr's TTY status so piping stdout keeps the dimming and
+// redirecting stderr to a file does not capture raw escapes.
 function dim(text: string): string {
-  return process.stdout.isTTY ? `${DIM}${text}${RESET}` : text;
+  return process.stderr.isTTY ? `${DIM}${text}${RESET}` : text;
 }
 
 export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -206,7 +209,10 @@ export function handleSlashCommand(
       try {
         agent.state.model = resolveModel(arg);
         flags.model = arg;
-        return { output: `model: ${arg}` };
+        // The running turn already snapshotted its model; a mid-stream switch
+        // only affects the next turn.
+        const deferred = agent.state.isStreaming ? " (applies after the current turn)" : "";
+        return { output: `model: ${arg}${deferred}` };
       } catch (error) {
         return { output: error instanceof Error ? error.message : String(error), isError: true };
       }
@@ -231,10 +237,11 @@ export function handleSlashCommand(
       }
       agent.state.thinkingLevel = arg as ReasoningLevel;
       flags.reasoning = arg as ReasoningLevel;
-      const note = supported.includes(arg as ReasoningLevel)
+      const clampNote = supported.includes(arg as ReasoningLevel)
         ? ""
-        : ` (outside ${flags.model}'s supported levels — the provider will clamp it)`;
-      return { output: `reasoning: ${arg}${note}` };
+        : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
+      const deferNote = agent.state.isStreaming ? " (applies after the current turn)" : "";
+      return { output: `reasoning: ${arg}${clampNote}${deferNote}` };
     }
     default:
       return {
@@ -306,8 +313,15 @@ function attachRenderer(agent: Agent): Renderer {
       if (message.role === "assistant") {
         ensureNewline();
         if (message.stopReason === "error" || message.stopReason === "aborted") {
-          write(process.stderr, `error: ${message.errorMessage ?? "unknown"}\n`);
-          errored = true;
+          write(
+            process.stderr,
+            `${message.stopReason}: ${message.errorMessage ?? "interrupted"}\n`,
+          );
+          // A user-initiated interrupt is not a failure; only a genuine error
+          // makes the session exit non-zero.
+          if (message.stopReason === "error") {
+            errored = true;
+          }
           return;
         }
         const trailer = applyCitationTrailer(message);
@@ -575,17 +589,27 @@ export const runCommand: Command = {
 
     const renderer = attachRenderer(agent);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | /info /sys /model /lsmodels /reasoning /exit | Ctrl+C / Ctrl+D to quit`)}\n`,
+      `${dim(`model: ${flags.model} | /info /sys /model /lsmodels /reasoning /exit | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     // Iterating the interface (rather than looping rl.question) queues input
-    // arriving while a turn runs instead of dropping it, and lets Ctrl+C
-    // interrupt: it aborts the active turn, or exits when idle.
+    // arriving while a turn runs instead of dropping it. Ctrl+C aborts the
+    // active response; a second Ctrl+C before it settles (or one while idle)
+    // quits. Note: abort stops the in-flight model request, but an
+    // already-running tool finishes, and one queued follow-up turn may still
+    // start — the agent loop only observes the abort at request boundaries.
+    let abortRequested = false;
     rl.on("SIGINT", () => {
-      if (agent.state.isStreaming) {
+      if (agent.state.isStreaming && !abortRequested) {
+        abortRequested = true;
         agent.abort();
       } else {
         rl.close();
+      }
+    });
+    agent.subscribe((event) => {
+      if (event.type === "agent_start") {
+        abortRequested = false;
       }
     });
     process.stderr.write("rath> ");
@@ -841,7 +865,12 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       if (agent.hasQueuedMessages()) {
         setImmediate(() => {
           if (!agent.state.isStreaming && agent.hasQueuedMessages()) {
-            agent.continue().catch(() => {});
+            agent.continue().catch((error) => {
+              transcript.addChild(
+                new Text(redLine(`error: ${error instanceof Error ? error.message : error}`)),
+              );
+              tui.requestRender();
+            });
           }
         });
       }
@@ -938,9 +967,10 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       return;
     }
     const message = { role: "user" as const, content: trimmed, timestamp: Date.now() };
-    if (agent.state.isStreaming) {
-      // Injected after the current turn finishes; the loop emits its
-      // message_start when it lands.
+    // Steer while a turn is streaming, or when a message is already queued for
+    // the post-run drain — prompting directly in the latter case would jump
+    // ahead of the queued one and break submission order.
+    if (agent.state.isStreaming || agent.hasQueuedMessages()) {
       agent.steer(message);
       transcript.addChild(new Text(dimLine(`(queued) › ${trimmed}`)));
       tui.requestRender();
@@ -957,6 +987,9 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   tui.addInputListener((data) => {
     if (matchesKey(data, "ctrl+c")) {
       if (agent.state.isStreaming) {
+        // Abort the active response and discard any queued steers, so an
+        // interrupt does not surface a forgotten follow-up afterward.
+        agent.clearAllQueues();
         agent.abort();
       } else {
         tui.stop();
