@@ -142,7 +142,7 @@ export interface OpenRouterNativeOptions extends StreamOptions {
 /**
  * Clone a stock OpenRouter model entry, re-pointing it at the
  * openrouter-native provider. Pass any model id from pi-ai's `openrouter`
- * registry (e.g. "openai/gpt-4o", "anthropic/claude-3.5-sonnet").
+ * registry (e.g. "openai/gpt-4o", "anthropic/claude-haiku-4.5").
  */
 export function openrouterNativeModel(modelId: string): Model<typeof OPENROUTER_NATIVE_API> {
   const base = getModel("openrouter" as KnownProvider, modelId as never) as Model<string>;
@@ -322,7 +322,9 @@ export function buildParams(
     stream_options: { include_usage: true },
   };
   if (options?.maxTokens) {
-    params.max_tokens = options.maxTokens;
+    // Modern field (stock openai-completions uses it for OpenRouter); the
+    // deprecated max_tokens is incompatible with OpenAI o-series upstreams.
+    params.max_completion_tokens = options.maxTokens;
   }
   if (options?.temperature !== undefined) {
     params.temperature = options.temperature;
@@ -656,6 +658,10 @@ async function processNativeStream(
           }
           blocks.push(block);
           stream.push({ type: "toolcall_start", contentIndex: indexOf(block), partial: output });
+        } else if (streamIndex !== undefined && !toolCallsByIndex.has(streamIndex)) {
+          // A block first seen id-only, now carrying an index: register the
+          // index so later index-only deltas resolve to it (stock parity).
+          toolCallsByIndex.set(streamIndex, block);
         }
         if (!block.id && toolCall.id) {
           block.id = toolCall.id;
