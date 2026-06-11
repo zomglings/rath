@@ -1,7 +1,6 @@
 /**
  * "openrouter-native": a pi-ai API provider for OpenRouter's Chat Completions
- * endpoint with OpenRouter's server-side ("hosted") tools — `web_search`
- * (and, opt-in, `web_fetch`).
+ * endpoint with OpenRouter's server-side ("hosted") web search.
  *
  * pi-ai routes every OpenRouter model through the stock "openai-completions"
  * api (verified: all openrouter models carry `api: "openai-completions"`).
@@ -11,8 +10,7 @@
  * OpenAI-compatible base URL, that:
  *
  *  - sends `{ type: "openrouter:web_search" }` (web search on by default; an
- *    option disables it) and optionally `{ type: "openrouter:web_fetch" }`
- *    alongside any client function tools;
+ *    option disables it) alongside any client function tools;
  *  - captures `url_citation` annotations as structured `citations` on text
  *    blocks (extra fields survive structural typing and JSON serialization);
  *  - captures the per-turn server-tool artifact as a `hostedToolCall` block
@@ -85,10 +83,11 @@ export const OPENROUTER_NATIVE_API = "openrouter-native";
 /**
  * OpenRouter server (hosted) tools this provider supports, by the suffix of
  * their `openrouter:<name>` tool type. The full catalogue lives in
- * OpenRouter's server-tools docs; support here is web search (+ fetch), the
- * tools that produce `url_citation` annotations.
+ * OpenRouter's server-tools docs; support here is web search, the tool whose
+ * `url_citation` annotation shape is verified. web_fetch is deferred: its
+ * output shape is undocumented here and would be mislabeled as web_search.
  */
-export type HostedToolName = "web_search" | "web_fetch";
+export type HostedToolName = "web_search";
 
 /**
  * One `url_citation` annotation exactly as OpenRouter returns it on the Chat
@@ -134,11 +133,6 @@ export interface OpenRouterNativeOptions extends StreamOptions {
    * supplies `parameters` (engine, max_results, allowed_domains, ...).
    */
   webSearch?: boolean | Record<string, unknown>;
-  /**
-   * Hosted web fetch tool. Off by default; `true` sends
-   * `{ type: "openrouter:web_fetch" }`; an object supplies `parameters`.
-   */
-  webFetch?: boolean | Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,17 +283,15 @@ export function annotationToCitation(annotation: { type?: string }): UrlCitation
   if (!inner || typeof inner.url !== "string") {
     return undefined;
   }
+  const startIndex = typeof inner.start_index === "number" ? inner.start_index : 0;
+  const endIndexRaw = typeof inner.end_index === "number" ? inner.end_index : startIndex;
   return {
     type: "url_citation",
     url: inner.url,
     title: typeof inner.title === "string" ? inner.title : "",
-    startIndex: typeof inner.start_index === "number" ? inner.start_index : 0,
-    endIndex:
-      typeof inner.end_index === "number"
-        ? inner.end_index
-        : typeof inner.start_index === "number"
-          ? inner.start_index
-          : 0,
+    startIndex,
+    // Guard against an inverted/garbage span so the cited range stays valid.
+    endIndex: Math.max(endIndexRaw, startIndex),
   };
 }
 
@@ -341,13 +333,6 @@ export function buildParams(
     const tool: OpenRouterServerTool = { type: "openrouter:web_search" };
     if (typeof options?.webSearch === "object") {
       tool.parameters = options.webSearch;
-    }
-    tools.push(tool);
-  }
-  if (options?.webFetch) {
-    const tool: OpenRouterServerTool = { type: "openrouter:web_fetch" };
-    if (typeof options.webFetch === "object") {
-      tool.parameters = options.webFetch;
     }
     tools.push(tool);
   }
@@ -414,10 +399,15 @@ export function convertNativeMessages(
     } else if (msg.role === "assistant") {
       const toolCalls: NonNullable<ChatCompletionAssistantMessageParam["tool_calls"]> = [];
       const reasoningDetails: unknown[] = [];
-      // A tool call's thoughtSignature is provider-specific (Google and the
-      // OpenRouter completions path use unrelated encodings). Only forward it
-      // as OpenRouter reasoning_details when this provider produced it.
-      const native = msg.api === OPENROUTER_NATIVE_API && msg.provider === model.provider;
+      // A tool call's thoughtSignature is encrypted, model-specific state.
+      // Every OpenRouter model shares provider "openrouter", so a provider-only
+      // check would forward one model's encrypted reasoning into a different
+      // model's request (e.g. an Anthropic blob into a GPT call) and 400 the
+      // turn. Gate on the exact producing model, like openai-native does.
+      const sameModel =
+        msg.api === OPENROUTER_NATIVE_API &&
+        msg.provider === model.provider &&
+        msg.model === model.id;
       let text = "";
       for (const block of msg.content as HostedContentBlock[]) {
         if (block.type === "text") {
@@ -434,7 +424,7 @@ export function convertNativeMessages(
             type: "function",
             function: { name: block.name, arguments: JSON.stringify(block.arguments) },
           });
-          if (native && block.thoughtSignature) {
+          if (sameModel && block.thoughtSignature) {
             try {
               reasoningDetails.push(JSON.parse(block.thoughtSignature));
             } catch {
@@ -528,10 +518,13 @@ async function processNativeStream(
     return textBlock;
   };
 
-  // Capture url_citation annotations, deduped by (url, start, end). OpenRouter
-  // may deliver them incrementally on delta.annotations and/or repeat the full
-  // set; some OpenAI-compatible upstreams instead attach the complete message
-  // (with annotations) on the final chunk, so both sources are ingested.
+  // Capture url_citation annotations, deduped by full identity. OpenRouter may
+  // deliver them incrementally on delta.annotations and/or repeat the full set;
+  // some OpenAI-compatible upstreams instead attach the complete message (with
+  // annotations) on the final chunk, so both sources are ingested. The key
+  // includes title and excerpt content, not only the span, so two distinct
+  // excerpts from the same URL with no spans are not collapsed into one (which
+  // would also lose them from the lossless raw item).
   const ingestAnnotations = (incoming: unknown): void => {
     if (!Array.isArray(incoming)) {
       return;
@@ -541,7 +534,13 @@ async function processNativeStream(
         continue;
       }
       const inner = annotation.url_citation;
-      const key = `${inner.url} ${inner.start_index ?? ""} ${inner.end_index ?? ""}`;
+      const key = JSON.stringify([
+        inner.url,
+        inner.title ?? "",
+        inner.content ?? "",
+        inner.start_index ?? "",
+        inner.end_index ?? "",
+      ]);
       if (seenAnnotations.has(key)) {
         continue;
       }
