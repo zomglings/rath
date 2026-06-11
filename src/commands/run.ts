@@ -44,8 +44,11 @@ import {
   flattenHostedContent,
   isHostedToolCall,
   OPENAI_NATIVE_API,
+  OPENROUTER_NATIVE_API,
   openaiNativeModel,
+  openrouterNativeModel,
   registerOpenAINative,
+  registerOpenRouterNative,
   stripRenderedCitations,
   uniqueUrlCitations,
 } from "../index.js";
@@ -107,6 +110,9 @@ export function resolveModel(spec: string): Model<Api> {
   if (provider === OPENAI_NATIVE_API) {
     return openaiNativeModel(modelId);
   }
+  if (provider === OPENROUTER_NATIVE_API) {
+    return openrouterNativeModel(modelId) as Model<Api>;
+  }
   const model = getModel(provider as KnownProvider, modelId as never) as Model<Api> | undefined;
   if (!model) {
     throw new Error(`Unknown model: ${spec}`);
@@ -114,11 +120,14 @@ export function resolveModel(spec: string): Model<Api> {
   return model;
 }
 
-/** All selectable model specs, openai-native first. */
+/** All selectable model specs, native providers first. */
 export function listModels(filter?: string): string[] {
   const specs: string[] = [];
   for (const model of getModels("openai")) {
     specs.push(`${OPENAI_NATIVE_API}/${model.id}`);
+  }
+  for (const model of getModels("openrouter")) {
+    specs.push(`${OPENROUTER_NATIVE_API}/${model.id}`);
   }
   for (const provider of getProviders()) {
     for (const model of getModels(provider)) {
@@ -162,7 +171,7 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
   return [
     ["model", flags.model],
     ["reasoning", String(agent.state.thinkingLevel)],
-    ["web search", flags.webSearch ? "on (hosted, openai-native only)" : "off"],
+    ["web search", flags.webSearch ? "on (hosted, openai-native / openrouter-native only)" : "off"],
     ["tools", tools.length > 0 ? tools.join(", ") : "none"],
     ["skills", "none (rath run loads no skills or context files)"],
     ["system prompt", "/sys to view or set"],
@@ -220,7 +229,9 @@ export async function handleSlashCommand(
         return { output: "Usage: /websearch [on|off]", isError: true };
       }
       flags.webSearch = arg === "on";
-      return { output: `web search: ${arg} (openai-native only)${deferred}` };
+      return {
+        output: `web search: ${arg} (openai-native / openrouter-native only)${deferred}`,
+      };
     }
     case "/tools": {
       if (arg.length === 0) {
@@ -302,7 +313,7 @@ export async function handleSlashCommand(
       const clampNote =
         arg === "off" || supported.includes(arg as ReasoningLevel)
           ? ""
-          : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
+          : ` (outside ${flags.model}'s supported levels — the native provider clamps it)`;
       return { output: `reasoning: ${arg}${clampNote}${deferred}` };
     }
     default:
@@ -457,7 +468,7 @@ export const runCommand: Command = {
     {
       long: "no-web-search",
       takesValue: false,
-      description: "Disable hosted web search (openai-native)",
+      description: "Disable hosted web search (openai-native / openrouter-native)",
     },
     {
       long: "tools",
@@ -560,6 +571,7 @@ export const runCommand: Command = {
     }
 
     registerOpenAINative();
+    registerOpenRouterNative();
     let agent: Agent;
     try {
       const model = resolveModel(flags.model);
@@ -620,9 +632,11 @@ export const runCommand: Command = {
             // provider converters key replayability on api+provider+model
             // (encrypted reasoning and hosted raw items are model-specific),
             // so two models sharing an api (e.g. openai-native/gpt-5-mini and
-            // openai-native/gpt-5) are NOT interchangeable. Match that triple
-            // here, or a cross-model switch would skip flatten and the
-            // converter would then silently drop the hosted history anyway.
+            // openai-native/gpt-5, or two openrouter-native models) are NOT
+            // interchangeable. Match that triple here, or a cross-model switch
+            // would skip flatten and the converter would then silently drop the
+            // hosted history anyway. flattenHostedContent is provider-agnostic,
+            // so it handles openrouter-native's hosted blocks the same way.
             const sameModel =
               m.api === agent.state.model.api &&
               m.provider === agent.state.model.provider &&

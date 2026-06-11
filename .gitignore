@@ -144,3 +144,6 @@ vite.config.ts.timestamp-*
 
 # Throwaway verification scripts / scratch artifacts
 tmp/
+
+# Claude Code worktrees and session state
+.claude/
