@@ -1499,8 +1499,14 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           new UserMessageComponent(messageText(event.message.content), markdownTheme),
         );
       } else if (event.message.role === "assistant") {
-        current = new AssistantMessageComponent(undefined, false, markdownTheme);
-        transcript.addChild(current);
+        // In slow mode the reply is not streamed into the transcript; it is
+        // paged at message_end. Streaming it live AND opening a pager over the
+        // same content would show it twice — the loader is the only progress
+        // indicator while it generates.
+        if (flags.mode !== "slow") {
+          current = new AssistantMessageComponent(undefined, false, markdownTheme);
+          transcript.addChild(current);
+        }
       }
     } else if (event.type === "message_update") {
       if (event.message.role === "assistant") {
