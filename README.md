@@ -129,8 +129,9 @@ list to choose), since rath development inside `rath run` wants them on hand.
   need; OpenAI's `/v1/models` is unfiltered and metadata-less, so it is not a
   usable live source.)
 - Every startup setting is also settable in-session (both frontends), so a
-  session never has to be restarted to change configuration: `/info` shows
-  the configuration, `/sys [text]` shows or sets the system prompt,
+  session never has to be restarted to change configuration: `/config` shows
+  the configuration (`/config default-model [spec|none]` pins or clears the
+  persisted default model), `/sys [text]` shows or sets the system prompt,
   `/model [spec]` shows or switches the model, `/lsmodels [filter]` lists
   models, `/reasoning [level]` shows or sets the reasoning level
   (openai-native clamps it to the model's supported levels),
