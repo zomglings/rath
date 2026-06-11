@@ -414,6 +414,10 @@ export function convertNativeMessages(
     } else if (msg.role === "assistant") {
       const toolCalls: NonNullable<ChatCompletionAssistantMessageParam["tool_calls"]> = [];
       const reasoningDetails: unknown[] = [];
+      // A tool call's thoughtSignature is provider-specific (Google and the
+      // OpenRouter completions path use unrelated encodings). Only forward it
+      // as OpenRouter reasoning_details when this provider produced it.
+      const native = msg.api === OPENROUTER_NATIVE_API && msg.provider === model.provider;
       let text = "";
       for (const block of msg.content as HostedContentBlock[]) {
         if (block.type === "text") {
@@ -430,7 +434,7 @@ export function convertNativeMessages(
             type: "function",
             function: { name: block.name, arguments: JSON.stringify(block.arguments) },
           });
-          if (block.thoughtSignature) {
+          if (native && block.thoughtSignature) {
             try {
               reasoningDetails.push(JSON.parse(block.thoughtSignature));
             } catch {
@@ -524,6 +528,34 @@ async function processNativeStream(
     return textBlock;
   };
 
+  // Capture url_citation annotations, deduped by (url, start, end). OpenRouter
+  // may deliver them incrementally on delta.annotations and/or repeat the full
+  // set; some OpenAI-compatible upstreams instead attach the complete message
+  // (with annotations) on the final chunk, so both sources are ingested.
+  const ingestAnnotations = (incoming: unknown): void => {
+    if (!Array.isArray(incoming)) {
+      return;
+    }
+    for (const annotation of incoming as OpenRouterUrlCitationAnnotation[]) {
+      if (annotation?.type !== "url_citation" || !annotation.url_citation?.url) {
+        continue;
+      }
+      const inner = annotation.url_citation;
+      const key = `${inner.url} ${inner.start_index ?? ""} ${inner.end_index ?? ""}`;
+      if (seenAnnotations.has(key)) {
+        continue;
+      }
+      seenAnnotations.add(key);
+      annotations.push(annotation);
+      const citation = annotationToCitation(annotation);
+      if (citation) {
+        const block = ensureTextBlock();
+        block.citations = block.citations ?? [];
+        block.citations.push(citation);
+      }
+    }
+  };
+
   for await (const chunk of openrouterStream) {
     if (!chunk || typeof chunk !== "object") {
       continue;
@@ -592,26 +624,10 @@ async function processNativeStream(
       });
     }
 
-    if (Array.isArray(delta.annotations)) {
-      for (const annotation of delta.annotations) {
-        if (annotation?.type !== "url_citation" || !annotation.url_citation?.url) {
-          continue;
-        }
-        const inner = annotation.url_citation;
-        const key = `${inner.url} ${inner.start_index ?? ""} ${inner.end_index ?? ""}`;
-        if (seenAnnotations.has(key)) {
-          continue;
-        }
-        seenAnnotations.add(key);
-        annotations.push(annotation);
-        const citation = annotationToCitation(annotation);
-        if (citation) {
-          const block = ensureTextBlock();
-          block.citations = block.citations ?? [];
-          block.citations.push(citation);
-        }
-      }
-    }
+    ingestAnnotations(delta.annotations);
+    // Final-chunk fallback: a non-standard `message` carrying the full
+    // annotation set (some OpenAI-compatible upstreams attach it there).
+    ingestAnnotations((choice as { message?: { annotations?: unknown } }).message?.annotations);
 
     if (Array.isArray(delta.tool_calls)) {
       for (const toolCall of delta.tool_calls) {
