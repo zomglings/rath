@@ -19,9 +19,15 @@
  * load when --tui is used; the type-only imports below are erased at compile
  * time and cost nothing.
  */
+import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import * as readline from "node:readline/promises";
-import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
+import {
+  Agent,
+  type AgentTool,
+  type BeforeToolCallContext,
+  type BeforeToolCallResult,
+} from "@earendil-works/pi-agent-core";
 import {
   type Api,
   type AssistantMessage,
@@ -65,6 +71,16 @@ export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 export const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
+// Interaction modes for `rath run`:
+// - "go": full speed, no inspection. Stream everything, never block, tools run
+//   immediately. This is the default and must stay byte-for-byte the current
+//   behavior — no paging, the gating hook is a pass-through.
+// - "slow": take time. Long output is paged (a pager in the plain REPL, a
+//   scrollable overlay in the TUI), and every tool call is gated behind a
+//   per-call confirmation before it runs.
+export const MODES = ["go", "slow"] as const;
+export type Mode = (typeof MODES)[number];
+
 export interface RunFlags {
   model: string;
   prompt?: string;
@@ -73,8 +89,26 @@ export interface RunFlags {
   webSearch: boolean;
   tools: ToolName[];
   tui: boolean;
+  mode: Mode;
   loadPath?: string;
   savePath?: string;
+}
+
+// Paging threshold: output longer than this many lines is paged in slow mode.
+// Slash-command output and tool results are usually well-bounded, so a fixed
+// line count is simpler and more predictable than chasing terminal height.
+export const LONG_OUTPUT_LINES = 24;
+
+/** True when `text` is long enough to page in slow mode. */
+export function isLongOutput(text: string): boolean {
+  // Count lines: a trailing newline does not add an empty line to read.
+  let lines = 1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n" && i !== text.length - 1) {
+      lines++;
+    }
+  }
+  return lines > LONG_OUTPUT_LINES;
 }
 
 /**
@@ -160,6 +194,7 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
   const tools = agent.state.tools.map((t) => t.name);
   return [
     ["model", flags.model],
+    ["mode", flags.mode === "slow" ? "slow (paging + tool confirmation)" : "go (full speed)"],
     ["reasoning", String(agent.state.thinkingLevel)],
     ["web search", flags.webSearch ? "on (hosted, openai-native only)" : "off"],
     ["tools", tools.length > 0 ? tools.join(", ") : "none"],
@@ -304,12 +339,28 @@ export async function handleSlashCommand(
           : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
       return { output: `reasoning: ${arg}${clampNote}${deferred}` };
     }
+    case "/mode": {
+      if (arg.length === 0) {
+        return { output: `mode: ${flags.mode}` };
+      }
+      if (arg !== "go" && arg !== "slow") {
+        return { output: "Usage: /mode [go|slow]", isError: true };
+      }
+      flags.mode = arg;
+      return { output: `mode: ${arg}` };
+    }
+    case "/go":
+      flags.mode = "go";
+      return { output: "mode: go (full speed)" };
+    case "/slow":
+      flags.mode = "slow";
+      return { output: "mode: slow (paging + tool confirmation)" };
     default:
       return {
         output:
           `Unknown command: ${command} (commands: /info, /sys [text], /model [spec], ` +
           "/lsmodels [filter], /reasoning [level], /websearch [on|off], /tools [names|none], " +
-          "/save [path], /exit)",
+          "/mode [go|slow], /go, /slow, /save [path], /exit)",
         isError: true,
       };
   }
@@ -398,6 +449,101 @@ function attachRenderer(agent: Agent): Renderer {
   return { hadError: () => errored };
 }
 
+/** Short, single-line preview of tool arguments for a confirmation prompt. */
+export function toolArgsPreview(args: unknown, max = 120): string {
+  let text: string;
+  try {
+    text = JSON.stringify(args) ?? String(args);
+  } catch {
+    text = String(args);
+  }
+  // Collapse whitespace so the preview stays on one line.
+  text = text.replace(/\s+/g, " ");
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Build a beforeToolCall hook for the Agent. In go mode (and whenever the
+ * frontend cannot confirm) the hook is a pass-through, so go mode keeps the
+ * current "tools run immediately" behavior exactly. In slow mode it asks
+ * `confirm` before every tool call and blocks the call when the user declines.
+ *
+ * The hook reads flags.mode on every call, so /slow mid-session starts gating
+ * and /go stops it — no agent rebuild needed.
+ *
+ * This is also the security mitigation for prompt injection: with hosted web
+ * search on, a malicious page can try to steer the model into running tools.
+ * Slow mode forces a human to approve each tool call before it executes.
+ */
+export function makeBeforeToolCall(
+  flags: RunFlags,
+  confirm: (toolName: string, argsPreview: string, signal?: AbortSignal) => Promise<boolean>,
+): (ctx: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined> {
+  return async (
+    ctx: BeforeToolCallContext,
+    signal?: AbortSignal,
+  ): Promise<BeforeToolCallResult | undefined> => {
+    if (flags.mode !== "slow") {
+      return undefined; // go mode: pass-through, no gating.
+    }
+    const toolName = ctx.toolCall.name;
+    // An interrupt fired while the confirmation is pending counts as a deny so
+    // the tool does not run after the user aborted the turn.
+    if (signal?.aborted) {
+      return { block: true, reason: `Tool call to ${toolName} denied (interrupted).` };
+    }
+    const approved = await confirm(toolName, toolArgsPreview(ctx.args), signal);
+    if (approved) {
+      return undefined;
+    }
+    return { block: true, reason: `Tool call to ${toolName} denied by user (slow mode).` };
+  };
+}
+
+/**
+ * Page `text` in the plain REPL when in slow mode and the output is long.
+ * Returns true when it was handed to a pager (so the caller skips its own
+ * printing); false when nothing was paged and the caller should print normally.
+ *
+ * Falls back to no-paging (returns false) when not in slow mode, the output is
+ * short, stdout/stdin are not a TTY, or no usable pager is found. The pager
+ * inherits the terminal directly (stdio "inherit"); spawnSync blocks until the
+ * pager exits, so this is only safe to call when the readline interface is not
+ * actively reading (between turns / before re-prompting), which is where we use
+ * it. The text is passed on the pager's stdin to avoid temp-file cleanup.
+ */
+export function pagePlain(text: string, flags: RunFlags): boolean {
+  if (flags.mode !== "slow" || !isLongOutput(text)) {
+    return false;
+  }
+  if (!process.stdout.isTTY || !process.stdin.isTTY) {
+    return false;
+  }
+  const pagerEnv = (process.env.PAGER ?? "").trim();
+  // Default to `less -R` so ANSI colors in the text render. Split on spaces so
+  // PAGER="less -R" works; this is the common shell convention.
+  const parts = pagerEnv.length > 0 ? pagerEnv.split(/\s+/) : ["less", "-R"];
+  const [cmd, ...rest] = parts;
+  if (!cmd) {
+    return false;
+  }
+  process.stderr.write(dim(`[paging ${isLongOutput(text) ? "long " : ""}output through ${cmd}]\n`));
+  try {
+    const result = spawnSync(cmd, rest, {
+      // stdin is the text (a pipe); stdout/stderr inherit the terminal so the
+      // pager draws normally and owns the keyboard while it runs.
+      input: text.endsWith("\n") ? text : `${text}\n`,
+      stdio: ["pipe", "inherit", "inherit"],
+    });
+    if (result.error) {
+      return false; // pager missing/unspawnable: caller prints plainly.
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const runCommand: Command = {
   name: "run",
   summary: "Run a generic agent loop",
@@ -416,6 +562,8 @@ export const runCommand: Command = {
     "  /reasoning [level]     show or set the reasoning level\n" +
     "  /websearch [on|off]    show or toggle hosted web search\n" +
     "  /tools [names|none]    show or set client-side tools\n" +
+    "  /mode [go|slow]        show or switch the interaction mode\n" +
+    "  /go, /slow             switch mode (go: full speed; slow: page + confirm)\n" +
     "  /save [path]           write the context now and save there on exit\n" +
     "  /exit                  quit\n" +
     "With --prompt, runs one prompt and exits (0 on success).",
@@ -454,6 +602,13 @@ export const runCommand: Command = {
       description: "Reasoning effort: off, minimal, low, medium, high, xhigh (default: low)",
     },
     {
+      long: "mode",
+      takesValue: true,
+      description:
+        "Interaction mode: go (full speed, default) or slow (page long output " +
+        "and confirm each tool call before it runs)",
+    },
+    {
       long: "no-web-search",
       takesValue: false,
       description: "Disable hosted web search (openai-native)",
@@ -485,6 +640,7 @@ export const runCommand: Command = {
       webSearch: true,
       tools: [],
       tui: false,
+      mode: "go",
     };
     let systemPromptFile: string | undefined;
     let systemPromptExplicit = false;
@@ -525,6 +681,13 @@ export const runCommand: Command = {
             return 1;
           }
           flags.reasoning = level;
+        } else if (token === "--mode") {
+          const mode = value() as Mode;
+          if (!MODES.includes(mode)) {
+            process.stderr.write(`Invalid --mode: ${mode} (use ${MODES.join(", ")})\n`);
+            return 1;
+          }
+          flags.mode = mode;
         } else if (token === "--no-web-search") {
           flags.webSearch = false;
         } else if (token === "--tools") {
@@ -646,6 +809,15 @@ export const runCommand: Command = {
 
     if (flags.prompt !== undefined) {
       const renderer = attachRenderer(agent);
+      // One-shot is non-interactive: there is no human to confirm tool calls,
+      // so slow mode denies them rather than running them unattended. go mode
+      // (the default) keeps the pass-through, so -p behavior is unchanged.
+      agent.beforeToolCall = makeBeforeToolCall(flags, async (toolName, argsPreview) => {
+        process.stderr.write(
+          `${dim(`run ${toolName} ${argsPreview}? [y/N] (non-interactive — denied)`)}\n`,
+        );
+        return false;
+      });
       await agent.prompt(flags.prompt);
       save();
       return renderer.hadError() ? 1 : 0;
@@ -659,9 +831,31 @@ export const runCommand: Command = {
 
     const renderer = attachRenderer(agent);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
+      `${dim(`model: ${flags.model} | mode: ${flags.mode} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    // Slow-mode tool confirmation. The hook fires while agent.prompt() is being
+    // awaited inside the loop below, so the `for await (line of rl)` iterator is
+    // suspended and not competing for stdin; rl.question reads the next line
+    // from the same interface, avoiding a second stdin reader (which would
+    // corrupt line buffering). Non-TTY stdin (piped/-p) cannot answer a
+    // prompt, so default to deny there — slow mode without a human present must
+    // not auto-run tools.
+    agent.beforeToolCall = makeBeforeToolCall(flags, async (toolName, argsPreview, signal) => {
+      const question = `run ${toolName} ${argsPreview}? [y/N] `;
+      if (!process.stdin.isTTY) {
+        process.stderr.write(`${dim(`${question}(no TTY — denied)`)}\n`);
+        return false;
+      }
+      try {
+        // Ctrl+C during the prompt aborts the turn; the signal cancels the
+        // question so we do not block on a line that will never come.
+        const answer = (await rl.question(dim(question), { signal })).trim().toLowerCase();
+        return answer === "y" || answer === "yes";
+      } catch {
+        return false; // aborted question -> deny.
+      }
+    });
     // Iterating the interface (rather than looping rl.question) queues input
     // arriving while a turn runs instead of dropping it. Ctrl+C aborts the
     // active response; a second Ctrl+C before it settles (or one while idle)
@@ -694,7 +888,12 @@ export const runCommand: Command = {
         if (result) {
           if (result.output !== undefined) {
             const text = result.output.length > 0 ? result.output : "(empty)";
-            process.stderr.write(`${result.isError ? text : dim(text)}\n`);
+            // Slow mode pages long, non-error output (e.g. /sys, /lsmodels)
+            // through $PAGER; pagePlain returns false (no-op) in go mode, for
+            // short output, or with no usable pager, so we print as before.
+            if (result.isError || !pagePlain(text, flags)) {
+              process.stderr.write(`${result.isError ? text : dim(text)}\n`);
+            }
           }
           if (result.exit) {
             break;
@@ -770,7 +969,9 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     ProcessTerminal,
     SelectList,
     Text,
+    truncateToWidth,
     TUI,
+    wrapTextWithAnsi,
   } = piTui;
   const {
     AssistantMessageComponent,
@@ -820,7 +1021,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   const refreshBanner = () => {
     banner.setText(
       `${cyanLine("rath")} ${dimLine(
-        `| ${flags.model} | reasoning: ${agent.state.thinkingLevel} | ` +
+        `| ${flags.model} | mode: ${flags.mode} | reasoning: ${agent.state.thinkingLevel} | ` +
           "/info for commands | Ctrl+C interrupts",
       )}`,
     );
@@ -860,10 +1061,152 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     };
   };
 
+  // Scrollable pager overlay for slow mode. A focused Component that wraps the
+  // text to the overlay width and shows one viewport at a time; arrows / j,k /
+  // PageUp,PageDown / space / g,G scroll, q or Escape dismiss. Used so long
+  // output (long /sys, /lsmodels, large tool results) can be read without
+  // scrolling the whole transcript past it.
+  class Pager implements PiTui.Component {
+    private top = 0;
+    private wrapped: string[] = [];
+    private wrapWidth = -1;
+    private viewport = 10;
+    constructor(
+      private readonly text: string,
+      private readonly onClose: () => void,
+    ) {}
+    private rewrap(width: number): void {
+      if (width === this.wrapWidth) {
+        return;
+      }
+      this.wrapWidth = width;
+      this.wrapped = this.text.split("\n").flatMap((line) => {
+        const out = wrapTextWithAnsi(line, width);
+        return out.length > 0 ? out : [""];
+      });
+      this.clampTop();
+    }
+    private clampTop(): void {
+      const max = Math.max(0, this.wrapped.length - this.viewport);
+      this.top = Math.min(Math.max(0, this.top), max);
+    }
+    render(width: number): string[] {
+      this.rewrap(width);
+      // Reserve one row for the status footer; overlay maxHeight caps the rest.
+      const bodyRows = Math.max(1, this.viewport);
+      const end = Math.min(this.wrapped.length, this.top + bodyRows);
+      const body = this.wrapped.slice(this.top, end).map((l) => truncateToWidth(l, width));
+      while (body.length < bodyRows) {
+        body.push("");
+      }
+      const atEnd = end >= this.wrapped.length;
+      const pct =
+        this.wrapped.length <= bodyRows
+          ? "ALL"
+          : `${Math.round((end / this.wrapped.length) * 100)}%`;
+      const footer = truncateToWidth(
+        dimLine(`── pager ${pct}${atEnd ? " (END)" : ""} — ↑↓/jk/space/g/G scroll, q to close ──`),
+        width,
+      );
+      return [...body, footer];
+    }
+    // The overlay's allotted rows drive the viewport; derive it from the last
+    // render height via setViewport, called by the opener after sizing.
+    setViewport(rows: number): void {
+      this.viewport = Math.max(1, rows - 1);
+      this.clampTop();
+    }
+    handleInput(data: string): void {
+      const page = Math.max(1, this.viewport - 1);
+      if (matchesKey(data, "up") || matchesKey(data, "k")) {
+        this.top -= 1;
+      } else if (matchesKey(data, "down") || matchesKey(data, "j")) {
+        this.top += 1;
+      } else if (matchesKey(data, "pageUp") || matchesKey(data, "b")) {
+        this.top -= page;
+      } else if (
+        matchesKey(data, "pageDown") ||
+        matchesKey(data, "space") ||
+        matchesKey(data, "f")
+      ) {
+        this.top += page;
+      } else if (matchesKey(data, "g") || matchesKey(data, "home")) {
+        this.top = 0;
+      } else if (matchesKey(data, "shift+g") || matchesKey(data, "end")) {
+        this.top = this.wrapped.length;
+      } else if (matchesKey(data, "q") || matchesKey(data, "escape")) {
+        this.onClose();
+        return;
+      } else {
+        return;
+      }
+      this.clampTop();
+      tui.requestRender();
+    }
+    invalidate(): void {
+      this.wrapWidth = -1;
+    }
+  }
+
+  // Pagers are serialized through a queue: parallel tool completions can each
+  // request paging, and stacking overlays would race for focus. One pager is
+  // shown at a time; closing it opens the next (or returns focus to the editor).
+  const pagerQueue: string[] = [];
+  let pagerOpen = false;
+  const showNextPager = (): void => {
+    const text = pagerQueue.shift();
+    if (text === undefined) {
+      pagerOpen = false;
+      tui.setFocus(editor);
+      tui.requestRender();
+      return;
+    }
+    pagerOpen = true;
+    const rows = Math.max(6, Math.floor((process.stdout.rows || 24) * 0.7));
+    const close = () => {
+      handle.hide();
+      showNextPager();
+    };
+    const pager = new Pager(text, close);
+    pager.setViewport(rows - 2);
+    const handle = tui.showOverlay(pager, { width: "90%", maxHeight: rows });
+    handle.focus();
+    tui.requestRender();
+  };
+  const openPager = (text: string): void => {
+    pagerQueue.push(text);
+    if (!pagerOpen) {
+      showNextPager();
+    }
+  };
+
+  // In slow mode, page long text in an overlay; otherwise add it inline. The
+  // `addInline` callback owns the non-paged rendering so callers keep their
+  // own styling (dim vs red, padding, etc.).
+  const pageOrShow = (text: string, addInline: () => void): void => {
+    if (flags.mode === "slow" && isLongOutput(text)) {
+      // Note what triggered paging in the transcript (writing to stderr would
+      // corrupt the TUI's differential rendering).
+      transcript.addChild(
+        new Text(dimLine(`[paging long output (${text.split("\n").length} lines)]`)),
+      );
+      openPager(text);
+    } else {
+      addInline();
+    }
+  };
+
   const showCommandOutput = (result: { output?: string; isError?: boolean }) => {
     if (result.output !== undefined) {
       const text = result.output.length > 0 ? result.output : "(empty)";
-      transcript.addChild(new Text(result.isError ? redLine(text) : dimLine(text)));
+      const addInline = () =>
+        transcript.addChild(new Text(result.isError ? redLine(text) : dimLine(text)));
+      // Never page errors (short and worth keeping in the transcript).
+      if (result.isError) {
+        addInline();
+      } else {
+        pageOrShow(text, addInline);
+      }
     }
   };
   const echoCommandResult = async (input: string) => {
@@ -871,6 +1214,54 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     refreshBanner();
     tui.requestRender();
   };
+
+  // Slow-mode tool-call confirmation overlay. A focused Component showing the
+  // tool and an args preview; y approves, n / Escape denies. Resolves the
+  // returned promise with the decision, which makeBeforeToolCall turns into a
+  // pass-through (approve) or a block (deny). The agent loop awaits this hook,
+  // so the tool does not run until the user answers.
+  const confirmTool = (toolName: string, argsPreview: string): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      let settled = false;
+      const decide = (approved: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        handle.hide();
+        tui.setFocus(editor);
+        transcript.addChild(
+          new Text(
+            approved ? dimLine(`[approved ${toolName}]`) : yellowLine(`[denied ${toolName}]`),
+          ),
+        );
+        tui.requestRender();
+        resolve(approved);
+      };
+      const prompt: PiTui.Component = {
+        render: (width: number): string[] => {
+          const head = yellowLine(`Run tool ${toolName}?`);
+          const args = dimLine(`  args: ${argsPreview}`);
+          const help = dimLine("  [y] approve   [n]/Esc deny");
+          return [head, args, "", help].map((l) => truncateToWidth(l, width));
+        },
+        handleInput: (data: string): void => {
+          if (matchesKey(data, "y")) {
+            decide(true);
+          } else if (matchesKey(data, "n") || matchesKey(data, "escape")) {
+            decide(false);
+          }
+        },
+        invalidate: () => {},
+      };
+      const handle = tui.showOverlay(prompt, { width: "80%", maxHeight: 8 });
+      handle.focus();
+      tui.requestRender();
+    });
+
+  agent.beforeToolCall = makeBeforeToolCall(flags, (toolName, argsPreview) =>
+    confirmTool(toolName, argsPreview),
+  );
 
   /** TUI-native rendering for selected slash commands. Returns true when handled. */
   const handleTuiCommand = (input: string): boolean => {
@@ -1007,11 +1398,30 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       }
     } else if (event.type === "tool_execution_end") {
       const component = toolComponents.get(event.toolCallId);
-      const result = event.result as { content?: { type: string }[]; details?: unknown };
+      const result = event.result as {
+        content?: { type: string; text?: string }[];
+        details?: unknown;
+      };
       component?.updateResult(
         { content: result?.content ?? [], details: result?.details, isError: event.isError },
         false,
       );
+      // Slow mode: offer the full tool result in a pager when it is long, so
+      // large outputs can be read without the inline component truncating them.
+      if (flags.mode === "slow" && !event.isError) {
+        const body = (result?.content ?? [])
+          .filter((c) => c.type === "text" && typeof c.text === "string")
+          .map((c) => c.text as string)
+          .join("\n");
+        if (body.length > 0 && isLongOutput(body)) {
+          transcript.addChild(
+            new Text(
+              dimLine(`[paging ${event.toolName} result (${body.split("\n").length} lines)]`),
+            ),
+          );
+          openPager(body);
+        }
+      }
     }
     tui.requestRender();
   });
