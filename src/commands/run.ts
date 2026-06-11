@@ -276,10 +276,11 @@ function createConfigureTool(opts: {
     name: "configure",
     label: "Configure session",
     description:
-      "Change your own session settings: model, reasoning level, web search, interaction mode, " +
-      "active client-side tools, and system prompt. Provide only the fields you want to change; " +
-      "they take effect on the next turn. Returns the resulting configuration. Does not change " +
-      "the persisted default model.",
+      "Inspect or change your own session settings: model, reasoning level, web search, " +
+      "interaction mode, active client-side tools, and system prompt. Call with no fields to " +
+      "just read the current configuration; provide only the fields you want to change (they " +
+      "take effect on the next turn). Either way the result reports the full configuration. " +
+      "Does not change the persisted default model.",
     parameters: CONFIGURE_PARAMETERS,
     execute: async (_toolCallId, params): Promise<AgentToolResult<ConfigureDetails>> => {
       const agent = getAgent();
