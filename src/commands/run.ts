@@ -164,7 +164,7 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
     ["web search", flags.webSearch ? "on (hosted, openai-native only)" : "off"],
     ["tools", tools.length > 0 ? tools.join(", ") : "none"],
     ["skills", "none (rath run loads no skills or context files)"],
-    ["system prompt", "/sys to display"],
+    ["system prompt", "/sys to view or set"],
     ["messages in context", String(agent.state.messages.length)],
     ...(flags.loadPath ? [["loaded from", flags.loadPath] as [string, string]] : []),
     ["save on exit", flags.savePath ?? "off"],
@@ -181,16 +181,18 @@ export interface SlashResult {
  * Handle an in-session slash command. Returns undefined when the input is
  * not a slash command (i.e. it is a prompt for the model).
  */
-export function handleSlashCommand(
+export async function handleSlashCommand(
   input: string,
   agent: Agent,
   flags: RunFlags,
-): SlashResult | undefined {
+): Promise<SlashResult | undefined> {
   if (!input.startsWith("/")) {
     return undefined;
   }
   const [command = "", ...rest] = input.split(/\s+/);
   const arg = rest.join(" ").trim();
+  // Most settings take effect next turn; the running turn already snapshotted.
+  const deferred = agent.state.isStreaming ? " (applies after the current turn)" : "";
   switch (command) {
     case "/exit":
       return { exit: true };
@@ -200,8 +202,68 @@ export function handleSlashCommand(
           .map(([key, value]) => `${key}: ${value}`)
           .join("\n"),
       };
-    case "/sys":
-      return { output: agent.state.systemPrompt };
+    case "/sys": {
+      if (arg.length === 0) {
+        const prompt = agent.state.systemPrompt;
+        return { output: prompt.length > 0 ? prompt : "(empty)" };
+      }
+      agent.state.systemPrompt = arg;
+      flags.systemPrompt = arg;
+      return { output: `system prompt set (${arg.length} chars)${deferred}` };
+    }
+    case "/websearch": {
+      if (arg.length === 0) {
+        return { output: `web search: ${flags.webSearch ? "on" : "off"}` };
+      }
+      if (arg !== "on" && arg !== "off") {
+        return { output: "Usage: /websearch [on|off]", isError: true };
+      }
+      flags.webSearch = arg === "on";
+      return { output: `web search: ${arg} (openai-native only)${deferred}` };
+    }
+    case "/tools": {
+      if (arg.length === 0) {
+        const names = agent.state.tools.map((t) => t.name);
+        return { output: `tools: ${names.length > 0 ? names.join(", ") : "none"}` };
+      }
+      if (arg === "none") {
+        agent.state.tools = [];
+        flags.tools = [];
+        return { output: `tools: none${deferred}` };
+      }
+      const requested = arg
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      const invalid = requested.filter((n) => !TOOL_NAMES.includes(n as ToolName));
+      if (invalid.length > 0) {
+        return {
+          output: `Unknown tool(s): ${invalid.join(", ")} (use ${TOOL_NAMES.join(", ")})`,
+          isError: true,
+        };
+      }
+      const names = requested as ToolName[];
+      try {
+        agent.state.tools = await loadTools(names, process.cwd());
+        flags.tools = names;
+        return { output: `tools: ${names.join(", ")}${deferred}` };
+      } catch (error) {
+        return { output: error instanceof Error ? error.message : String(error), isError: true };
+      }
+    }
+    case "/save": {
+      const path = arg.length > 0 ? arg : flags.savePath;
+      if (!path) {
+        return { output: "Usage: /save <path> (also sets the save-on-exit path)", isError: true };
+      }
+      try {
+        saveContext(agent, path);
+        flags.savePath = path;
+        return { output: `saved to ${path}` };
+      } catch (error) {
+        return { output: error instanceof Error ? error.message : String(error), isError: true };
+      }
+    }
     case "/model": {
       if (arg.length === 0) {
         return { output: `model: ${flags.model}` };
@@ -209,9 +271,6 @@ export function handleSlashCommand(
       try {
         agent.state.model = resolveModel(arg);
         flags.model = arg;
-        // The running turn already snapshotted its model; a mid-stream switch
-        // only affects the next turn.
-        const deferred = agent.state.isStreaming ? " (applies after the current turn)" : "";
         return { output: `model: ${arg}${deferred}` };
       } catch (error) {
         return { output: error instanceof Error ? error.message : String(error), isError: true };
@@ -243,12 +302,14 @@ export function handleSlashCommand(
         arg === "off" || supported.includes(arg as ReasoningLevel)
           ? ""
           : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
-      const deferNote = agent.state.isStreaming ? " (applies after the current turn)" : "";
-      return { output: `reasoning: ${arg}${clampNote}${deferNote}` };
+      return { output: `reasoning: ${arg}${clampNote}${deferred}` };
     }
     default:
       return {
-        output: `Unknown command: ${command} (commands: /info, /sys, /model, /lsmodels, /reasoning, /exit)`,
+        output:
+          `Unknown command: ${command} (commands: /info, /sys [text], /model [spec], ` +
+          "/lsmodels [filter], /reasoning [level], /websearch [on|off], /tools [names|none], " +
+          "/save [path], /exit)",
         isError: true,
       };
   }
@@ -347,10 +408,16 @@ export const runCommand: Command = {
     "OPENAI_API_KEY) is the only input taken from the environment.\n" +
     "\n" +
     "Without --prompt, reads prompts interactively (plain REPL, or pi-tui\n" +
-    "with -T/--tui). In-session commands: /info shows the configuration,\n" +
-    "/sys shows the system prompt, /model [provider/model-id] shows or\n" +
-    "switches the model, /lsmodels [filter] lists available models,\n" +
-    "/reasoning [level] shows or sets the reasoning level, /exit quits.\n" +
+    "with -T/--tui). Every startup setting is also settable in-session:\n" +
+    "  /info                  show the session configuration\n" +
+    "  /sys [text]            show or set the system prompt\n" +
+    "  /model [provider/id]   show or switch the model\n" +
+    "  /lsmodels [filter]     list available models\n" +
+    "  /reasoning [level]     show or set the reasoning level\n" +
+    "  /websearch [on|off]    show or toggle hosted web search\n" +
+    "  /tools [names|none]    show or set client-side tools\n" +
+    "  /save [path]           write the context now and save there on exit\n" +
+    "  /exit                  quit\n" +
     "With --prompt, runs one prompt and exits (0 on success).",
   flags: [
     {
@@ -592,7 +659,7 @@ export const runCommand: Command = {
 
     const renderer = attachRenderer(agent);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | /info /sys /model /lsmodels /reasoning /exit | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
+      `${dim(`model: ${flags.model} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     // Iterating the interface (rather than looping rl.question) queues input
@@ -623,7 +690,7 @@ export const runCommand: Command = {
           process.stderr.write("rath> ");
           continue;
         }
-        const result = handleSlashCommand(trimmed, agent, flags);
+        const result = await handleSlashCommand(trimmed, agent, flags);
         if (result) {
           if (result.output !== undefined) {
             const text = result.output.length > 0 ? result.output : "(empty)";
@@ -754,7 +821,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     banner.setText(
       `${cyanLine("rath")} ${dimLine(
         `| ${flags.model} | reasoning: ${agent.state.thinkingLevel} | ` +
-          "/info /sys /model /lsmodels /reasoning /exit | Ctrl+C interrupts",
+          "/info for commands | Ctrl+C interrupts",
       )}`,
     );
   };
@@ -799,9 +866,10 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       transcript.addChild(new Text(result.isError ? redLine(text) : dimLine(text)));
     }
   };
-  const echoCommandResult = (input: string) => {
-    showCommandOutput(handleSlashCommand(input, agent, flags) ?? {});
+  const echoCommandResult = async (input: string) => {
+    showCommandOutput((await handleSlashCommand(input, agent, flags)) ?? {});
     refreshBanner();
+    tui.requestRender();
   };
 
   /** TUI-native rendering for selected slash commands. Returns true when handled. */
@@ -956,15 +1024,17 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     if (trimmed.startsWith("/")) {
       transcript.addChild(new Text(`\n${cyanLine("›")} ${trimmed}`));
       if (!handleTuiCommand(trimmed)) {
-        const result = handleSlashCommand(trimmed, agent, flags);
-        if (result) {
-          showCommandOutput(result);
-          refreshBanner();
-          if (result.exit) {
-            tui.stop();
-            resolveDone(0);
+        handleSlashCommand(trimmed, agent, flags).then((result) => {
+          if (result) {
+            showCommandOutput(result);
+            refreshBanner();
+            if (result.exit) {
+              tui.stop();
+              resolveDone(0);
+            }
           }
-        }
+          tui.requestRender();
+        });
       }
       tui.requestRender();
       return;
