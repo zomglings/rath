@@ -4,6 +4,7 @@ export {
   type ContainerFileCitation,
   contentBlocks,
   type FileCitation,
+  flattenHostedContent,
   getCitations,
   getHostedToolCalls,
   type HostedContentBlock,
@@ -27,3 +28,17 @@ export {
   registerOpenAINative,
   streamOpenAINative,
 } from "./providers/openai-native.js";
+export {
+  annotationToCitation as openrouterAnnotationToCitation,
+  buildParams as buildOpenRouterNativeParams,
+  convertNativeMessages as convertOpenRouterNativeMessages,
+  type HostedToolName as OpenRouterHostedToolName,
+  OPENROUTER_NATIVE_API,
+  type OpenRouterHostedToolCallItem,
+  type OpenRouterNativeHostedToolCall,
+  type OpenRouterNativeOptions,
+  type OpenRouterUrlCitationAnnotation,
+  openrouterNativeModel,
+  registerOpenRouterNative,
+  streamOpenRouterNative,
+} from "./providers/openrouter-native.js";

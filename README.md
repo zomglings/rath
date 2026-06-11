@@ -58,9 +58,24 @@ for (const block of message.content) {
 console.log(getHostedToolCalls(message));
 ```
 
-Contexts containing `hostedToolCall` blocks or citations are only understood by
-the `openai-native` provider; flatten them before handing a context to a stock
-pi-ai provider (not yet implemented).
+Contexts containing `hostedToolCall` blocks or citations are understood by the
+provider that produced them. Handing such a context to a different model
+(another provider, or another model of the same provider) flattens the
+extended blocks to plain text via `flattenHostedContent` so the new model
+keeps the search history; same-model replay stays byte-identical to preserve
+the prompt cache.
+
+## openrouter-native provider
+
+`openrouter-native` is the same idea for OpenRouter's server-side web search:
+a provider wrapping OpenRouter's `openrouter:web_search` server tool on the
+Chat Completions API, capturing its `url_citation` annotations as the same
+structured `citations`. pi-ai routes OpenRouter through the stock
+`openai-completions` api, which drops those annotations; this provider
+preserves them. Register with `registerOpenRouterNative()` and use
+`openrouterNativeModel("openai/gpt-4o")` (any id from pi-ai's `openrouter`
+registry). It reuses the shared `hosted-tools` machinery, so citations,
+trailers, and flatten-on-handoff work identically.
 
 ## CLI
 
@@ -103,8 +118,17 @@ rath development itself is meant to happen inside `rath run`.
   (openai-native clamps it to the model's supported levels),
   `/websearch [on|off]` toggles hosted web search, `/tools [names|none]`
   shows or sets client-side tools, `/save [path]` writes the context now and
-  saves there on exit, `/exit` quits. Changes take effect on the next turn.
-  In the TUI, bare `/model` and `/reasoning` open selector overlays.
+  saves there on exit, `/go`/`/slow` (or `/mode`) switch interaction mode,
+  `/exit` quits. Changes take effect on the next turn. In the TUI, bare
+  `/model` and `/reasoning` open selector overlays.
+- Two interaction modes (`--mode go|slow`, default `go`): **go** runs at full
+  speed, tools execute immediately. **slow** gates every tool call behind a
+  per-call confirmation (also the mitigation for prompt-injection driving
+  tools while web search is on) and pages long output — through `$PAGER` in
+  the plain REPL, a scrollable overlay in the TUI.
+- Any registered pi-ai provider works, plus rath's own hosted-tool providers:
+  `openai-native/<model>` and `openrouter-native/<model>` (OpenRouter's
+  server-side web search with citations; see below).
 - Hosted web search is on by default with openai-native (`--no-web-search`
   disables it). After each reply, citations are rendered into a `Sources:`
   text block appended to the assistant message, marked

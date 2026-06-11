@@ -19,9 +19,17 @@
  * load when --tui is used; the type-only imports below are erased at compile
  * time and cost nothing.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, isAbsolute, join } from "node:path";
 import * as readline from "node:readline/promises";
-import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
+import {
+  Agent,
+  type AgentTool,
+  type BeforeToolCallContext,
+  type BeforeToolCallResult,
+} from "@earendil-works/pi-agent-core";
 import {
   type Api,
   type AssistantMessage,
@@ -41,10 +49,15 @@ import { type Command, fullName, helpText } from "../command.js";
 import {
   applyCitationTrailer,
   contentBlocks,
+  flattenHostedContent,
   isHostedToolCall,
+  isRenderedCitations,
   OPENAI_NATIVE_API,
+  OPENROUTER_NATIVE_API,
   openaiNativeModel,
+  openrouterNativeModel,
   registerOpenAINative,
+  registerOpenRouterNative,
   stripRenderedCitations,
   uniqueUrlCitations,
 } from "../index.js";
@@ -65,6 +78,16 @@ export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 export const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
+// Interaction modes for `rath run`:
+// - "go": full speed, no inspection. Stream everything, never block, tools run
+//   immediately. This is the default and must stay byte-for-byte the current
+//   behavior — no paging, the gating hook is a pass-through.
+// - "slow": take time. Long output is paged (a pager in the plain REPL, a
+//   scrollable overlay in the TUI), and every tool call is gated behind a
+//   per-call confirmation before it runs.
+export const MODES = ["go", "slow"] as const;
+export type Mode = (typeof MODES)[number];
+
 export interface RunFlags {
   model: string;
   prompt?: string;
@@ -73,8 +96,26 @@ export interface RunFlags {
   webSearch: boolean;
   tools: ToolName[];
   tui: boolean;
+  mode: Mode;
   loadPath?: string;
   savePath?: string;
+}
+
+// Paging threshold: output longer than this many lines is paged in slow mode.
+// Slash-command output and tool results are usually well-bounded, so a fixed
+// line count is simpler and more predictable than chasing terminal height.
+export const LONG_OUTPUT_LINES = 24;
+
+/** True when `text` is long enough to page in slow mode. */
+export function isLongOutput(text: string): boolean {
+  // Count lines: a trailing newline does not add an empty line to read.
+  let lines = 1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n" && i !== text.length - 1) {
+      lines++;
+    }
+  }
+  return lines > LONG_OUTPUT_LINES;
 }
 
 /**
@@ -106,6 +147,9 @@ export function resolveModel(spec: string): Model<Api> {
   if (provider === OPENAI_NATIVE_API) {
     return openaiNativeModel(modelId);
   }
+  if (provider === OPENROUTER_NATIVE_API) {
+    return openrouterNativeModel(modelId) as Model<Api>;
+  }
   const model = getModel(provider as KnownProvider, modelId as never) as Model<Api> | undefined;
   if (!model) {
     throw new Error(`Unknown model: ${spec}`);
@@ -113,11 +157,14 @@ export function resolveModel(spec: string): Model<Api> {
   return model;
 }
 
-/** All selectable model specs, openai-native first. */
+/** All selectable model specs, native providers first. */
 export function listModels(filter?: string): string[] {
   const specs: string[] = [];
   for (const model of getModels("openai")) {
     specs.push(`${OPENAI_NATIVE_API}/${model.id}`);
+  }
+  for (const model of getModels("openrouter")) {
+    specs.push(`${OPENROUTER_NATIVE_API}/${model.id}`);
   }
   for (const provider of getProviders()) {
     for (const model of getModels(provider)) {
@@ -160,8 +207,9 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
   const tools = agent.state.tools.map((t) => t.name);
   return [
     ["model", flags.model],
+    ["mode", flags.mode === "slow" ? "slow (paging + tool confirmation)" : "go (full speed)"],
     ["reasoning", String(agent.state.thinkingLevel)],
-    ["web search", flags.webSearch ? "on (hosted, openai-native only)" : "off"],
+    ["web search", flags.webSearch ? "on (hosted, openai-native / openrouter-native only)" : "off"],
     ["tools", tools.length > 0 ? tools.join(", ") : "none"],
     ["skills", "none (rath run loads no skills or context files)"],
     ["system prompt", "/sys to view or set"],
@@ -219,7 +267,9 @@ export async function handleSlashCommand(
         return { output: "Usage: /websearch [on|off]", isError: true };
       }
       flags.webSearch = arg === "on";
-      return { output: `web search: ${arg} (openai-native only)${deferred}` };
+      return {
+        output: `web search: ${arg} (openai-native / openrouter-native only)${deferred}`,
+      };
     }
     case "/tools": {
       if (arg.length === 0) {
@@ -301,15 +351,31 @@ export async function handleSlashCommand(
       const clampNote =
         arg === "off" || supported.includes(arg as ReasoningLevel)
           ? ""
-          : ` (outside ${flags.model}'s supported levels — openai-native clamps it)`;
+          : ` (outside ${flags.model}'s supported levels — the native provider clamps it)`;
       return { output: `reasoning: ${arg}${clampNote}${deferred}` };
     }
+    case "/mode": {
+      if (arg.length === 0) {
+        return { output: `mode: ${flags.mode}` };
+      }
+      if (arg !== "go" && arg !== "slow") {
+        return { output: "Usage: /mode [go|slow]", isError: true };
+      }
+      flags.mode = arg;
+      return { output: `mode: ${arg}` };
+    }
+    case "/go":
+      flags.mode = "go";
+      return { output: "mode: go (full speed)" };
+    case "/slow":
+      flags.mode = "slow";
+      return { output: "mode: slow (paging + tool confirmation)" };
     default:
       return {
         output:
           `Unknown command: ${command} (commands: /info, /sys [text], /model [spec], ` +
           "/lsmodels [filter], /reasoning [level], /websearch [on|off], /tools [names|none], " +
-          "/save [path], /exit)",
+          "/mode [go|slow], /go, /slow, /save [path], /exit)",
         isError: true,
       };
   }
@@ -325,8 +391,13 @@ interface Renderer {
  * goes to stdout (the deliverable, so `-p > file` captures just that);
  * thinking, hosted-tool markers, tool-execution lines, and errors go to
  * stderr as status.
+ *
+ * When `pageReplies` is set (the interactive REPL, never `-p`), slow mode
+ * buffers the answer instead of streaming it and pages the finished reply
+ * through $PAGER so it can be read deliberately; short replies and go mode
+ * stream/print as usual.
  */
-function attachRenderer(agent: Agent): Renderer {
+function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Renderer {
   // Track which stream has an unterminated line so the next block starts fresh.
   let openStream: NodeJS.WriteStream | null = null;
   const write = (stream: NodeJS.WriteStream, text: string) => {
@@ -341,6 +412,34 @@ function attachRenderer(agent: Agent): Renderer {
   };
   const seenHostedCalls = new Set<string>();
   let errored = false;
+  // In slow mode (interactive only) the thinking and answer are not streamed
+  // live; the finished turn is paged at message_end so it can be read at
+  // leisure. Tool-call markers still stream as progress.
+  const paging = () => pageReplies && flags.mode === "slow";
+  // Print a (possibly partial) turn with the same stream split as live
+  // streaming: answer to stdout, thinking and the sources trailer to stderr.
+  // Used when slow mode suppressed the live stream but cannot page (short
+  // output, no TTY) or the turn was interrupted.
+  const printTurnSplit = (message: AssistantMessage) => {
+    for (const block of contentBlocks(message)) {
+      if (block.type === "thinking") {
+        const t = block.thinking.trim();
+        if (t.length > 0) {
+          write(process.stderr, `${dim(t)}\n`);
+        }
+      } else if (block.type === "text") {
+        const t = block.text.trim();
+        if (t.length === 0) {
+          continue;
+        }
+        if (isRenderedCitations(block)) {
+          write(process.stderr, `${dim(t)}\n`);
+        } else {
+          write(process.stdout, `${t}\n`);
+        }
+      }
+    }
+  };
 
   agent.subscribe((event) => {
     if (event.type === "agent_start") {
@@ -348,9 +447,13 @@ function attachRenderer(agent: Agent): Renderer {
     } else if (event.type === "message_update") {
       const e = event.assistantMessageEvent;
       if (e.type === "text_delta") {
-        write(process.stdout, e.delta);
+        if (!paging()) {
+          write(process.stdout, e.delta);
+        }
       } else if (e.type === "thinking_delta") {
-        write(process.stderr, dim(e.delta));
+        if (!paging()) {
+          write(process.stderr, dim(e.delta));
+        }
       } else if (e.type === "text_end" || e.type === "thinking_end") {
         ensureNewline();
       }
@@ -377,6 +480,12 @@ function attachRenderer(agent: Agent): Renderer {
       if (message.role === "assistant") {
         ensureNewline();
         if (message.stopReason === "error" || message.stopReason === "aborted") {
+          // Slow mode suppressed the live stream; surface whatever partial
+          // content was generated before the interrupt/error rather than
+          // discarding it.
+          if (paging()) {
+            printTurnSplit(message);
+          }
           write(
             process.stderr,
             `${message.stopReason}: ${message.errorMessage ?? "interrupted"}\n`,
@@ -389,13 +498,196 @@ function attachRenderer(agent: Agent): Renderer {
           return;
         }
         const trailer = applyCitationTrailer(message);
-        if (trailer) {
+        if (paging()) {
+          // Page the finished turn — thinking, answer, and sources — through
+          // $PAGER. If it cannot page (short output, or stdout is not a TTY),
+          // print with the normal stream split so thinking does not land on
+          // stdout.
+          if (!pagePlain(buildPagedTurnText(message), flags)) {
+            printTurnSplit(message);
+          }
+        } else if (trailer) {
           write(process.stderr, `${dim(trailer)}\n`);
         }
       }
     }
   });
   return { hadError: () => errored };
+}
+
+/** Short, single-line preview of tool arguments for a confirmation prompt. */
+export function toolArgsPreview(args: unknown, max = 120): string {
+  let text: string;
+  try {
+    text = JSON.stringify(args) ?? String(args);
+  } catch {
+    text = String(args);
+  }
+  // Collapse whitespace so the preview stays on one line.
+  text = text.replace(/\s+/g, " ");
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Build a beforeToolCall hook for the Agent. In go mode the hook is a
+ * pass-through, so go mode keeps the current "tools run immediately" behavior
+ * exactly. In slow mode it asks `confirm` before every tool call and blocks
+ * the call when the user declines; a frontend that cannot confirm (non-TTY
+ * plain REPL, or -p one-shot) denies rather than passing through.
+ *
+ * The hook reads flags.mode on every call, so /slow mid-session starts gating
+ * and /go stops it — no agent rebuild needed.
+ *
+ * This is also the security mitigation for prompt injection: with hosted web
+ * search on, a malicious page can try to steer the model into running tools.
+ * Slow mode forces a human to approve each tool call before it executes.
+ */
+export function makeBeforeToolCall(
+  flags: RunFlags,
+  confirm: (toolName: string, argsPreview: string, signal?: AbortSignal) => Promise<boolean>,
+): (ctx: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined> {
+  return async (
+    ctx: BeforeToolCallContext,
+    signal?: AbortSignal,
+  ): Promise<BeforeToolCallResult | undefined> => {
+    if (flags.mode !== "slow") {
+      return undefined; // go mode: pass-through, no gating.
+    }
+    const toolName = ctx.toolCall.name;
+    // An interrupt fired while the confirmation is pending counts as a deny so
+    // the tool does not run after the user aborted the turn.
+    if (signal?.aborted) {
+      return { block: true, reason: `Tool call to ${toolName} denied (interrupted).` };
+    }
+    const approved = await confirm(toolName, toolArgsPreview(ctx.args), signal);
+    if (approved) {
+      return undefined;
+    }
+    return { block: true, reason: `Tool call to ${toolName} denied by user (slow mode).` };
+  };
+}
+
+/**
+ * Build the readable text of a finished assistant turn for the pager: thinking
+ * (labeled), the answer, and the rendered Sources trailer, in content order.
+ * Hosted/function tool-call blocks are omitted (their results are paged
+ * separately); call after applyCitationTrailer so the trailer is included.
+ */
+export function buildPagedTurnText(message: AssistantMessage): string {
+  const parts: string[] = [];
+  for (const block of contentBlocks(message)) {
+    if (block.type === "thinking") {
+      const t = block.thinking.trim();
+      if (t.length > 0) {
+        parts.push(`Thinking:\n${t}`);
+      }
+    } else if (block.type === "text") {
+      const t = block.text.trim();
+      if (t.length > 0) {
+        parts.push(t);
+      }
+    }
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * Run the external pager ($PAGER, default `less -R`) on `text`, full-screen,
+ * with vim/arrow/PgUp-PgDn navigation and search — i.e. real less behavior.
+ * Returns true when the pager ran, false when no usable pager was found or it
+ * exited abnormally (the caller should then render the content itself).
+ *
+ * The pager command comes from $PAGER if set; otherwise the first of `less -R`
+ * and `more` whose executable is actually on PATH (so we degrade to whatever
+ * the platform has rather than hard-failing on systems without less). See
+ * resolvePagerCommand.
+ *
+ * The text is written to a temp file and the pager is run as `pager <file>`
+ * with inherited stdio so it owns the terminal (drawing to the screen, reading
+ * the keyboard). Piping on the pager's stdin instead would make less detect a
+ * non-TTY stdin and dump like cat. The synchronous `spawnSync` blocks the
+ * event loop for the pager's lifetime; the temp file is removed afterward. The
+ * caller must own the terminal first (the plain REPL is between reads; the TUI
+ * suspends itself with tui.stop()).
+ */
+/**
+ * Resolve `cmd` against PATH the way a shell would, returning true if an
+ * executable by that name exists. A name containing a path separator is
+ * checked directly. On Windows, PATHEXT extensions (.exe/.cmd/...) are tried
+ * for names without their own extension. This only checks existence; it never
+ * runs the candidate.
+ */
+function isOnPath(cmd: string): boolean {
+  const exts =
+    process.platform === "win32"
+      ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+      : [""];
+  const hasExt = exts.some((e) => e !== "" && cmd.toLowerCase().endsWith(e.toLowerCase()));
+  const names = hasExt ? [cmd] : exts.map((e) => cmd + e);
+  const isFile = (p: string): boolean => {
+    try {
+      return existsSync(p) && statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (cmd.includes("/") || cmd.includes("\\") || isAbsolute(cmd)) {
+    return names.some(isFile);
+  }
+  const dirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  return dirs.some((dir) => names.some((n) => isFile(join(dir, n))));
+}
+
+/**
+ * The pager command (argv array) to use: $PAGER split on spaces if set,
+ * otherwise the first detected default among `less -R` and `more`. Returns []
+ * when nothing usable is found, which makes runExternalPager a no-op so the
+ * caller renders inline.
+ */
+export function resolvePagerCommand(): string[] {
+  const pagerEnv = (process.env.PAGER ?? "").trim();
+  if (pagerEnv.length > 0) {
+    // Split on spaces so PAGER="less -R" works (the common shell convention).
+    return pagerEnv.split(/\s+/);
+  }
+  const defaults = [["less", "-R"], ["more"]];
+  return defaults.find((argv) => argv[0] !== undefined && isOnPath(argv[0])) ?? [];
+}
+
+export function runExternalPager(text: string): boolean {
+  const parts = resolvePagerCommand();
+  const [cmd, ...rest] = parts;
+  if (!cmd) {
+    return false;
+  }
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(join(tmpdir(), "rath-pager-"));
+    const file = join(dir, "output.txt");
+    writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`);
+    const result = spawnSync(cmd, [...rest, file], { stdio: "inherit" });
+    if (result.error || (typeof result.status === "number" && result.status !== 0)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}
+
+/** Page `text` in the plain REPL when in slow mode and the output is long. */
+export function pagePlain(text: string, flags: RunFlags): boolean {
+  if (flags.mode !== "slow" || !isLongOutput(text)) {
+    return false;
+  }
+  if (!process.stdout.isTTY || !process.stdin.isTTY) {
+    return false;
+  }
+  return runExternalPager(text);
 }
 
 export const runCommand: Command = {
@@ -416,6 +708,8 @@ export const runCommand: Command = {
     "  /reasoning [level]     show or set the reasoning level\n" +
     "  /websearch [on|off]    show or toggle hosted web search\n" +
     "  /tools [names|none]    show or set client-side tools\n" +
+    "  /mode [go|slow]        show or switch the interaction mode\n" +
+    "  /go, /slow             switch mode (go: full speed; slow: page + confirm)\n" +
     "  /save [path]           write the context now and save there on exit\n" +
     "  /exit                  quit\n" +
     "With --prompt, runs one prompt and exits (0 on success).",
@@ -454,9 +748,16 @@ export const runCommand: Command = {
       description: "Reasoning effort: off, minimal, low, medium, high, xhigh (default: low)",
     },
     {
+      long: "mode",
+      takesValue: true,
+      description:
+        "Interaction mode: go (full speed, default) or slow (page long output " +
+        "and confirm each tool call before it runs)",
+    },
+    {
       long: "no-web-search",
       takesValue: false,
-      description: "Disable hosted web search (openai-native)",
+      description: "Disable hosted web search (openai-native / openrouter-native)",
     },
     {
       long: "tools",
@@ -485,6 +786,7 @@ export const runCommand: Command = {
       webSearch: true,
       tools: [],
       tui: false,
+      mode: "go",
     };
     let systemPromptFile: string | undefined;
     let systemPromptExplicit = false;
@@ -525,6 +827,13 @@ export const runCommand: Command = {
             return 1;
           }
           flags.reasoning = level;
+        } else if (token === "--mode") {
+          const mode = value() as Mode;
+          if (!MODES.includes(mode)) {
+            process.stderr.write(`Invalid --mode: ${mode} (use ${MODES.join(", ")})\n`);
+            return 1;
+          }
+          flags.mode = mode;
         } else if (token === "--no-web-search") {
           flags.webSearch = false;
         } else if (token === "--tools") {
@@ -559,6 +868,7 @@ export const runCommand: Command = {
     }
 
     registerOpenAINative();
+    registerOpenRouterNative();
     let agent: Agent;
     try {
       const model = resolveModel(flags.model);
@@ -615,20 +925,34 @@ export const runCommand: Command = {
             if (m.stopReason === "error" || m.stopReason === "aborted") {
               return [];
             }
-            const native = agent.state.model.api === OPENAI_NATIVE_API;
-            // The rendered citation trailer is for display/persistence;
-            // openai-native reconstructs the real annotations itself, so strip
-            // it before replay. Foreign providers get it as plain text.
-            const stripped = native ? stripRenderedCitations(m) : m;
-            // Thinking signatures are provider-specific; a foreign provider
-            // rejects openai-native's. Drop thinking blocks on cross-provider
-            // replay (the proper flatten-on-handoff is a follow-up).
-            if (!native && m.api === OPENAI_NATIVE_API) {
-              return [
-                { ...stripped, content: stripped.content.filter((b) => b.type !== "thinking") },
-              ];
+            // Replay is lossless only to the EXACT producing model: the
+            // provider converters key replayability on api+provider+model
+            // (encrypted reasoning and hosted raw items are model-specific),
+            // so two models sharing an api (e.g. openai-native/gpt-5-mini and
+            // openai-native/gpt-5, or two openrouter-native models) are NOT
+            // interchangeable. Match that triple here, or a cross-model switch
+            // would skip flatten and the converter would then silently drop the
+            // hosted history anyway. flattenHostedContent is provider-agnostic,
+            // so it handles openrouter-native's hosted blocks the same way.
+            const sameModel =
+              m.api === agent.state.model.api &&
+              m.provider === agent.state.model.provider &&
+              m.model === agent.state.model.id;
+            if (sameModel) {
+              // The rendered citation trailer is a display/persistence artifact;
+              // the producing provider reconstructs the real annotations itself,
+              // so strip the trailer before replay. (For openai-native the
+              // provider's converter also strips it defensively; doing it here
+              // keeps the wire payload identical for same-model replay.)
+              return [stripRenderedCitations(m)];
             }
-            return [stripped];
+            // Handoff to a different model (foreign provider, or another model
+            // of the same provider): the target converter only understands
+            // text | thinking | toolCall and would silently drop hostedToolCall
+            // blocks, ignore inline citations, and reject the producing model's
+            // thinking signatures. Flatten the extended content to plain text
+            // the target preserves.
+            return [flattenHostedContent(m)];
           });
         },
       });
@@ -645,7 +969,17 @@ export const runCommand: Command = {
     };
 
     if (flags.prompt !== undefined) {
-      const renderer = attachRenderer(agent);
+      // One-shot streams the answer to stdout (scriptable; never paged).
+      const renderer = attachRenderer(agent, flags, false);
+      // One-shot is non-interactive: there is no human to confirm tool calls,
+      // so slow mode denies them rather than running them unattended. go mode
+      // (the default) keeps the pass-through, so -p behavior is unchanged.
+      agent.beforeToolCall = makeBeforeToolCall(flags, async (toolName, argsPreview) => {
+        process.stderr.write(
+          `${dim(`run ${toolName} ${argsPreview}? [y/N] (non-interactive — denied)`)}\n`,
+        );
+        return false;
+      });
       await agent.prompt(flags.prompt);
       save();
       return renderer.hadError() ? 1 : 0;
@@ -657,11 +991,34 @@ export const runCommand: Command = {
       return code;
     }
 
-    const renderer = attachRenderer(agent);
+    // Interactive REPL: in slow mode, page long replies (pageReplies = true).
+    const renderer = attachRenderer(agent, flags, true);
     process.stderr.write(
-      `${dim(`model: ${flags.model} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
+      `${dim(`model: ${flags.model} | mode: ${flags.mode} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
     );
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    // Slow-mode tool confirmation. The hook fires while agent.prompt() is being
+    // awaited inside the loop below, so the `for await (line of rl)` iterator is
+    // suspended and not competing for stdin; rl.question reads the next line
+    // from the same interface, avoiding a second stdin reader (which would
+    // corrupt line buffering). Non-TTY stdin (piped/-p) cannot answer a
+    // prompt, so default to deny there — slow mode without a human present must
+    // not auto-run tools.
+    agent.beforeToolCall = makeBeforeToolCall(flags, async (toolName, argsPreview, signal) => {
+      const question = `run ${toolName} ${argsPreview}? [y/N] `;
+      if (!process.stdin.isTTY) {
+        process.stderr.write(`${dim(`${question}(no TTY — denied)`)}\n`);
+        return false;
+      }
+      try {
+        // Ctrl+C during the prompt aborts the turn; the signal cancels the
+        // question so we do not block on a line that will never come.
+        const answer = (await rl.question(dim(question), { signal })).trim().toLowerCase();
+        return answer === "y" || answer === "yes";
+      } catch {
+        return false; // aborted question -> deny.
+      }
+    });
     // Iterating the interface (rather than looping rl.question) queues input
     // arriving while a turn runs instead of dropping it. Ctrl+C aborts the
     // active response; a second Ctrl+C before it settles (or one while idle)
@@ -694,7 +1051,12 @@ export const runCommand: Command = {
         if (result) {
           if (result.output !== undefined) {
             const text = result.output.length > 0 ? result.output : "(empty)";
-            process.stderr.write(`${result.isError ? text : dim(text)}\n`);
+            // Slow mode pages long, non-error output (e.g. /sys, /lsmodels)
+            // through $PAGER; pagePlain returns false (no-op) in go mode, for
+            // short output, or with no usable pager, so we print as before.
+            if (result.isError || !pagePlain(text, flags)) {
+              process.stderr.write(`${result.isError ? text : dim(text)}\n`);
+            }
           }
           if (result.exit) {
             break;
@@ -770,6 +1132,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     ProcessTerminal,
     SelectList,
     Text,
+    truncateToWidth,
     TUI,
   } = piTui;
   const {
@@ -820,7 +1183,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   const refreshBanner = () => {
     banner.setText(
       `${cyanLine("rath")} ${dimLine(
-        `| ${flags.model} | reasoning: ${agent.state.thinkingLevel} | ` +
+        `| ${flags.model} | mode: ${flags.mode} | reasoning: ${agent.state.thinkingLevel} | ` +
           "/info for commands | Ctrl+C interrupts",
       )}`,
     );
@@ -860,10 +1223,54 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     };
   };
 
+  // Scrollable pager overlay for slow mode. A focused Component that wraps the
+  // text to the overlay width and shows one viewport at a time; arrows / j,k /
+  // PageUp,PageDown / space / g,G scroll, q or Escape dismiss. Used so long
+  // output (long /sys, /lsmodels, large tool results) can be read without
+  // scrolling the whole transcript past it.
+  // Page long text the way the user expects a pager to behave: suspend the TUI
+  // and hand the whole terminal to the real $PAGER (less), which gives
+  // full-screen rendering and the full set of less/vim keybindings (arrows,
+  // PgUp/PgDn, j/k, g/G, /search, q) for free — far better than a half-screen
+  // overlay that the transcript bleeds through. spawnSync blocks until the
+  // pager exits, so calls serialize naturally (no queue needed); afterward the
+  // TUI is restarted and re-renders the transcript. Returns true if it paged.
+  const pageInTui = (text: string): boolean => {
+    tui.stop();
+    let paged = false;
+    try {
+      paged = runExternalPager(text);
+    } finally {
+      tui.start();
+      tui.requestRender();
+    }
+    return paged;
+  };
+
+  // In slow mode, page long text; otherwise (or if no usable pager) add it
+  // inline. The `addInline` callback owns the non-paged rendering so callers
+  // keep their own styling (dim vs red, padding, etc.).
+  const pageOrShow = (text: string, addInline: () => void): void => {
+    if (flags.mode === "slow" && isLongOutput(text)) {
+      if (!pageInTui(text)) {
+        addInline();
+      }
+    } else {
+      addInline();
+    }
+  };
+
   const showCommandOutput = (result: { output?: string; isError?: boolean }) => {
     if (result.output !== undefined) {
       const text = result.output.length > 0 ? result.output : "(empty)";
-      transcript.addChild(new Text(result.isError ? redLine(text) : dimLine(text)));
+      const addInline = () =>
+        transcript.addChild(new Text(result.isError ? redLine(text) : dimLine(text)));
+      // Never page errors (short and worth keeping in the transcript).
+      if (result.isError) {
+        addInline();
+      } else {
+        pageOrShow(text, addInline);
+      }
     }
   };
   const echoCommandResult = async (input: string) => {
@@ -871,6 +1278,81 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     refreshBanner();
     tui.requestRender();
   };
+
+  // Slow-mode tool-call confirmation overlay. A focused Component showing the
+  // tool and an args preview; y approves, n / Escape denies. Resolves the
+  // returned promise with the decision, which makeBeforeToolCall turns into a
+  // pass-through (approve) or a block (deny). The agent loop awaits this hook,
+  // so the tool does not run until the user answers.
+  //
+  // Ctrl+C is intercepted by the TUI input listener (below), not by this
+  // overlay, so it aborts the agent and fires the abort signal — we listen for
+  // it here to dismiss the overlay and deny, otherwise this promise would hang
+  // the agent loop forever waiting for a y/n that an interrupted user expects
+  // to be unnecessary.
+  const confirmTool = (
+    toolName: string,
+    argsPreview: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      let settled = false;
+      const decide = (approved: boolean, reason: "user" | "abort" = "user") => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        // handle.hide() restores focus to the overlay underneath (e.g. an open
+        // pager) or the editor; forcing the editor here would strand it.
+        handle.hide();
+        transcript.addChild(
+          new Text(
+            approved
+              ? dimLine(`[approved ${toolName}]`)
+              : yellowLine(`[denied ${toolName}${reason === "abort" ? " (interrupted)" : ""}]`),
+          ),
+        );
+        tui.requestRender();
+        resolve(approved);
+      };
+      const onAbort = () => decide(false, "abort");
+      if (signal?.aborted) {
+        // Already aborted before the overlay even shows: deny without opening.
+        transcript.addChild(new Text(yellowLine(`[denied ${toolName} (interrupted)]`)));
+        tui.requestRender();
+        resolve(false);
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const prompt: PiTui.Component = {
+        render: (width: number): string[] => {
+          const head = yellowLine(`Run tool ${toolName}?`);
+          const args = dimLine(`  args: ${argsPreview}`);
+          const help = dimLine("  [y] approve   [n]/Esc deny");
+          return [head, args, "", help].map((l) => truncateToWidth(l, width));
+        },
+        handleInput: (data: string): void => {
+          if (matchesKey(data, "y") || matchesKey(data, "shift+y")) {
+            decide(true);
+          } else if (
+            matchesKey(data, "n") ||
+            matchesKey(data, "shift+n") ||
+            matchesKey(data, "escape")
+          ) {
+            decide(false);
+          }
+        },
+        invalidate: () => {},
+      };
+      const handle = tui.showOverlay(prompt, { width: "80%", maxHeight: 8 });
+      handle.focus();
+      tui.requestRender();
+    });
+
+  agent.beforeToolCall = makeBeforeToolCall(flags, (toolName, argsPreview, signal) =>
+    confirmTool(toolName, argsPreview, signal),
+  );
 
   /** TUI-native rendering for selected slash commands. Returns true when handled. */
   const handleTuiCommand = (input: string): boolean => {
@@ -951,8 +1433,14 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           new UserMessageComponent(messageText(event.message.content), markdownTheme),
         );
       } else if (event.message.role === "assistant") {
-        current = new AssistantMessageComponent(undefined, false, markdownTheme);
-        transcript.addChild(current);
+        // In slow mode the reply is not streamed into the transcript; it is
+        // paged at message_end. Streaming it live AND opening a pager over the
+        // same content would show it twice — the loader is the only progress
+        // indicator while it generates.
+        if (flags.mode !== "slow") {
+          current = new AssistantMessageComponent(undefined, false, markdownTheme);
+          transcript.addChild(current);
+        }
       }
     } else if (event.type === "message_update") {
       if (event.message.role === "assistant") {
@@ -978,6 +1466,12 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           transcript.addChild(new Text(redLine(`error: ${message.errorMessage ?? "unknown"}`)));
         } else {
           addAssistant(message);
+          // Slow mode: page the whole turn (thinking, answer, sources) in the
+          // real pager for deliberate reading; it stays in the transcript too.
+          const turnText = buildPagedTurnText(message);
+          if (flags.mode === "slow" && isLongOutput(turnText)) {
+            pageInTui(turnText);
+          }
         }
       }
     } else if (event.type === "tool_execution_start") {
@@ -1007,11 +1501,25 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
       }
     } else if (event.type === "tool_execution_end") {
       const component = toolComponents.get(event.toolCallId);
-      const result = event.result as { content?: { type: string }[]; details?: unknown };
+      const result = event.result as {
+        content?: { type: string; text?: string }[];
+        details?: unknown;
+      };
       component?.updateResult(
         { content: result?.content ?? [], details: result?.details, isError: event.isError },
         false,
       );
+      // Slow mode: offer the full tool result in the pager when it is long, so
+      // large outputs can be read without the inline component truncating them.
+      if (flags.mode === "slow" && !event.isError) {
+        const body = (result?.content ?? [])
+          .filter((c) => c.type === "text" && typeof c.text === "string")
+          .map((c) => c.text as string)
+          .join("\n");
+        if (body.length > 0 && isLongOutput(body)) {
+          pageInTui(body);
+        }
+      }
     }
     tui.requestRender();
   });
