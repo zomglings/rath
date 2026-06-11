@@ -71,24 +71,35 @@ async function main(): Promise<void> {
   // Case 3: schema migrated automatically, re-open idempotent.
   const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
   const dbFile = join(work, "rath.sqlite");
+  // Current migration count (v1 preferences, v2 cache); bump as migrations are
+  // added.
+  const SCHEMA_VERSION = 2;
   {
     const db = new DatabaseSync(dbFile);
     const version = db.prepare("PRAGMA user_version").get().user_version;
-    assert.equal(version, 1, "user_version reflects the applied migration count");
-    const table = db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'preferences'")
-      .get();
-    assert.ok(table, "preferences table exists");
+    assert.equal(version, SCHEMA_VERSION, "user_version reflects the applied migration count");
+    const tables = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('preferences','cache')",
+      )
+      .all()
+      .map((r: { name: string }) => r.name)
+      .sort();
+    assert.deepEqual(tables, ["cache", "preferences"], "both migrated tables exist");
     db.close();
   }
   // Re-open via the store (runs migrate again) — must not error or drift.
   assert.equal(loadPreferences().defaultModel, "openrouter-native/openai/gpt-4o");
   {
     const db = new DatabaseSync(dbFile);
-    assert.equal(db.prepare("PRAGMA user_version").get().user_version, 1, "no version drift");
+    assert.equal(
+      db.prepare("PRAGMA user_version").get().user_version,
+      SCHEMA_VERSION,
+      "no version drift",
+    );
     db.close();
   }
-  log("Case 3 OK: auto-migrated to v1, re-open idempotent");
+  log(`Case 3 OK: auto-migrated to v${SCHEMA_VERSION}, re-open idempotent`);
 
   // Case 4: a DB ahead of this build is left alone (no downgrade).
   {
