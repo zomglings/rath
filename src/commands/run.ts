@@ -390,8 +390,13 @@ interface Renderer {
  * goes to stdout (the deliverable, so `-p > file` captures just that);
  * thinking, hosted-tool markers, tool-execution lines, and errors go to
  * stderr as status.
+ *
+ * When `pageReplies` is set (the interactive REPL, never `-p`), slow mode
+ * buffers the answer instead of streaming it and pages the finished reply
+ * through $PAGER so it can be read deliberately; short replies and go mode
+ * stream/print as usual.
  */
-function attachRenderer(agent: Agent): Renderer {
+function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Renderer {
   // Track which stream has an unterminated line so the next block starts fresh.
   let openStream: NodeJS.WriteStream | null = null;
   const write = (stream: NodeJS.WriteStream, text: string) => {
@@ -406,14 +411,24 @@ function attachRenderer(agent: Agent): Renderer {
   };
   const seenHostedCalls = new Set<string>();
   let errored = false;
+  // True for the duration of a reply whose answer text is being buffered for
+  // paging rather than streamed live.
+  const bufferingReply = () => pageReplies && flags.mode === "slow";
+  let replyBuffer = "";
 
   agent.subscribe((event) => {
     if (event.type === "agent_start") {
       errored = false;
+    } else if (event.type === "message_start") {
+      replyBuffer = "";
     } else if (event.type === "message_update") {
       const e = event.assistantMessageEvent;
       if (e.type === "text_delta") {
-        write(process.stdout, e.delta);
+        if (bufferingReply()) {
+          replyBuffer += e.delta;
+        } else {
+          write(process.stdout, e.delta);
+        }
       } else if (e.type === "thinking_delta") {
         write(process.stderr, dim(e.delta));
       } else if (e.type === "text_end" || e.type === "thinking_end") {
@@ -454,7 +469,15 @@ function attachRenderer(agent: Agent): Renderer {
           return;
         }
         const trailer = applyCitationTrailer(message);
-        if (trailer) {
+        if (bufferingReply()) {
+          // Page the finished answer (with sources) through $PAGER; if it is
+          // not long enough to page (or stdout is not a TTY), print it.
+          const full = trailer ? `${replyBuffer}\n\n${trailer}` : replyBuffer;
+          if (!pagePlain(full, flags)) {
+            write(process.stdout, full.endsWith("\n") ? full : `${full}\n`);
+          }
+          replyBuffer = "";
+        } else if (trailer) {
           write(process.stderr, `${dim(trailer)}\n`);
         }
       }
@@ -852,7 +875,8 @@ export const runCommand: Command = {
     };
 
     if (flags.prompt !== undefined) {
-      const renderer = attachRenderer(agent);
+      // One-shot streams the answer to stdout (scriptable; never paged).
+      const renderer = attachRenderer(agent, flags, false);
       // One-shot is non-interactive: there is no human to confirm tool calls,
       // so slow mode denies them rather than running them unattended. go mode
       // (the default) keeps the pass-through, so -p behavior is unchanged.
@@ -873,7 +897,8 @@ export const runCommand: Command = {
       return code;
     }
 
-    const renderer = attachRenderer(agent);
+    // Interactive REPL: in slow mode, page long replies (pageReplies = true).
+    const renderer = attachRenderer(agent, flags, true);
     process.stderr.write(
       `${dim(`model: ${flags.model} | mode: ${flags.mode} | /info for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
     );
@@ -1446,6 +1471,22 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           transcript.addChild(new Text(redLine(`error: ${message.errorMessage ?? "unknown"}`)));
         } else {
           addAssistant(message);
+          // Slow mode: a long reply streamed into the transcript scrolls off
+          // and the transcript is not scrollable in place, so open it in the
+          // pager for deliberate reading. It stays in the transcript too.
+          const replyText = contentBlocks(message)
+            .filter((b) => b.type === "text")
+            .map((b) => (b as { text: string }).text)
+            .join("\n\n")
+            .trim();
+          if (flags.mode === "slow" && isLongOutput(replyText)) {
+            transcript.addChild(
+              new Text(
+                dimLine(`[reply paged (${replyText.split("\n").length} lines) — q to close]`),
+              ),
+            );
+            openPager(replyText);
+          }
         }
       }
     } else if (event.type === "tool_execution_start") {
