@@ -140,6 +140,18 @@ export function uniqueUrlCitations(message: AssistantMessage): UrlCitation[] {
   return [...seen.values()];
 }
 
+/** Render the message's unique URL citations to "Sources:" trailer text, or
+ * undefined when there are none. The single source of truth for trailer text,
+ * so the display/persistence trailer and the flattened-handoff trailer match. */
+function renderCitationTrailer(message: AssistantMessage): string | undefined {
+  const citations = uniqueUrlCitations(message);
+  if (citations.length === 0) {
+    return undefined;
+  }
+  const lines = citations.map((c) => `- ${c.title ? `${c.title} — ` : ""}${c.url}`);
+  return `Sources:\n${lines.join("\n")}`;
+}
+
 /**
  * Render the message's citations and append them as a marked text block.
  * Idempotent. Returns the trailer text, or undefined when there is nothing
@@ -149,12 +161,10 @@ export function applyCitationTrailer(message: AssistantMessage): string | undefi
   if (message.content.some(isRenderedCitations)) {
     return undefined;
   }
-  const citations = uniqueUrlCitations(message);
-  if (citations.length === 0) {
+  const trailer = renderCitationTrailer(message);
+  if (trailer === undefined) {
     return undefined;
   }
-  const lines = citations.map((c) => `- ${c.title ? `${c.title} — ` : ""}${c.url}`);
-  const trailer = `Sources:\n${lines.join("\n")}`;
   const block: RenderedCitationsBlock = { type: "text", text: trailer, renderedCitations: true };
   (message.content as unknown as RenderedCitationsBlock[]).push(block);
   return trailer;
@@ -170,4 +180,158 @@ export function stripRenderedCitations(message: AssistantMessage): AssistantMess
     return message;
   }
   return { ...message, content: message.content.filter((b) => !isRenderedCitations(b)) };
+}
+
+// ---------------------------------------------------------------------------
+// Flatten-on-handoff
+// ---------------------------------------------------------------------------
+
+/**
+ * Render a hosted tool call's `raw` item to a single descriptive text line.
+ *
+ * Provider-agnostic: hosted-tools.ts must not depend on a provider SDK, so we
+ * probe the raw item structurally for the fields rath providers are known to
+ * populate (today: the OpenAI Responses API web_search_call / file_search_call
+ * / code_interpreter_call / image_generation_call shapes) rather than import
+ * their types. Unknown shapes degrade to a generic "[toolName] (status)" line —
+ * the foreign model still learns a server-side tool ran, which is the whole
+ * point, even if we cannot name the query.
+ */
+function renderHostedToolCall(block: HostedToolCallContent): string {
+  const raw = block.raw as Record<string, unknown> | null | undefined;
+  const label = block.toolName || "hosted tool";
+  const status = block.status ? ` (${block.status})` : "";
+  const detail = raw ? hostedToolDetail(raw) : "";
+  return `[${label}${status}]${detail ? ` ${detail}` : ""}`;
+}
+
+/** A flat list of strings from an unknown array field, dropping non-strings. */
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+/**
+ * Pull human-readable detail out of a raw hosted-tool item. Knows the OpenAI
+ * Responses API web/file/code/image shapes structurally; returns "" when it
+ * recognizes nothing, so the caller still emits the generic label line.
+ */
+function hostedToolDetail(raw: Record<string, unknown>): string {
+  // web_search_call: query/queries + sources live under `action`.
+  const action = raw.action as Record<string, unknown> | undefined;
+  if (action && typeof action.type === "string") {
+    if (action.type === "search") {
+      const queries = stringList(action.queries);
+      if (queries.length === 0 && typeof action.query === "string") {
+        queries.push(action.query);
+      }
+      const sources = Array.isArray(action.sources)
+        ? (action.sources as Record<string, unknown>[])
+            .map((s) => (typeof s.url === "string" ? s.url : undefined))
+            .filter((u): u is string => u !== undefined)
+        : [];
+      const parts: string[] = [];
+      if (queries.length > 0) {
+        parts.push(`searched: ${queries.map((q) => `"${q}"`).join(", ")}`);
+      }
+      if (sources.length > 0) {
+        parts.push(`sources: ${sources.join(", ")}`);
+      }
+      return parts.join("; ");
+    }
+    if (action.type === "open_page" && typeof action.url === "string") {
+      return `opened: ${action.url}`;
+    }
+    if (action.type === "find_in_page" && typeof action.url === "string") {
+      const pattern = typeof action.pattern === "string" ? ` for "${action.pattern}"` : "";
+      return `searched in ${action.url}${pattern}`;
+    }
+  }
+  // file_search_call: top-level `queries`.
+  const queries = stringList(raw.queries);
+  if (queries.length > 0) {
+    return `queried: ${queries.map((q) => `"${q}"`).join(", ")}`;
+  }
+  // code_interpreter_call: top-level `code`.
+  if (typeof raw.code === "string" && raw.code.length > 0) {
+    const code = raw.code.replace(/\s+/g, " ").trim();
+    return `ran code: ${code.length > 200 ? `${code.slice(0, 200)}…` : code}`;
+  }
+  return "";
+}
+
+/**
+ * Flatten an assistant message's extended content into blocks a foreign
+ * provider (one whose pi-ai converter only understands text | thinking |
+ * toolCall) preserves. Used before handing a context built on one provider to
+ * a different provider: that converter SILENTLY DROPS hostedToolCall blocks and
+ * ignores inline citations, so the foreign model would otherwise lose all
+ * record that a server-side search ran and what it found.
+ *
+ * The transformation, in original block order:
+ *  - `hostedToolCall` blocks -> a descriptive text block ("[web_search]
+ *    searched: "…"; sources: …"). PLAIN TEXT, not a synthetic
+ *    toolCall+toolResult pair: a toolCall with no matching toolResult (or the
+ *    reverse) breaks the provider's call/result pairing and the API rejects the
+ *    turn; the hosted call has no client-side counterpart to pair with. Plain
+ *    text inserted in place is the simpler, safer representation and reads as
+ *    ordinary history.
+ *  - `thinking` blocks -> dropped (a foreign provider rejects another
+ *    provider's thinking signatures).
+ *  - citation-bearing text -> the text is kept as-is and a single rendered
+ *    "Sources:" trailer is ensured (the same trailer applyCitationTrailer
+ *    produces). If the message already carries that trailer it is reused, so
+ *    we never double-render; inline `citations` arrays are left on the text
+ *    block (harmless to a foreign provider, which ignores them) and surfaced
+ *    through the trailer instead.
+ *
+ * Idempotent (re-flattening adds no second trailer, and there are no
+ * hostedToolCall/thinking blocks left to render) and a no-op (returns the same
+ * message reference) for messages with no extended content.
+ */
+export function flattenHostedContent(message: AssistantMessage): AssistantMessage {
+  const blocks = contentBlocks(message);
+  const hasHosted = blocks.some(isHostedToolCall);
+  const hasThinking = blocks.some((b) => b.type === "thinking");
+  const trailer = applyCitationTrailerText(message);
+  // No extended content to flatten: same reference back (no-op, idempotent).
+  if (!hasHosted && !hasThinking && trailer === undefined) {
+    return message;
+  }
+  const flattened: HostedContentBlock[] = [];
+  for (const block of blocks) {
+    if (block.type === "thinking") {
+      continue;
+    }
+    // Drop any existing rendered-citations trailer; the single canonical
+    // trailer is re-appended below, so keeping this one would double-render on
+    // a second flatten pass (idempotency).
+    if (isRenderedCitations(block)) {
+      continue;
+    }
+    if (isHostedToolCall(block)) {
+      flattened.push({ type: "text", text: renderHostedToolCall(block) });
+      continue;
+    }
+    flattened.push(block);
+  }
+  if (trailer !== undefined) {
+    const block: RenderedCitationsBlock = { type: "text", text: trailer, renderedCitations: true };
+    flattened.push(block);
+  }
+  return { ...message, content: flattened as unknown as AssistantMessage["content"] };
+}
+
+/**
+ * The citations trailer text this message should carry, without mutating it:
+ * the existing trailer if one is present, a freshly rendered one if inline
+ * citations exist, or undefined if there is nothing to render. Mirrors
+ * applyCitationTrailer's rendering so the flattened trailer matches the
+ * display/persistence trailer exactly (no double-render on idempotent reflatten).
+ */
+function applyCitationTrailerText(message: AssistantMessage): string | undefined {
+  const existing = message.content.find(isRenderedCitations);
+  if (existing) {
+    return (existing as RenderedCitationsBlock).text;
+  }
+  return renderCitationTrailer(message);
 }

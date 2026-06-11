@@ -41,6 +41,7 @@ import { type Command, fullName, helpText } from "../command.js";
 import {
   applyCitationTrailer,
   contentBlocks,
+  flattenHostedContent,
   isHostedToolCall,
   OPENAI_NATIVE_API,
   openaiNativeModel,
@@ -615,20 +616,24 @@ export const runCommand: Command = {
             if (m.stopReason === "error" || m.stopReason === "aborted") {
               return [];
             }
-            const native = agent.state.model.api === OPENAI_NATIVE_API;
-            // The rendered citation trailer is for display/persistence;
-            // openai-native reconstructs the real annotations itself, so strip
-            // it before replay. Foreign providers get it as plain text.
-            const stripped = native ? stripRenderedCitations(m) : m;
-            // Thinking signatures are provider-specific; a foreign provider
-            // rejects openai-native's. Drop thinking blocks on cross-provider
-            // replay (the proper flatten-on-handoff is a follow-up).
-            if (!native && m.api === OPENAI_NATIVE_API) {
-              return [
-                { ...stripped, content: stripped.content.filter((b) => b.type !== "thinking") },
-              ];
+            // Same-provider replay must stay byte-identical to what the model
+            // produced, or the prompt/KV cache prefix breaks. Compare the
+            // message's PRODUCING api to the currently-selected model's api.
+            const sameProvider = m.api === agent.state.model.api;
+            if (sameProvider) {
+              // The rendered citation trailer is a display/persistence artifact;
+              // the producing provider reconstructs the real annotations itself,
+              // so strip the trailer before replay. (For openai-native the
+              // provider's converter also strips it defensively; doing it here
+              // keeps the wire payload identical for any same-provider replay.)
+              return [stripRenderedCitations(m)];
             }
-            return [stripped];
+            // Cross-provider handoff: the foreign provider's converter only
+            // understands text | thinking | toolCall and would silently drop
+            // hostedToolCall blocks, ignore inline citations, and reject the
+            // producing provider's thinking signatures. Flatten the extended
+            // content to plain text the foreign provider preserves.
+            return [flattenHostedContent(m)];
           });
         },
       });

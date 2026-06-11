@@ -4,6 +4,7 @@ export {
   type ContainerFileCitation,
   contentBlocks,
   type FileCitation,
+  flattenHostedContent,
   getCitations,
   getHostedToolCalls,
   type HostedContentBlock,
