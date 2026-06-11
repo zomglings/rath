@@ -568,24 +568,6 @@ export function makeBeforeToolCall(
 }
 
 /**
- * Page `text` in the plain REPL when in slow mode and the output is long.
- * Returns true when it was handed to a pager (so the caller skips its own
- * printing); false when nothing was paged and the caller should print normally.
- *
- * Falls back to no-paging (returns false) when not in slow mode, the output is
- * short, stdout/stdin are not a TTY, or no usable pager is found.
- *
- * The text is written to a temp file and the pager is run as `pager <file>`
- * with full "inherit" stdio. This is deliberate: piping the text on the pager's
- * stdin would steal the keyboard (less detects a non-TTY stdin and dumps the
- * content like cat instead of paging). With the content in a file, stdin stays
- * the terminal so the pager reads keypresses. The synchronous `spawnSync`
- * blocks the event loop for the pager's lifetime — so even though this is now
- * called from the message_end handler mid-`agent.prompt()` (not only between
- * turns), the readline interface's line callback cannot fire while the pager
- * owns the terminal. The temp file is removed afterward.
- */
-/**
  * Build the readable text of a finished assistant turn for the pager: thinking
  * (labeled), the answer, and the rendered Sources trailer, in content order.
  * Hosted/function tool-call blocks are omitted (their results are paged
@@ -609,16 +591,23 @@ export function buildPagedTurnText(message: AssistantMessage): string {
   return parts.join("\n\n");
 }
 
-export function pagePlain(text: string, flags: RunFlags): boolean {
-  if (flags.mode !== "slow" || !isLongOutput(text)) {
-    return false;
-  }
-  if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    return false;
-  }
+/**
+ * Run the external pager ($PAGER, default `less -R`) on `text`, full-screen,
+ * with vim/arrow/PgUp-PgDn navigation and search — i.e. real less behavior.
+ * Returns true when the pager ran, false when no usable pager was found or it
+ * exited abnormally (the caller should then render the content itself).
+ *
+ * The text is written to a temp file and the pager is run as `pager <file>`
+ * with inherited stdio so it owns the terminal (drawing to the screen, reading
+ * the keyboard). Piping on the pager's stdin instead would make less detect a
+ * non-TTY stdin and dump like cat. The synchronous `spawnSync` blocks the
+ * event loop for the pager's lifetime; the temp file is removed afterward. The
+ * caller must own the terminal first (the plain REPL is between reads; the TUI
+ * suspends itself with tui.stop()).
+ */
+export function runExternalPager(text: string): boolean {
   const pagerEnv = (process.env.PAGER ?? "").trim();
-  // Default to `less -R` so ANSI colors in the text render. Split on spaces so
-  // PAGER="less -R" works; this is the common shell convention.
+  // Split on spaces so PAGER="less -R" works (the common shell convention).
   const parts = pagerEnv.length > 0 ? pagerEnv.split(/\s+/) : ["less", "-R"];
   const [cmd, ...rest] = parts;
   if (!cmd) {
@@ -629,14 +618,7 @@ export function pagePlain(text: string, flags: RunFlags): boolean {
     dir = mkdtempSync(join(tmpdir(), "rath-pager-"));
     const file = join(dir, "output.txt");
     writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`);
-    process.stderr.write(dim(`[paging long output through ${cmd}]\n`));
-    const result = spawnSync(cmd, [...rest, file], {
-      // Inherit all three streams so the pager owns the terminal: it draws to
-      // the screen and reads the keyboard from the real stdin TTY.
-      stdio: "inherit",
-    });
-    // Pager missing/unspawnable, or it exited abnormally (broken $PAGER): fall
-    // back to the caller printing plainly so the content is never lost.
+    const result = spawnSync(cmd, [...rest, file], { stdio: "inherit" });
     if (result.error || (typeof result.status === "number" && result.status !== 0)) {
       return false;
     }
@@ -645,10 +627,20 @@ export function pagePlain(text: string, flags: RunFlags): boolean {
     return false;
   } finally {
     if (dir) {
-      // Always remove the temp dir, even if the pager errored.
       rmSync(dir, { recursive: true, force: true });
     }
   }
+}
+
+/** Page `text` in the plain REPL when in slow mode and the output is long. */
+export function pagePlain(text: string, flags: RunFlags): boolean {
+  if (flags.mode !== "slow" || !isLongOutput(text)) {
+    return false;
+  }
+  if (!process.stdout.isTTY || !process.stdin.isTTY) {
+    return false;
+  }
+  return runExternalPager(text);
 }
 
 export const runCommand: Command = {
@@ -1095,7 +1087,6 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
     Text,
     truncateToWidth,
     TUI,
-    wrapTextWithAnsi,
   } = piTui;
   const {
     AssistantMessageComponent,
@@ -1190,137 +1181,33 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
   // PageUp,PageDown / space / g,G scroll, q or Escape dismiss. Used so long
   // output (long /sys, /lsmodels, large tool results) can be read without
   // scrolling the whole transcript past it.
-  class Pager implements PiTui.Component {
-    private top = 0;
-    private wrapped: string[] = [];
-    private wrapWidth = -1;
-    private viewport = 10;
-    constructor(
-      private readonly text: string,
-      private readonly onClose: () => void,
-    ) {}
-    private rewrap(width: number): void {
-      if (width === this.wrapWidth) {
-        return;
-      }
-      this.wrapWidth = width;
-      this.wrapped = this.text.split("\n").flatMap((line) => {
-        const out = wrapTextWithAnsi(line, width);
-        return out.length > 0 ? out : [""];
-      });
-      this.clampTop();
-    }
-    private clampTop(): void {
-      const max = Math.max(0, this.wrapped.length - this.viewport);
-      this.top = Math.min(Math.max(0, this.top), max);
-    }
-    render(width: number): string[] {
-      this.rewrap(width);
-      // Reserve one row for the status footer; overlay maxHeight caps the rest.
-      const bodyRows = Math.max(1, this.viewport);
-      const end = Math.min(this.wrapped.length, this.top + bodyRows);
-      const body = this.wrapped.slice(this.top, end).map((l) => truncateToWidth(l, width));
-      while (body.length < bodyRows) {
-        body.push("");
-      }
-      const atEnd = end >= this.wrapped.length;
-      const pct =
-        this.wrapped.length <= bodyRows
-          ? "ALL"
-          : `${Math.round((end / this.wrapped.length) * 100)}%`;
-      const footer = truncateToWidth(
-        dimLine(`── pager ${pct}${atEnd ? " (END)" : ""} — ↑↓/jk/space/g/G scroll, q to close ──`),
-        width,
-      );
-      return [...body, footer];
-    }
-    // The overlay's allotted rows drive the viewport; derive it from the last
-    // render height via setViewport, called by the opener after sizing.
-    setViewport(rows: number): void {
-      this.viewport = Math.max(1, rows - 1);
-      this.clampTop();
-    }
-    handleInput(data: string): void {
-      const page = Math.max(1, this.viewport - 1);
-      if (matchesKey(data, "up") || matchesKey(data, "k")) {
-        this.top -= 1;
-      } else if (matchesKey(data, "down") || matchesKey(data, "j")) {
-        this.top += 1;
-      } else if (matchesKey(data, "pageUp") || matchesKey(data, "b")) {
-        this.top -= page;
-      } else if (
-        matchesKey(data, "pageDown") ||
-        matchesKey(data, "space") ||
-        matchesKey(data, "f")
-      ) {
-        this.top += page;
-      } else if (matchesKey(data, "g") || matchesKey(data, "home")) {
-        this.top = 0;
-      } else if (matchesKey(data, "shift+g") || matchesKey(data, "end")) {
-        this.top = this.wrapped.length;
-      } else if (
-        matchesKey(data, "q") ||
-        matchesKey(data, "shift+q") ||
-        matchesKey(data, "escape")
-      ) {
-        this.onClose();
-        return;
-      } else {
-        return;
-      }
-      this.clampTop();
+  // Page long text the way the user expects a pager to behave: suspend the TUI
+  // and hand the whole terminal to the real $PAGER (less), which gives
+  // full-screen rendering and the full set of less/vim keybindings (arrows,
+  // PgUp/PgDn, j/k, g/G, /search, q) for free — far better than a half-screen
+  // overlay that the transcript bleeds through. spawnSync blocks until the
+  // pager exits, so calls serialize naturally (no queue needed); afterward the
+  // TUI is restarted and re-renders the transcript. Returns true if it paged.
+  const pageInTui = (text: string): boolean => {
+    tui.stop();
+    let paged = false;
+    try {
+      paged = runExternalPager(text);
+    } finally {
+      tui.start();
       tui.requestRender();
     }
-    invalidate(): void {
-      this.wrapWidth = -1;
-    }
-  }
-
-  // Pagers are serialized through a queue: parallel tool completions can each
-  // request paging, and stacking overlays would race for focus. One pager is
-  // shown at a time; closing it opens the next (or returns focus to the editor).
-  const pagerQueue: string[] = [];
-  let pagerOpen = false;
-  const showNextPager = (): void => {
-    const text = pagerQueue.shift();
-    if (text === undefined) {
-      pagerOpen = false;
-      // The last pager's handle.hide() already restored focus to the overlay
-      // underneath (or the editor); do not force it to the editor here, which
-      // would strand a still-open overlay (e.g. a confirm) unfocused.
-      tui.requestRender();
-      return;
-    }
-    pagerOpen = true;
-    const rows = Math.max(6, Math.floor((process.stdout.rows || 24) * 0.7));
-    const close = () => {
-      handle.hide();
-      showNextPager();
-    };
-    const pager = new Pager(text, close);
-    pager.setViewport(rows - 2);
-    const handle = tui.showOverlay(pager, { width: "90%", maxHeight: rows });
-    handle.focus();
-    tui.requestRender();
-  };
-  const openPager = (text: string): void => {
-    pagerQueue.push(text);
-    if (!pagerOpen) {
-      showNextPager();
-    }
+    return paged;
   };
 
-  // In slow mode, page long text in an overlay; otherwise add it inline. The
-  // `addInline` callback owns the non-paged rendering so callers keep their
-  // own styling (dim vs red, padding, etc.).
+  // In slow mode, page long text; otherwise (or if no usable pager) add it
+  // inline. The `addInline` callback owns the non-paged rendering so callers
+  // keep their own styling (dim vs red, padding, etc.).
   const pageOrShow = (text: string, addInline: () => void): void => {
     if (flags.mode === "slow" && isLongOutput(text)) {
-      // Note what triggered paging in the transcript (writing to stderr would
-      // corrupt the TUI's differential rendering).
-      transcript.addChild(
-        new Text(dimLine(`[paging long output (${text.split("\n").length} lines)]`)),
-      );
-      openPager(text);
+      if (!pageInTui(text)) {
+        addInline();
+      }
     } else {
       addInline();
     }
@@ -1532,16 +1419,11 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           transcript.addChild(new Text(redLine(`error: ${message.errorMessage ?? "unknown"}`)));
         } else {
           addAssistant(message);
-          // Slow mode: a long turn streamed into the transcript scrolls off
-          // and the transcript is not scrollable in place, so open the whole
-          // turn (thinking, answer, sources) in the pager for deliberate
-          // reading. It stays in the transcript too.
+          // Slow mode: page the whole turn (thinking, answer, sources) in the
+          // real pager for deliberate reading; it stays in the transcript too.
           const turnText = buildPagedTurnText(message);
           if (flags.mode === "slow" && isLongOutput(turnText)) {
-            transcript.addChild(
-              new Text(dimLine(`[turn paged (${turnText.split("\n").length} lines) — q to close]`)),
-            );
-            openPager(turnText);
+            pageInTui(turnText);
           }
         }
       }
@@ -1580,7 +1462,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
         { content: result?.content ?? [], details: result?.details, isError: event.isError },
         false,
       );
-      // Slow mode: offer the full tool result in a pager when it is long, so
+      // Slow mode: offer the full tool result in the pager when it is long, so
       // large outputs can be read without the inline component truncating them.
       if (flags.mode === "slow" && !event.isError) {
         const body = (result?.content ?? [])
@@ -1588,12 +1470,7 @@ async function runTui(agent: Agent, flags: RunFlags): Promise<number> {
           .map((c) => c.text as string)
           .join("\n");
         if (body.length > 0 && isLongOutput(body)) {
-          transcript.addChild(
-            new Text(
-              dimLine(`[paging ${event.toolName} result (${body.split("\n").length} lines)]`),
-            ),
-          );
-          openPager(body);
+          pageInTui(body);
         }
       }
     }
