@@ -53,7 +53,7 @@ export interface StatuslineData {
   lastInteraction?: number;
 }
 
-export const STATUSLINE_BAR_WIDTH = 20;
+export const STATUSLINE_BAR_WIDTH = 30;
 
 /** Cells of the context bar assigned to each usage category. */
 export interface BarSegments {
@@ -65,31 +65,47 @@ export interface BarSegments {
 }
 
 /**
- * Apportion the bar's cells to the usage categories, proportional to the
- * context window, with a floor of one cell for any non-zero category (small
- * usage must be visible). The floors can push the total past the bar width
- * for tiny windows; empty clamps at zero and the bar renders slightly long
- * rather than lying by omission.
+ * Apportion the bar's cells to the usage categories. Boundaries are placed by
+ * cumulative rounding — each category's cell count is the rounded cumulative
+ * total minus the cells already assigned — so the bar's overall fill tracks
+ * total usage (growth spread across categories still moves the boundary; the
+ * per-category-floor() alternative swallows it). Any non-zero category still
+ * gets at least one cell so small-but-present usage is visible; the floors
+ * can push the total past the bar width for tiny windows, in which case empty
+ * clamps at zero and the bar renders slightly long rather than lying by
+ * omission.
  */
 export function barSegments(
   usage: ContextUsage,
   contextWindow: number,
   barWidth = STATUSLINE_BAR_WIDTH,
 ): BarSegments {
-  const cell = (tokens: number): number => {
-    if (tokens <= 0 || contextWindow <= 0) {
-      return 0;
+  if (contextWindow <= 0) {
+    return { cacheRead: 0, cacheWrite: 0, input: 0, output: 0, empty: barWidth };
+  }
+  // Bar order: cache reads, cache writes, fresh input, output.
+  const counts = [usage.cacheRead, usage.cacheWrite, usage.input, usage.output];
+  const cells: number[] = [];
+  let cumulative = 0;
+  let assigned = 0;
+  for (const tokens of counts) {
+    cumulative += Math.max(0, tokens);
+    let n = Math.round((cumulative * barWidth) / contextWindow) - assigned;
+    if (tokens > 0 && n <= 0) {
+      n = 1; // visibility floor: non-zero usage must show
+    } else if (n < 0) {
+      n = 0; // an earlier floor overshot the boundary; do not go negative
     }
-    return Math.max(1, Math.floor((tokens * barWidth) / contextWindow));
+    assigned += n;
+    cells.push(n);
+  }
+  return {
+    cacheRead: cells[0]!,
+    cacheWrite: cells[1]!,
+    input: cells[2]!,
+    output: cells[3]!,
+    empty: Math.max(0, barWidth - assigned),
   };
-  const segments = {
-    cacheRead: cell(usage.cacheRead),
-    cacheWrite: cell(usage.cacheWrite),
-    input: cell(usage.input),
-    output: cell(usage.output),
-  };
-  const filled = segments.cacheRead + segments.cacheWrite + segments.input + segments.output;
-  return { ...segments, empty: Math.max(0, barWidth - filled) };
 }
 
 /** 12345 -> "12k"; counts below 1000 are shown exactly. */
@@ -139,20 +155,32 @@ export function gitInfo(cwd: string): GitInfo | undefined {
 
 // Statusline palette. Plain ANSI codes (not pi-tui theme styles) so the module
 // stays terminal-library-free; the statusline is a fixed informational strip,
-// not themed content.
+// not themed content. All colors are 256-color palette indices with no
+// attributes (no bold/dim): attribute changes can make terminals substitute
+// font weights, whose block glyphs may not align with the regular face — the
+// bar must be one seamless strip. (Notably, dim (SGR 2) is sticky: a later
+// color code does not clear it, and dim is exactly the attribute terminals
+// most often render with a thinner font.)
 const RESET = "\x1b[0m";
 const BOLD_CYAN = "\x1b[1;36m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const RED = "\x1b[31m";
+const GREEN = "\x1b[38;5;2m";
+const YELLOW = "\x1b[38;5;3m";
+const RED = "\x1b[38;5;1m";
 const ORANGE = "\x1b[38;5;208m";
-const DIM_WHITE = "\x1b[2;37m";
-const DARK_GRAY = "\x1b[90m";
-const BLUE = "\x1b[34m";
-const PINK = "\x1b[38;2;255;182;193m";
+const DIM_WHITE = "\x1b[38;5;245m";
+const DARK_GRAY = "\x1b[38;5;238m";
+const BLUE = "\x1b[38;5;4m";
+// 218 is the closest xterm-256 index to light pink (255,182,193); truecolor
+// (38;2;r;g;b) is avoided because macOS Terminal.app does not support it.
+const PINK = "\x1b[38;5;218m";
 
 const FULL_BLOCK = "█";
 const LIGHT_SHADE = "░";
+// Leading-edge partial cell, in eighths: PARTIAL_BLOCKS[k-1] is k/8 of a cell.
+// One cell of a 30-wide bar over a 200k window is ~6.7k tokens — too coarse to
+// see a single turn's growth — so the first empty cell renders as a partial
+// block, giving ~8x finer visible progress.
+const PARTIAL_BLOCKS = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"] as const;
 
 const GIT_STATE_COLOR: Record<GitTreeState, string> = {
   conflict: RED,
@@ -179,6 +207,22 @@ export function renderStatusline(data: StatuslineData): string {
     const { input, output, cacheRead, cacheWrite } = data.usage;
     const used = input + output + cacheRead + cacheWrite;
     const seg = barSegments(data.usage, data.contextWindow);
+    const filled = seg.cacheRead + seg.cacheWrite + seg.input + seg.output;
+    // Sub-cell progress: when the exact fill exceeds the whole cells drawn,
+    // render the leading empty cell as a partial block in the color of the
+    // last non-zero category. Skipped when the visibility floors already
+    // overdrew (exact < filled) or the bar is full.
+    let partial = "";
+    let empty = seg.empty;
+    if (empty > 0) {
+      const exact = (used * STATUSLINE_BAR_WIDTH) / data.contextWindow;
+      const eighths = Math.floor((exact - filled) * 8);
+      if (eighths >= 1) {
+        const color = output > 0 ? DIM_WHITE : input > 0 ? ORANGE : cacheWrite > 0 ? YELLOW : GREEN;
+        partial = `${color}${PARTIAL_BLOCKS[Math.min(eighths, 7) - 1]}`;
+        empty -= 1;
+      }
+    }
     const bar =
       GREEN +
       FULL_BLOCK.repeat(seg.cacheRead) +
@@ -188,8 +232,9 @@ export function renderStatusline(data: StatuslineData): string {
       FULL_BLOCK.repeat(seg.input) +
       DIM_WHITE +
       FULL_BLOCK.repeat(seg.output) +
+      partial +
       DARK_GRAY +
-      LIGHT_SHADE.repeat(seg.empty) +
+      LIGHT_SHADE.repeat(empty) +
       RESET;
     const pct = Math.floor((used * 100) / data.contextWindow);
     gauge = `[${bar}] ${formatTokens(used)}/${formatTokens(data.contextWindow)} (${pct}%)`;

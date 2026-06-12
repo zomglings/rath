@@ -34,6 +34,13 @@ export {
   uniqueUrlCitations,
 } from "./hosted-tools.js";
 export {
+  DEFAULT_DEFAULT_MODEL,
+  listModels,
+  REASONING_LEVELS,
+  type ReasoningLevel,
+  resolveModel,
+} from "./models.js";
+export {
   convertNativeMessages,
   type HostedToolCallItem,
   type HostedToolName,

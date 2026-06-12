@@ -167,12 +167,16 @@ list to choose), since rath development inside `rath run` wants them on hand.
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
 - `--tools` enables client-side tools (the full set:
-  `read,bash,edit,write,grep,find,ls,request_human_edit,configure,list_models,save_context,end_session`).
+  `read,bash,edit,write,grep,find,ls,request_human_edit,barbarian_review,configure,list_models,save_context,end_session`).
   Omitting `--tools` enables all of them; `--tools none` disables them. The
   first seven come from `@earendil-works/pi-coding-agent` and run with your
   privileges in the current directory; the rest are rath's own tools, which
   give the model the same controls over the session that you have through the
   slash commands — the agent operates the harness as a peer, not a passenger.
+- `barbarian_review` spawns the Barbarian Reviewer (see `rath barbarian`
+  below) from inside a session: the model can ask for an adversarial review
+  of a repo's changes and gets the findings report back as the tool result,
+  optionally choosing the barbarian's model and reasoning level.
 - `request_human_edit` is rath's human-in-the-loop tool: it opens a file in
   your editor (`$VISUAL`/`$EDITOR`, falling back to the first of `code`, `vim`,
   `emacs`, `nano` on PATH; GUI editors like `code`/`cursor` get `--wait`
@@ -191,6 +195,32 @@ list to choose), since rath development inside `rath run` wants them on hand.
   — and in go mode they apply immediately.
 - `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
   from one.
+
+### rath barbarian
+
+`rath barbarian` runs the Barbarian Reviewer: a non-interactive subagent
+(`src/agents/barbarian.ts`) that adversarially reviews the changes from a
+source commit-ish to a target commit-ish in a git repository and writes a
+findings report. It is not a linter — it hunts defects (correctness,
+regressions, broken contracts, security exposure, bad tests, incomplete
+changes) and is expected to prove findings by reproduction where possible,
+staging disposable `git worktree`s under a temp artifact root.
+
+- Defaults: `--source` is `main` (falling back to `master`); `--target` is
+  the current repository state — staged, unstaged, and untracked changes
+  captured as a synthetic commit in a disposable worktree, so the review
+  covers work in progress without ever touching your tree.
+- `--repo` points at any path inside the target repository (default: cwd).
+- `--model` and `--reasoning` choose the barbarian's model (default: the
+  pinned default model) and effort (default: `high`).
+- `--output` names the findings file (relative to the repo root); by default
+  it lands in the artifact root. `--instructions` appends extra reviewer
+  instructions to the prompt.
+- The findings report prints to stdout; progress and the artifact/findings
+  paths go to stderr. Hosted web search is disabled for the barbarian (an
+  unattended agent has no business following injectable web content).
+- The same agent is available inside `rath run` as the `barbarian_review`
+  tool.
 
 ## Integration tests
 
@@ -222,8 +252,8 @@ cost real money (fractions of a cent in tokens, plus per-use fees for hosted
 tools such as web search and code interpreter containers), which is why they
 are not part of the pre-commit checks. (Several tests are the exception:
 `request-human-edit`, `config-preferences`, `configure-tool`, `session-tools`,
-`slow-mode-gate`, and `statusline` call no API and need no key — they exercise
-the CLI tools and config store directly; `catalogue` needs network but no key, hitting
+`slow-mode-gate`, `statusline`, and `barbarian-git` call no API and need no
+key — they exercise the CLI tools and config store directly; `catalogue` needs network but no key, hitting
 OpenRouter's keyless `/api/v1/models`, and skips cleanly when offline.)
 `RATH_TEST_MODEL` overrides the model used by the
 API tests (default: `gpt-5.5`; the OpenRouter test uses `openai/gpt-5.5`).
@@ -272,6 +302,11 @@ to prove what was actually sent to the API.
   token/timestamp formatting, full-line rendering with and without usage, and
   `gitInfo` against throwaway repositories in each working-tree state (unborn
   branch, clean, dirty, detached HEAD, not-a-repo).
+- `barbarian-git` — the Barbarian Reviewer's git plumbing (no API, no key):
+  repo-root resolution, the main→master source fallback, change detection,
+  and the synthetic target commit (staged + unstaged + untracked captured in
+  a disposable worktree, with the user's tree left untouched and the diff
+  covering exactly the working-tree changes).
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

@@ -34,11 +34,7 @@ import {
 import {
   type Api,
   type AssistantMessage,
-  getModel,
-  getModels,
-  getProviders,
   getSupportedThinkingLevels,
-  type KnownProvider,
   type Message,
   type Model,
   type SimpleStreamOptions,
@@ -47,7 +43,7 @@ import {
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { ensureCatalogue, openRouterCatalogue } from "../catalogue.js";
+import { ensureCatalogue } from "../catalogue.js";
 import { type Command, fullName, helpText } from "../command.js";
 import { clearDefaultModel, loadPreferences, setDefaultModel } from "../config.js";
 import {
@@ -55,16 +51,20 @@ import {
   contentBlocks,
   flattenHostedContent,
   isHostedToolCall,
-  OPENAI_NATIVE_API,
-  OPENROUTER_NATIVE_API,
-  openaiNativeModel,
-  openrouterNativeModel,
   registerOpenAINative,
   registerOpenRouterNative,
   stripRenderedCitations,
   uniqueUrlCitations,
 } from "../index.js";
+import {
+  DEFAULT_DEFAULT_MODEL,
+  listModels,
+  REASONING_LEVELS,
+  type ReasoningLevel,
+  resolveModel,
+} from "../models.js";
 import { gitInfo, renderStatusline, type StatuslineData } from "../statusline.js";
+import { createBarbarianReviewTool } from "../tools/barbarian.js";
 import { createRequestHumanEditTool } from "../tools/request-human-edit.js";
 import { isOnPath } from "../which.js";
 
@@ -78,9 +78,6 @@ function dim(text: string): string {
   return process.stderr.isTTY ? `${DIM}${text}${RESET}` : text;
 }
 
-export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
-
 export const TOOL_NAMES = [
   "read",
   "bash",
@@ -90,6 +87,7 @@ export const TOOL_NAMES = [
   "find",
   "ls",
   "request_human_edit",
+  "barbarian_review",
   "configure",
   "list_models",
   "save_context",
@@ -101,6 +99,7 @@ export type ToolName = (typeof TOOL_NAMES)[number];
 // filesystem. Everything else comes from @earendil-works/pi-coding-agent.
 const RATH_TOOLS = [
   "request_human_edit",
+  "barbarian_review",
   "configure",
   "list_models",
   "save_context",
@@ -118,11 +117,6 @@ type PiToolName = Exclude<ToolName, RathToolName>;
 //   confirmation before it runs.
 export const MODES = ["go", "slow"] as const;
 export type Mode = (typeof MODES)[number];
-
-// The default for the (DB-stored) default model: used when neither -m nor a
-// pinned default model (preferences, set via /config default-model) supplies
-// one. Hence the doubled name — it is the default of the default.
-export const DEFAULT_DEFAULT_MODEL = `${OPENAI_NATIVE_API}/gpt-5.5`;
 
 export interface RunFlags {
   model: string;
@@ -201,6 +195,9 @@ export async function loadTools(
         tools.push(
           createRequestHumanEditTool({ cwd, suspendTerminal: ctx.suspendTerminal }) as AgentTool,
         );
+        break;
+      case "barbarian_review":
+        tools.push(createBarbarianReviewTool() as AgentTool);
         break;
       case "configure":
         // Pass the WHOLE ctx (incl. requestExit) so a configure-driven tools
@@ -525,52 +522,6 @@ function createEndSessionTool(opts: {
       };
     },
   };
-}
-
-export function resolveModel(spec: string): Model<Api> {
-  const slash = spec.indexOf("/");
-  if (slash <= 0 || slash === spec.length - 1) {
-    throw new Error(`Model must be <provider>/<model-id> (got: ${spec})`);
-  }
-  const provider = spec.slice(0, slash);
-  const modelId = spec.slice(slash + 1);
-  if (provider === OPENAI_NATIVE_API) {
-    return openaiNativeModel(modelId);
-  }
-  if (provider === OPENROUTER_NATIVE_API) {
-    return openrouterNativeModel(modelId) as Model<Api>;
-  }
-  const model = getModel(provider as KnownProvider, modelId as never) as Model<Api> | undefined;
-  if (!model) {
-    throw new Error(`Unknown model: ${spec}`);
-  }
-  return model;
-}
-
-/**
- * All selectable model specs, native providers first. openrouter-native comes
- * from the live catalogue (ensureCatalogue) when it has been primed, falling
- * back to pi-ai's bundled registry otherwise; openai-native and the stock
- * providers come from the bundled registry (what they validate against).
- */
-export function listModels(filter?: string): string[] {
-  const specs: string[] = [];
-  for (const model of getModels("openai")) {
-    specs.push(`${OPENAI_NATIVE_API}/${model.id}`);
-  }
-  const liveOpenRouter = openRouterCatalogue();
-  const openRouterIds = liveOpenRouter
-    ? [...liveOpenRouter.keys()].sort()
-    : getModels("openrouter").map((m) => m.id);
-  for (const id of openRouterIds) {
-    specs.push(`${OPENROUTER_NATIVE_API}/${id}`);
-  }
-  for (const provider of getProviders()) {
-    for (const model of getModels(provider)) {
-      specs.push(`${provider}/${model.id}`);
-    }
-  }
-  return filter ? specs.filter((s) => s.includes(filter)) : specs;
 }
 
 export interface SerializedContext {

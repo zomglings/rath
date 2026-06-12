@@ -39,10 +39,13 @@ function git(cwd: string, ...args: string[]): void {
 async function main(): Promise<void> {
   // Case 1: bar apportionment — proportionality, the non-zero floor, clamping.
   const even = barSegments({ cacheRead: 50_000, cacheWrite: 0, input: 50_000, output: 0 }, 200_000);
-  assert.equal(even.cacheRead, 5, "25% of a 20-cell bar is 5 cells");
-  assert.equal(even.input, 5, "25% of a 20-cell bar is 5 cells");
+  // 25% + 25% of a 30-cell bar: boundaries at round(7.5)=8 and round(15)=15,
+  // so 8 + 7 cells — cumulative rounding keeps the total exact even when the
+  // individual shares are not integral.
+  assert.equal(even.cacheRead + even.input, STATUSLINE_BAR_WIDTH / 2, "50% fills half the bar");
+  assert.ok(Math.abs(even.cacheRead - even.input) <= 1, "equal shares differ by at most a cell");
   assert.equal(even.cacheWrite + even.output, 0, "zero categories get no cells");
-  assert.equal(even.empty, 10, "remaining cells are empty");
+  assert.equal(even.empty, STATUSLINE_BAR_WIDTH / 2, "remaining cells are empty");
 
   const tiny = barSegments({ cacheRead: 0, cacheWrite: 0, input: 1, output: 1 }, 200_000);
   assert.equal(tiny.input, 1, "non-zero usage gets at least one cell");
@@ -55,7 +58,34 @@ async function main(): Promise<void> {
     STATUSLINE_BAR_WIDTH,
     "a zero window renders an empty bar, not a crash",
   );
-  log("Case 1 OK: bar apportionment (proportional, floored, clamped)");
+
+  // Cumulative rounding: total fill tracks total usage — fill equals the
+  // rounded cumulative boundary, not sum(floor(parts)). With a 30-cell bar
+  // over 200k, one cell is ~6.67k tokens: 20k+20k is exactly 6 cells, and
+  // growth to 24k+24k (7.2 cells) must move the boundary to 7 even though
+  // each category alone only grew by 0.6 of a cell. (Values stay above one
+  // cell each so the non-zero visibility floor does not kick in.)
+  const a = barSegments({ cacheRead: 20_000, cacheWrite: 0, input: 20_000, output: 0 }, 200_000);
+  assert.equal(
+    a.cacheRead + a.input,
+    Math.round((40_000 * STATUSLINE_BAR_WIDTH) / 200_000),
+    "fill equals the rounded cumulative boundary",
+  );
+  const b = barSegments({ cacheRead: 24_000, cacheWrite: 0, input: 24_000, output: 0 }, 200_000);
+  assert.equal(
+    b.cacheRead + b.input,
+    Math.round((48_000 * STATUSLINE_BAR_WIDTH) / 200_000),
+    "growth moves the cumulative boundary",
+  );
+  assert.ok(b.cacheRead + b.input > a.cacheRead + a.input, "more usage fills more of the bar");
+
+  // The floor still applies: sub-cell non-zero categories are visible.
+  const floored = barSegments(
+    { cacheRead: 4_000, cacheWrite: 0, input: 4_000, output: 0 },
+    200_000,
+  );
+  assert.ok(floored.cacheRead >= 1 && floored.input >= 1, "sub-cell categories stay visible");
+  log("Case 1 OK: bar apportionment (proportional, cumulative, floored, clamped)");
 
   // Case 2: token and timestamp formatting.
   assert.equal(formatTokens(999), "999");
