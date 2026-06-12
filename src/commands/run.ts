@@ -43,7 +43,7 @@ import {
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { barbarianSkillPrompt } from "../barbarian-skill.js";
+import { BARBARIAN_SKILL_MARKER, barbarianSkillPrompt } from "../barbarian-skill.js";
 import { ensureCatalogue } from "../catalogue.js";
 import { type Command, fullName, helpText } from "../command.js";
 import { clearDefaultModel, configDir, loadPreferences, setDefaultModel } from "../config.js";
@@ -1202,11 +1202,15 @@ export const runCommand: Command = {
       // The bundled barbarian skill is loaded by default: its full text is
       // injected straight into the system prompt so the agent knows
       // `rath barbarian run` exists from its first turn (a future --skipskills
-      // will opt out). Additional --skill paths are loaded from disk on top (no
-      // discovery): their name/description are added and the model reads the
-      // skill file via the read tool when a task matches.
+      // will opt out). Inject only when absent: a system prompt restored from a
+      // saved context already carries the skill, and re-injecting would grow the
+      // prompt by a copy on every save/load cycle. Additional --skill paths are
+      // loaded from disk on top (no discovery): their name/description are added
+      // and the model reads the skill file via the read tool when a task matches.
       const loadedSkills: string[] = ["rath-barbarian"];
-      systemPrompt = `${systemPrompt}\n\n${barbarianSkillPrompt()}`;
+      if (!systemPrompt?.includes(BARBARIAN_SKILL_MARKER)) {
+        systemPrompt = `${systemPrompt}\n\n${barbarianSkillPrompt()}`;
+      }
       if (flags.skillPaths?.length) {
         const piCa = await import("@earendil-works/pi-coding-agent");
         const { skills, diagnostics } = piCa.loadSkills({
@@ -1236,7 +1240,7 @@ export const runCommand: Command = {
                   suspendTerminal: (fn) => terminal.suspend(fn),
                   getAgent: () => agent,
                   flags,
-                  requestExit: () => sessionControl.requestExit(),
+                  requestExit: (message) => sessionControl.requestExit(message),
                 })
               : [],
         },

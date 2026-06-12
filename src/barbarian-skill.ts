@@ -108,6 +108,14 @@ function bundleContents(): Record<string, string> {
 }
 
 /**
+ * Stable marker identifying the injected barbarian skill block in a system
+ * prompt. `rath run` checks for it before injecting so a system prompt that
+ * already carries the skill (e.g. one restored from a saved context) is not
+ * given a second copy.
+ */
+export const BARBARIAN_SKILL_MARKER = `<skill name="${SKILL_NAME}">`;
+
+/**
  * The bundled barbarian skill rendered for direct injection into a `rath run`
  * agent's system prompt. Unlike `--skill` (which adds a name/description pointer
  * and lets the model read the file on demand), this inlines the full skill text
@@ -121,7 +129,7 @@ export function barbarianSkillPrompt(): string {
     "The following skill provides specialized instructions for a specific task.",
     "It is built in — its full instructions are inlined here (there is no file to read).",
     "",
-    `<skill name="${SKILL_NAME}">`,
+    BARBARIAN_SKILL_MARKER,
     body,
     "</skill>",
   ].join("\n");
