@@ -13,18 +13,17 @@
  * pi-ai's provider registry; the openai-native provider is registered, so
  * hosted web search is available (on by default, --no-web-search disables
  * it). Client-side tools are loaded on demand from
- * @earendil-works/pi-coding-agent. Frontends: a plain readline REPL
- * (default, also used for -p one-shots) and a pi-tui interface (-T/--tui)
- * rendered with Pi's own interactive components. The TUI's dependencies
- * (pi-tui and pi-coding-agent's UI) are imported inside runTui, so they only
- * load when --tui is used; the type-only imports below are erased at compile
- * time and cost nothing.
+ * @earendil-works/pi-coding-agent. The frontend is the pi-tui interface,
+ * rendered with Pi's own interactive components; -p runs the same interface,
+ * auto-submitting the prompt and ending the session when its turn settles.
+ * The TUI's dependencies (pi-tui and pi-coding-agent's UI) are imported
+ * inside runTui; the type-only imports below are erased at compile time and
+ * cost nothing.
  */
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as readline from "node:readline/promises";
 import {
   Agent,
   type AgentTool,
@@ -35,11 +34,7 @@ import {
 import {
   type Api,
   type AssistantMessage,
-  getModel,
-  getModels,
-  getProviders,
   getSupportedThinkingLevels,
-  type KnownProvider,
   type Message,
   type Model,
   type SimpleStreamOptions,
@@ -48,39 +43,40 @@ import {
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { ensureCatalogue, openRouterCatalogue } from "../catalogue.js";
+import { BARBARIAN_SKILL_MARKER, barbarianSkillPrompt } from "../barbarian-skill.js";
+import { ensureCatalogue } from "../catalogue.js";
 import { type Command, fullName, helpText } from "../command.js";
-import { clearDefaultModel, loadPreferences, setDefaultModel } from "../config.js";
+import { clearDefaultModel, configDir, loadPreferences, setDefaultModel } from "../config.js";
 import {
   applyCitationTrailer,
   contentBlocks,
   flattenHostedContent,
   isHostedToolCall,
-  isRenderedCitations,
-  OPENAI_NATIVE_API,
-  OPENROUTER_NATIVE_API,
-  openaiNativeModel,
-  openrouterNativeModel,
   registerOpenAINative,
   registerOpenRouterNative,
   stripRenderedCitations,
   uniqueUrlCitations,
 } from "../index.js";
+import {
+  DEFAULT_DEFAULT_MODEL,
+  listModels,
+  REASONING_LEVELS,
+  type ReasoningLevel,
+  resolveModel,
+} from "../models.js";
+import { gitInfo, renderStatusline, type StatuslineData } from "../statusline.js";
 import { createRequestHumanEditTool } from "../tools/request-human-edit.js";
 import { isOnPath } from "../which.js";
 
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
-// dim() wraps status text, which the plain frontend writes to stderr; gate the
-// escape codes on stderr's TTY status so piping stdout keeps the dimming and
-// redirecting stderr to a file does not capture raw escapes.
+// dim() wraps the status text written to stderr outside the TUI (startup
+// fallbacks, the save-on-exit notice); gate the escape codes on stderr's TTY
+// status so redirecting stderr to a file does not capture raw escapes.
 function dim(text: string): string {
   return process.stderr.isTTY ? `${DIM}${text}${RESET}` : text;
 }
-
-export const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
 export const TOOL_NAMES = [
   "read",
@@ -114,16 +110,11 @@ type PiToolName = Exclude<ToolName, RathToolName>;
 // - "go": full speed, no inspection. Stream everything, never block, tools run
 //   immediately. This is the default and must stay byte-for-byte the current
 //   behavior — no paging, the gating hook is a pass-through.
-// - "slow": take time. Long output is paged (a pager in the plain REPL, a
-//   scrollable overlay in the TUI), and every tool call is gated behind a
-//   per-call confirmation before it runs.
+// - "slow": take time. Long output is paged through $PAGER (the TUI suspends
+//   for the pager's duration), and every tool call is gated behind a per-call
+//   confirmation before it runs.
 export const MODES = ["go", "slow"] as const;
 export type Mode = (typeof MODES)[number];
-
-// The default for the (DB-stored) default model: used when neither -m nor a
-// pinned default model (preferences, set via /config default-model) supplies
-// one. Hence the doubled name — it is the default of the default.
-export const DEFAULT_DEFAULT_MODEL = `${OPENAI_NATIVE_API}/gpt-5.5`;
 
 export interface RunFlags {
   model: string;
@@ -132,10 +123,13 @@ export interface RunFlags {
   reasoning: ReasoningLevel;
   webSearch: boolean;
   tools: ToolName[];
-  tui: boolean;
   mode: Mode;
   loadPath?: string;
   savePath?: string;
+  /** Paths to Agent Skills to preload (from --skill); set during startup. */
+  skillPaths?: string[];
+  /** Names of skills actually loaded, for the /config display. */
+  skills?: string[];
 }
 
 // Paging threshold: output longer than this many lines is paged in slow mode.
@@ -159,14 +153,15 @@ export function isLongOutput(text: string): boolean {
  * Context rath's own tools need to operate the running session: the editor
  * takes the terminal (suspendTerminal); configure/save_context reach the live
  * Agent (getAgent, set once it exists) and mutate flags in place; end_session
- * asks the frontend to quit (requestExit). The session-coupled tools are
+ * asks the frontend to quit (requestExit), optionally with a parting message
+ * printed to stdout after the TUI closes. The session-coupled tools are
  * skipped when their required context is absent.
  */
 export interface ToolContext {
   suspendTerminal?: <T>(fn: () => T) => T;
   getAgent?: () => Agent;
   flags?: RunFlags;
-  requestExit?: () => void;
+  requestExit?: (message?: string) => void;
 }
 
 /**
@@ -232,9 +227,9 @@ export async function loadTools(
 
 /**
  * Lets a tool that must own the terminal (request_human_edit's editor) suspend
- * whatever UI the active frontend is running. The plain REPL holds no UI
- * mid-turn, so its controller is a pass-through; the TUI swaps in a
- * tui.stop()/start() wrapper once it is up.
+ * whatever UI the active frontend is running. A -p one-shot holds no UI, so
+ * its controller is a pass-through; the TUI swaps in a tui.stop()/start()
+ * wrapper once it is up.
  */
 interface TerminalController {
   suspend: <T>(fn: () => T) => T;
@@ -489,79 +484,43 @@ function createSaveContextTool(opts: {
   };
 }
 
-const END_SESSION_PARAMETERS = Type.Object({});
+const END_SESSION_PARAMETERS = Type.Object({
+  message: Type.Optional(
+    Type.String({
+      description:
+        "Parting message printed to stdout after the session ends (e.g. a one-line result for " +
+        "the invoking shell).",
+    }),
+  ),
+});
 
 export interface EndSessionDetails {
   ended: true;
+  message?: string;
 }
 
 /** The `end_session` tool: the model ends the rath session (like /exit). */
 function createEndSessionTool(opts: {
-  requestExit: () => void;
+  requestExit: (message?: string) => void;
 }): AgentTool<typeof END_SESSION_PARAMETERS, EndSessionDetails> {
   return {
     name: "end_session",
     label: "End session",
     description:
       "End the rath session, as the human would with /exit. Save-on-exit still runs if set. Use " +
-      "when the work is complete and there is nothing left to do.",
+      "when the work is complete and there is nothing left to do. An optional message is " +
+      "printed to stdout after the session ends (like /exit <message>).",
     parameters: END_SESSION_PARAMETERS,
-    execute: async (): Promise<AgentToolResult<EndSessionDetails>> => {
-      opts.requestExit();
+    execute: async (_toolCallId, params): Promise<AgentToolResult<EndSessionDetails>> => {
+      opts.requestExit(params.message);
       return {
         content: [{ type: "text", text: "Ending the session." }],
-        details: { ended: true },
+        details: { ended: true, ...(params.message !== undefined && { message: params.message }) },
         // Stop the agent loop after this batch; the frontend then exits.
         terminate: true,
       };
     },
   };
-}
-
-export function resolveModel(spec: string): Model<Api> {
-  const slash = spec.indexOf("/");
-  if (slash <= 0 || slash === spec.length - 1) {
-    throw new Error(`Model must be <provider>/<model-id> (got: ${spec})`);
-  }
-  const provider = spec.slice(0, slash);
-  const modelId = spec.slice(slash + 1);
-  if (provider === OPENAI_NATIVE_API) {
-    return openaiNativeModel(modelId);
-  }
-  if (provider === OPENROUTER_NATIVE_API) {
-    return openrouterNativeModel(modelId) as Model<Api>;
-  }
-  const model = getModel(provider as KnownProvider, modelId as never) as Model<Api> | undefined;
-  if (!model) {
-    throw new Error(`Unknown model: ${spec}`);
-  }
-  return model;
-}
-
-/**
- * All selectable model specs, native providers first. openrouter-native comes
- * from the live catalogue (ensureCatalogue) when it has been primed, falling
- * back to pi-ai's bundled registry otherwise; openai-native and the stock
- * providers come from the bundled registry (what they validate against).
- */
-export function listModels(filter?: string): string[] {
-  const specs: string[] = [];
-  for (const model of getModels("openai")) {
-    specs.push(`${OPENAI_NATIVE_API}/${model.id}`);
-  }
-  const liveOpenRouter = openRouterCatalogue();
-  const openRouterIds = liveOpenRouter
-    ? [...liveOpenRouter.keys()].sort()
-    : getModels("openrouter").map((m) => m.id);
-  for (const id of openRouterIds) {
-    specs.push(`${OPENROUTER_NATIVE_API}/${id}`);
-  }
-  for (const provider of getProviders()) {
-    for (const model of getModels(provider)) {
-      specs.push(`${provider}/${model.id}`);
-    }
-  }
-  return filter ? specs.filter((s) => s.includes(filter)) : specs;
 }
 
 export interface SerializedContext {
@@ -607,7 +566,11 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
     ["web search", flags.webSearch ? "on (hosted, openai-native / openrouter-native only)" : "off"],
     ["tools (active)", tools.length > 0 ? tools.join(", ") : "none"],
     ["tools (available)", TOOL_NAMES.join(", ")],
-    ["skills", "none (rath run loads no skills or context files)"],
+    [
+      "skills",
+      `${(flags.skills?.length ? flags.skills : ["rath-barbarian"]).join(", ")} ` +
+        "(rath-barbarian built-in; --skill <path> to add more, no discovery)",
+    ],
     ["system prompt", "/sys to view or set"],
     ["messages in context", String(agent.state.messages.length)],
     ...(flags.loadPath ? [["loaded from", flags.loadPath] as [string, string]] : []),
@@ -619,6 +582,8 @@ export interface SlashResult {
   output?: string;
   isError?: boolean;
   exit?: boolean;
+  /** With exit: printed to stdout after the TUI has released the terminal. */
+  exitMessage?: string;
 }
 
 /**
@@ -630,7 +595,7 @@ export async function handleSlashCommand(
   agent: Agent,
   flags: RunFlags,
   terminal: TerminalController,
-  requestExit: () => void = () => {},
+  requestExit: (message?: string) => void = () => {},
 ): Promise<SlashResult | undefined> {
   if (!input.startsWith("/")) {
     return undefined;
@@ -641,7 +606,10 @@ export async function handleSlashCommand(
   const deferred = agent.state.isStreaming ? " (applies after the current turn)" : "";
   switch (command) {
     case "/exit":
-      return { exit: true };
+      // An argument becomes the session's parting message, printed to stdout
+      // after the TUI closes — so a scripted run can end with a clean,
+      // capturable result line.
+      return { exit: true, ...(arg.length > 0 && { exitMessage: arg }) };
     case "/config": {
       // Subcommands manage persisted preferences; bare /config shows everything.
       const [sub = "", ...subRest] = arg.split(/\s+/).filter((s) => s.length > 0);
@@ -828,144 +796,10 @@ export async function handleSlashCommand(
           `Unknown command: ${command} (commands: /config [default-model [spec|none]], ` +
           "/sys [text], /model [spec], /lsmodels [filter], /reasoning [level], " +
           "/websearch [on|off], /tools [names|none], /mode [go|slow], /go, /slow, " +
-          "/save [path], /exit)",
+          "/save [path], /exit [message])",
         isError: true,
       };
   }
-}
-
-interface Renderer {
-  /** True when the most recent run produced an error message. */
-  hadError: () => boolean;
-}
-
-/**
- * Wire plain rendering onto the agent's event stream. The model's answer text
- * goes to stdout (the deliverable, so `-p > file` captures just that);
- * thinking, hosted-tool markers, tool-execution lines, and errors go to
- * stderr as status.
- *
- * When `pageReplies` is set (the interactive REPL, never `-p`), slow mode
- * buffers the answer instead of streaming it and pages the finished reply
- * through $PAGER so it can be read deliberately; short replies and go mode
- * stream/print as usual.
- */
-function attachRenderer(agent: Agent, flags: RunFlags, pageReplies = false): Renderer {
-  // Track which stream has an unterminated line so the next block starts fresh.
-  let openStream: NodeJS.WriteStream | null = null;
-  const write = (stream: NodeJS.WriteStream, text: string) => {
-    stream.write(text);
-    openStream = text.endsWith("\n") ? null : stream;
-  };
-  const ensureNewline = () => {
-    if (openStream) {
-      openStream.write("\n");
-      openStream = null;
-    }
-  };
-  const seenHostedCalls = new Set<string>();
-  let errored = false;
-  // In slow mode (interactive only) the thinking and answer are not streamed
-  // live; the finished turn is paged at message_end so it can be read at
-  // leisure. Tool-call markers still stream as progress.
-  const paging = () => pageReplies && flags.mode === "slow";
-  // Print a (possibly partial) turn with the same stream split as live
-  // streaming: answer to stdout, thinking and the sources trailer to stderr.
-  // Used when slow mode suppressed the live stream but cannot page (short
-  // output, no TTY) or the turn was interrupted.
-  const printTurnSplit = (message: AssistantMessage) => {
-    for (const block of contentBlocks(message)) {
-      if (block.type === "thinking") {
-        const t = block.thinking.trim();
-        if (t.length > 0) {
-          write(process.stderr, `${dim(t)}\n`);
-        }
-      } else if (block.type === "text") {
-        const t = block.text.trim();
-        if (t.length === 0) {
-          continue;
-        }
-        if (isRenderedCitations(block)) {
-          write(process.stderr, `${dim(t)}\n`);
-        } else {
-          write(process.stdout, `${t}\n`);
-        }
-      }
-    }
-  };
-
-  agent.subscribe((event) => {
-    if (event.type === "agent_start") {
-      errored = false;
-    } else if (event.type === "message_update") {
-      const e = event.assistantMessageEvent;
-      if (e.type === "text_delta") {
-        if (!paging()) {
-          write(process.stdout, e.delta);
-        }
-      } else if (e.type === "thinking_delta") {
-        if (!paging()) {
-          write(process.stderr, dim(e.delta));
-        }
-      } else if (e.type === "text_end" || e.type === "thinking_end") {
-        ensureNewline();
-      }
-      // Hosted tool calls emit no assistant-message events; they appear as
-      // blocks on the partial message. Announce each one once.
-      if (event.message.role === "assistant") {
-        for (const block of contentBlocks(event.message)) {
-          if (isHostedToolCall(block) && !seenHostedCalls.has(block.id)) {
-            seenHostedCalls.add(block.id);
-            ensureNewline();
-            write(process.stderr, `${dim(`[${block.toolName}]`)}\n`);
-          }
-        }
-      }
-    } else if (event.type === "tool_execution_start") {
-      ensureNewline();
-      const args = JSON.stringify(event.args);
-      write(
-        process.stderr,
-        `${dim(`[${event.toolName}: ${args.length > 120 ? `${args.slice(0, 120)}…` : args}]`)}\n`,
-      );
-    } else if (event.type === "message_end") {
-      const message = event.message;
-      if (message.role === "assistant") {
-        ensureNewline();
-        if (message.stopReason === "error" || message.stopReason === "aborted") {
-          // Slow mode suppressed the live stream; surface whatever partial
-          // content was generated before the interrupt/error rather than
-          // discarding it.
-          if (paging()) {
-            printTurnSplit(message);
-          }
-          write(
-            process.stderr,
-            `${message.stopReason}: ${message.errorMessage ?? "interrupted"}\n`,
-          );
-          // A user-initiated interrupt is not a failure; only a genuine error
-          // makes the session exit non-zero.
-          if (message.stopReason === "error") {
-            errored = true;
-          }
-          return;
-        }
-        const trailer = applyCitationTrailer(message);
-        if (paging()) {
-          // Page the finished turn — thinking, answer, and sources — through
-          // $PAGER. If it cannot page (short output, or stdout is not a TTY),
-          // print with the normal stream split so thinking does not land on
-          // stdout.
-          if (!pagePlain(buildPagedTurnText(message), flags)) {
-            printTurnSplit(message);
-          }
-        } else if (trailer) {
-          write(process.stderr, `${dim(trailer)}\n`);
-        }
-      }
-    }
-  });
-  return { hadError: () => errored };
 }
 
 /** Short, single-line preview of tool arguments for a confirmation prompt. */
@@ -985,8 +819,7 @@ export function toolArgsPreview(args: unknown, max = 120): string {
  * Build a beforeToolCall hook for the Agent. In go mode the hook is a
  * pass-through, so go mode keeps the current "tools run immediately" behavior
  * exactly. In slow mode it asks `confirm` before every tool call and blocks
- * the call when the user declines; a frontend that cannot confirm (non-TTY
- * plain REPL, or -p one-shot) denies rather than passing through.
+ * the call when the user declines.
  *
  * The gating mode is snapshotted at each turn's start (agent_start), not read
  * live per call. A human's /go|/slow between turns is captured at the next
@@ -1087,8 +920,8 @@ export function resolvePagerCommand(): string[] {
  * the keyboard). Piping on the pager's stdin instead would make less detect a
  * non-TTY stdin and dump like cat. The synchronous `spawnSync` blocks the
  * event loop for the pager's lifetime; the temp file is removed afterward. The
- * caller must own the terminal first (the plain REPL is between reads; the TUI
- * suspends itself with tui.stop()).
+ * caller must own the terminal first (the TUI suspends itself with
+ * tui.stop()).
  */
 export function runExternalPager(text: string): boolean {
   const parts = resolvePagerCommand();
@@ -1115,17 +948,6 @@ export function runExternalPager(text: string): boolean {
   }
 }
 
-/** Page `text` in the plain REPL when in slow mode and the output is long. */
-export function pagePlain(text: string, flags: RunFlags): boolean {
-  if (flags.mode !== "slow" || !isLongOutput(text)) {
-    return false;
-  }
-  if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    return false;
-  }
-  return runExternalPager(text);
-}
-
 export const runCommand: Command = {
   name: "run",
   summary: "Run a generic agent loop",
@@ -1136,8 +958,8 @@ export const runCommand: Command = {
     "environment. Tools are the one convenience default: --tools enables all\n" +
     "client-side tools when omitted (--tools none to disable, or a list).\n" +
     "\n" +
-    "Without --prompt, reads prompts interactively (plain REPL, or pi-tui\n" +
-    "with -T/--tui). Every startup setting is also settable in-session:\n" +
+    "Runs as an interactive pi-tui session (a TTY is required). Every\n" +
+    "startup setting is also settable in-session:\n" +
     "  /config                show the configuration\n" +
     "  /config default-model [spec|none]  pin or clear the default model\n" +
     "  /sys [text]            show or set the system prompt\n" +
@@ -1149,26 +971,22 @@ export const runCommand: Command = {
     "  /mode [go|slow]        show or switch the interaction mode\n" +
     "  /go, /slow             switch mode (go: full speed; slow: page + confirm)\n" +
     "  /save [path]           write the context now and save there on exit\n" +
-    "  /exit                  quit\n" +
-    "With --prompt, runs one prompt and exits (0 on success).",
+    "  /exit [message]        quit (the message is printed after the TUI closes)\n" +
+    "With --prompt, the prompt is auto-submitted as the first message and the\n" +
+    "session ends when its turn settles (0 on success); the model can end it\n" +
+    "earlier with end_session, whose message is printed after the TUI closes.",
   flags: [
     {
       long: "model",
       short: "m",
       takesValue: true,
-      description: "Model as <provider>/<model-id> (default: openai-native/gpt-5-mini)",
+      description: `Model as <provider>/<model-id> (default: ${DEFAULT_DEFAULT_MODEL})`,
     },
     {
       long: "prompt",
       short: "p",
       takesValue: true,
-      description: "Run a single prompt non-interactively and exit",
-    },
-    {
-      long: "tui",
-      short: "T",
-      takesValue: false,
-      description: "Interactive pi-tui interface instead of the plain REPL",
+      description: "Auto-submit this prompt as the first message and exit when its turn settles",
     },
     {
       long: "system-prompt",
@@ -1203,8 +1021,17 @@ export const runCommand: Command = {
       repeatable: true,
       description:
         `Client-side tools to enable (comma-separated or repeated): ${TOOL_NAMES.join(", ")}. ` +
-        "Omit to enable all of them (request_human_edit excluded in a -p one-shot); pass " +
-        "--tools none to disable. They run with your privileges in the current directory.",
+        "Omit to enable all of them; pass --tools none to disable. They run with your " +
+        "privileges in the current directory.",
+    },
+    {
+      long: "skill",
+      takesValue: true,
+      repeatable: true,
+      description:
+        "Preload an Agent Skill from a path (file or directory; repeatable). Its name and " +
+        "description are added to the system prompt and the model reads the skill file when " +
+        "the task matches. Explicit only — no skill discovery.",
     },
     {
       long: "load",
@@ -1224,7 +1051,6 @@ export const runCommand: Command = {
       reasoning: "low",
       webSearch: true,
       tools: [],
-      tui: false,
       mode: "go",
     };
     let systemPromptFile: string | undefined;
@@ -1256,8 +1082,6 @@ export const runCommand: Command = {
           modelExplicit = true;
         } else if (token === "-p" || token === "--prompt") {
           flags.prompt = value();
-        } else if (token === "-T" || token === "--tui") {
-          flags.tui = true;
         } else if (token === "--system-prompt") {
           flags.systemPrompt = value();
           systemPromptExplicit = true;
@@ -1304,6 +1128,12 @@ export const runCommand: Command = {
               }
             }
           }
+        } else if (token === "--skill") {
+          const skillPath = value();
+          if (!flags.skillPaths) {
+            flags.skillPaths = [];
+          }
+          flags.skillPaths.push(skillPath);
         } else if (token === "--load") {
           flags.loadPath = value();
         } else if (token === "--save") {
@@ -1320,25 +1150,16 @@ export const runCommand: Command = {
       }
     }
 
-    // Default to all tools when --tools was not given at all. In a -p one-shot
-    // there is no human at the terminal, so drop tools that need one:
-    // request_human_edit would spawn an editor and block the pipeline. An
-    // explicit --tools is honored verbatim (the caller asked for it).
+    // Default to all tools when --tools was not given at all. An explicit
+    // --tools is honored verbatim (the caller asked for it).
     if (!toolsExplicit) {
       flags.tools = [...TOOL_NAMES];
-      if (flags.prompt !== undefined) {
-        flags.tools = flags.tools.filter((t) => t !== "request_human_edit");
-      }
     }
 
     // Without -m, use the pinned default model from preferences (built-in
     // default if none pinned or the store is unavailable).
     if (!modelExplicit) {
       flags.model = loadPreferences().defaultModel ?? DEFAULT_DEFAULT_MODEL;
-    }
-
-    if (flags.prompt !== undefined && flags.tui) {
-      process.stderr.write("--tui is ignored with --prompt (one-shot, non-interactive)\n");
     }
 
     registerOpenAINative();
@@ -1351,8 +1172,8 @@ export const runCommand: Command = {
     // Shared with request_human_edit (via loadTools) so the editor can take the
     // terminal; the TUI replaces .suspend with a tui.stop/start wrapper.
     const terminal: TerminalController = { suspend: (fn) => fn() };
-    // end_session calls requestExit; each frontend installs its own quit below.
-    const sessionControl = { requestExit: () => {} };
+    // end_session calls requestExit; runTui installs the actual quit.
+    const sessionControl = { requestExit: (_message?: string) => {} };
     let agent: Agent;
     try {
       let model: Model<Api>;
@@ -1375,9 +1196,38 @@ export const runCommand: Command = {
       }
       const loaded = flags.loadPath ? loadContext(flags.loadPath) : undefined;
       // A loaded context supplies the system prompt unless a flag overrides it.
-      const systemPrompt = systemPromptExplicit
+      let systemPrompt = systemPromptExplicit
         ? flags.systemPrompt
         : (loaded?.systemPrompt ?? flags.systemPrompt);
+      // The bundled barbarian skill is loaded by default: its full text is
+      // injected straight into the system prompt so the agent knows
+      // `rath barbarian run` exists from its first turn (a future --skipskills
+      // will opt out). Inject only when absent: a system prompt restored from a
+      // saved context already carries the skill, and re-injecting would grow the
+      // prompt by a copy on every save/load cycle. Additional --skill paths are
+      // loaded from disk on top (no discovery): their name/description are added
+      // and the model reads the skill file via the read tool when a task matches.
+      const loadedSkills: string[] = ["rath-barbarian"];
+      if (!systemPrompt?.includes(BARBARIAN_SKILL_MARKER)) {
+        systemPrompt = `${systemPrompt}\n\n${barbarianSkillPrompt()}`;
+      }
+      if (flags.skillPaths?.length) {
+        const piCa = await import("@earendil-works/pi-coding-agent");
+        const { skills, diagnostics } = piCa.loadSkills({
+          cwd: process.cwd(),
+          agentDir: configDir(),
+          skillPaths: flags.skillPaths,
+          includeDefaults: false,
+        });
+        for (const d of diagnostics) {
+          process.stderr.write(`${dim(`skill: ${d.message}`)}\n`);
+        }
+        if (skills.length > 0) {
+          systemPrompt = `${systemPrompt}\n\n${piCa.formatSkillsForPrompt(skills)}`;
+          loadedSkills.push(...skills.map((s) => s.name));
+        }
+      }
+      flags.skills = loadedSkills;
       agent = new Agent({
         initialState: {
           systemPrompt,
@@ -1390,7 +1240,7 @@ export const runCommand: Command = {
                   suspendTerminal: (fn) => terminal.suspend(fn),
                   getAgent: () => agent,
                   flags,
-                  requestExit: () => sessionControl.requestExit(),
+                  requestExit: (message) => sessionControl.requestExit(message),
                 })
               : [],
         },
@@ -1474,133 +1324,20 @@ export const runCommand: Command = {
       }
     };
 
-    if (flags.prompt !== undefined) {
-      // One-shot streams the answer to stdout (scriptable; never paged).
-      const renderer = attachRenderer(agent, flags, false);
-      // One-shot is non-interactive: there is no human to confirm tool calls,
-      // so slow mode denies them rather than running them unattended. go mode
-      // (the default) keeps the pass-through, so -p behavior is unchanged.
-      agent.beforeToolCall = makeBeforeToolCall(agent, flags, async (toolName, argsPreview) => {
-        process.stderr.write(
-          `${dim(`run ${toolName} ${argsPreview}? [y/N] (non-interactive — denied)`)}\n`,
-        );
-        return false;
-      });
-      await agent.prompt(flags.prompt);
-      save();
-      return renderer.hadError() ? 1 : 0;
+    const result = await runTui(agent, flags, terminal, sessionControl);
+    save();
+    // The parting message (from /exit <message> or end_session({message}))
+    // prints to stdout only after the TUI has released the terminal, so it is
+    // the last, clean line of the run — capturable by the invoking shell.
+    if (result.exitMessage !== undefined && result.exitMessage.length > 0) {
+      process.stdout.write(`${result.exitMessage}\n`);
     }
-
-    if (flags.tui) {
-      const code = await runTui(agent, flags, terminal, sessionControl);
-      save();
-      return code;
-    }
-
-    // Interactive REPL: in slow mode, page long replies (pageReplies = true).
-    const renderer = attachRenderer(agent, flags, true);
-    process.stderr.write(
-      `${dim(`model: ${flags.model} | mode: ${flags.mode} | /config for commands | Ctrl+C interrupts, Ctrl+D quits`)}\n`,
-    );
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    // Slow-mode tool confirmation. The hook fires while agent.prompt() is being
-    // awaited inside the loop below, so the `for await (line of rl)` iterator is
-    // suspended and not competing for stdin; rl.question reads the next line
-    // from the same interface, avoiding a second stdin reader (which would
-    // corrupt line buffering). Non-TTY stdin (piped/-p) cannot answer a
-    // prompt, so default to deny there — slow mode without a human present must
-    // not auto-run tools.
-    agent.beforeToolCall = makeBeforeToolCall(
-      agent,
-      flags,
-      async (toolName, argsPreview, signal) => {
-        const question = `run ${toolName} ${argsPreview}? [y/N] `;
-        if (!process.stdin.isTTY) {
-          process.stderr.write(`${dim(`${question}(no TTY — denied)`)}\n`);
-          return false;
-        }
-        try {
-          // Ctrl+C during the prompt aborts the turn; the signal cancels the
-          // question so we do not block on a line that will never come.
-          const answer = (await rl.question(dim(question), { signal })).trim().toLowerCase();
-          return answer === "y" || answer === "yes";
-        } catch {
-          return false; // aborted question -> deny.
-        }
-      },
-    );
-    // Iterating the interface (rather than looping rl.question) queues input
-    // arriving while a turn runs instead of dropping it. Ctrl+C aborts the
-    // active response; a second Ctrl+C before it settles (or one while idle)
-    // quits. Note: abort stops the in-flight model request, but an
-    // already-running tool finishes, and one queued follow-up turn may still
-    // start — the agent loop only observes the abort at request boundaries.
-    let abortRequested = false;
-    rl.on("SIGINT", () => {
-      if (agent.state.isStreaming && !abortRequested) {
-        abortRequested = true;
-        agent.abort();
-      } else {
-        rl.close();
-      }
-    });
-    agent.subscribe((event) => {
-      if (event.type === "agent_start") {
-        abortRequested = false;
-      }
-    });
-    // end_session sets this mid-turn; the loop breaks once the turn returns.
-    let exitRequested = false;
-    sessionControl.requestExit = () => {
-      exitRequested = true;
-    };
-    process.stderr.write("rath> ");
-    try {
-      for await (const line of rl) {
-        const trimmed = line.trim();
-        if (trimmed.length === 0) {
-          process.stderr.write("rath> ");
-          continue;
-        }
-        const result = await handleSlashCommand(
-          trimmed,
-          agent,
-          flags,
-          terminal,
-          sessionControl.requestExit,
-        );
-        if (result) {
-          if (result.output !== undefined) {
-            const text = result.output.length > 0 ? result.output : "(empty)";
-            // Slow mode pages long, non-error output (e.g. /sys, /lsmodels)
-            // through $PAGER; pagePlain returns false (no-op) in go mode, for
-            // short output, or with no usable pager, so we print as before.
-            if (result.isError || !pagePlain(text, flags)) {
-              process.stderr.write(`${result.isError ? text : dim(text)}\n`);
-            }
-          }
-          if (result.exit) {
-            break;
-          }
-          process.stderr.write("rath> ");
-          continue;
-        }
-        await agent.prompt(trimmed);
-        if (exitRequested) {
-          break;
-        }
-        process.stderr.write("rath> ");
-      }
-    } finally {
-      rl.close();
-      save();
-    }
-    return renderer.hadError() ? 1 : 0;
+    return result.code;
   },
 };
 
 // ---------------------------------------------------------------------------
-// TUI frontend (-T/--tui)
+// TUI frontend
 // ---------------------------------------------------------------------------
 
 // Styles do not carry across TUI lines; every style helper applies per line.
@@ -1629,27 +1366,39 @@ function messageText(content: string | { type: string; text?: string }[]): strin
     .join("\n");
 }
 
+/** How a TUI session ended: exit code, plus the optional parting message. */
+interface TuiResult {
+  code: number;
+  /** From /exit <message> or end_session({message}); printed after teardown. */
+  exitMessage?: string;
+}
+
 /**
- * pi-tui frontend. Same session semantics as the plain REPL — same Agent,
- * same slash commands, same citation merging — rendered with Pi's own
- * interactive components (AssistantMessageComponent, UserMessageComponent,
+ * pi-tui frontend — the only frontend. Rendered with Pi's own interactive
+ * components (AssistantMessageComponent, UserMessageComponent,
  * ToolExecutionComponent, and the Pi theme), so the TUI looks like vanilla
  * Pi. rath adds what those components do not know about: hosted-tool
- * markers and clickable citation sources. Messages stream as they arrive
- * and are re-rendered in full on completion.
+ * markers, clickable citation sources, and the statusline below the editor.
+ * Messages stream as they arrive and are re-rendered in full on completion.
+ *
+ * With flags.prompt set (-p), the prompt is auto-submitted as the first
+ * message and the session ends when its turn settles — unless the human took
+ * over (typed a prompt or queued a steer), in which case the session stays
+ * open and is theirs. The exit code reflects the auto-run turn: 1 when it
+ * ended in an error, 0 otherwise.
  */
 async function runTui(
   agent: Agent,
   flags: RunFlags,
   terminal: TerminalController,
-  sessionControl: { requestExit: () => void },
-): Promise<number> {
+  sessionControl: { requestExit: (message?: string) => void },
+): Promise<TuiResult> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    process.stderr.write("--tui requires an interactive terminal\n");
-    return 1;
+    process.stderr.write("rath run requires an interactive terminal\n");
+    return { code: 1 };
   }
 
-  // The TUI's dependencies load here so plain runs never pay for them.
+  // The TUI's dependencies load here, after the TTY gate.
   const piTui = await import("@earendil-works/pi-tui");
   const piCa = await import("@earendil-works/pi-coding-agent");
   const {
@@ -1712,16 +1461,49 @@ async function runTui(
   const refreshBanner = () => {
     banner.setText(
       `${cyanLine("rath")} ${dimLine(
-        `| ${flags.model} | mode: ${flags.mode} | reasoning: ${agent.state.thinkingLevel} | ` +
+        `| mode: ${flags.mode} | reasoning: ${agent.state.thinkingLevel} | ` +
           "/config for commands | Ctrl+C interrupts",
       )}`,
     );
   };
   refreshBanner();
+
+  // The statusline: model, a context-window gauge from the last turn's usage,
+  // cwd, git state, and the last-turn timestamp. Git info costs subprocess
+  // calls, so it refreshes on session events (turn end, slash commands), not
+  // per render frame.
+  const statusline = new Text("");
+  let lastInteraction: number | undefined;
+  const refreshStatusline = () => {
+    const lastAssistant = [...agent.state.messages]
+      .reverse()
+      .find((m): m is AssistantMessage => m.role === "assistant");
+    const usage = lastAssistant?.usage;
+    const cwd = process.cwd();
+    const data: StatuslineData = {
+      model: flags.model,
+      contextWindow: (agent.state.model as Model<Api>).contextWindow,
+      ...(usage && {
+        usage: {
+          input: usage.input,
+          output: usage.output,
+          cacheRead: usage.cacheRead,
+          cacheWrite: usage.cacheWrite,
+        },
+      }),
+      cwd,
+      git: gitInfo(cwd),
+      lastInteraction,
+    };
+    statusline.setText(renderStatusline(data));
+  };
+  refreshStatusline();
+
   tui.addChild(banner);
   tui.addChild(transcript);
   tui.addChild(status);
   tui.addChild(editor);
+  tui.addChild(statusline);
   tui.setFocus(editor);
 
   const addAssistant = (message: AssistantMessage) => {
@@ -1819,6 +1601,7 @@ async function runTui(
       (await handleSlashCommand(input, agent, flags, terminal, sessionControl.requestExit)) ?? {},
     );
     refreshBanner();
+    refreshStatusline();
     tui.requestRender();
   };
 
@@ -1942,16 +1725,22 @@ async function runTui(
     }
   }
 
-  let resolveDone: (code: number) => void = () => {};
-  const done = new Promise<number>((resolve) => {
+  let resolveDone: (result: TuiResult) => void = () => {};
+  const done = new Promise<TuiResult>((resolve) => {
     resolveDone = resolve;
   });
 
-  // end_session quits the TUI the same way /exit does.
-  sessionControl.requestExit = () => {
+  // end_session quits the TUI the same way /exit does; its optional message
+  // is printed by the caller after the terminal is released.
+  sessionControl.requestExit = (message?: string) => {
     tui.stop();
-    resolveDone(0);
+    resolveDone({ code: 0, ...(message !== undefined && { exitMessage: message }) });
   };
+
+  // -p auto-run state: whether the human took over (typed a prompt or queued
+  // a steer), and whether the auto-run turn ended in an error.
+  let humanTookOver = false;
+  let lastTurnErrored = false;
 
   let current: PiCodingAgent.AssistantMessageComponent | null = null;
   const toolComponents = new Map<string, PiCodingAgent.ToolExecutionComponent>();
@@ -1963,6 +1752,8 @@ async function runTui(
       loader.stop();
       status.clear();
       toolComponents.clear();
+      lastInteraction = Date.now();
+      refreshStatusline();
       // A prompt submitted during the final steering-poll window stays queued.
       // Drain it once the run has fully settled (continue() throws while the
       // run is still active), instead of waiting for the next manual prompt.
@@ -2014,8 +1805,10 @@ async function runTui(
         // emits them here, not as a rejection — render the error explicitly
         // instead of an empty assistant bubble.
         if (failed) {
+          lastTurnErrored = message.stopReason === "error";
           transcript.addChild(new Text(redLine(`error: ${message.errorMessage ?? "unknown"}`)));
         } else {
+          lastTurnErrored = false;
           addAssistant(message);
           // Slow mode: page the whole turn (thinking, answer, sources) in the
           // real pager for deliberate reading; it stays in the transcript too.
@@ -2088,9 +1881,13 @@ async function runTui(
             if (result) {
               showCommandOutput(result);
               refreshBanner();
+              refreshStatusline();
               if (result.exit) {
                 tui.stop();
-                resolveDone(0);
+                resolveDone({
+                  code: 0,
+                  ...(result.exitMessage !== undefined && { exitMessage: result.exitMessage }),
+                });
               }
             }
             tui.requestRender();
@@ -2100,6 +1897,7 @@ async function runTui(
       tui.requestRender();
       return;
     }
+    humanTookOver = true;
     const message = { role: "user" as const, content: trimmed, timestamp: Date.now() };
     // Steer while a turn is streaming, or when a message is already queued for
     // the post-run drain — prompting directly in the latter case would jump
@@ -2127,7 +1925,7 @@ async function runTui(
         agent.abort();
       } else {
         tui.stop();
-        resolveDone(0);
+        resolveDone({ code: 0 });
       }
       return { consume: true };
     }
@@ -2135,8 +1933,36 @@ async function runTui(
   });
 
   tui.start();
-  const code = await done;
+
+  // -p: auto-submit the prompt as the first message. When its turn settles,
+  // end the session — unless the human took over, in which case the session
+  // is theirs (interactive from here on). The model can also end it earlier
+  // via end_session; resolveDone is idempotent through the `done` promise
+  // (the first resolution wins).
+  if (flags.prompt !== undefined) {
+    // The prompt renders in the transcript via the message_start event.
+    agent
+      .prompt(flags.prompt)
+      .then(() => {
+        if (!humanTookOver && !agent.hasQueuedMessages()) {
+          tui.stop();
+          resolveDone({ code: lastTurnErrored ? 1 : 0 });
+        }
+      })
+      .catch((error) => {
+        transcript.addChild(
+          new Text(redLine(`error: ${error instanceof Error ? error.message : error}`)),
+        );
+        if (!humanTookOver) {
+          tui.stop();
+          resolveDone({ code: 1 });
+        }
+        tui.requestRender();
+      });
+  }
+
+  const result = await done;
   agent.abort();
   await agent.waitForIdle();
-  return code;
+  return result;
 }

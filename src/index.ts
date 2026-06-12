@@ -34,6 +34,13 @@ export {
   uniqueUrlCitations,
 } from "./hosted-tools.js";
 export {
+  DEFAULT_DEFAULT_MODEL,
+  listModels,
+  REASONING_LEVELS,
+  type ReasoningLevel,
+  resolveModel,
+} from "./models.js";
+export {
   convertNativeMessages,
   type HostedToolCallItem,
   type HostedToolName,
@@ -58,6 +65,19 @@ export {
   registerOpenRouterNative,
   streamOpenRouterNative,
 } from "./providers/openrouter-native.js";
+export {
+  type BarSegments,
+  barSegments,
+  type ContextUsage,
+  formatTimestamp,
+  formatTokens,
+  type GitInfo,
+  type GitTreeState,
+  gitInfo,
+  renderStatusline,
+  STATUSLINE_BAR_WIDTH,
+  type StatuslineData,
+} from "./statusline.js";
 export {
   createRequestHumanEditTool,
   type RequestHumanEditDetails,

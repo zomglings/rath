@@ -97,8 +97,8 @@ The `rath` CLI exists for people developing or using rath to:
    harness while it works.
 
 ```
-rath run                  # generic agent loop, interactive
-rath run -p <prompt>      # one prompt, then exit
+rath run                  # generic agent loop, interactive (pi-tui)
+rath run -p <prompt>      # auto-submit a prompt; exit when its turn settles
 rath test                 # run all integration tests
 rath test -n <name>       # run specific tests (repeatable; --name)
 rath test --list          # list available tests
@@ -110,14 +110,28 @@ rath <command> -h         # help for any (sub)command
 `rath run` starts a generic agent loop with nothing implicit: no skill
 discovery, no context-file walking (AGENTS.md is never read). The model sees
 exactly what the flags specify; the provider API key is the only input taken
-from the environment. The one convenience default is tools: `--tools` enables
-all client-side tools when omitted (pass `--tools none` to disable them, or a
-list to choose), since rath development inside `rath run` wants them on hand.
+from the environment. Two convenience defaults: tools — `--tools` enables all
+client-side tools when omitted (pass `--tools none` to disable them, or a list
+to choose), since rath development inside `rath run` wants them on hand; and the
+bundled rath-barbarian skill, whose full text is injected into the system prompt
+so the agent knows it can invoke `rath barbarian run` (this is the only built-in
+skill; rath still does no skill discovery — a future `--skipskills` will opt
+out).
 
-- Two interactive frontends: a plain readline REPL (default; also handles
-  `-p` one-shots) and a pi-tui interface (`-T`/`--tui`) with differential
+- One frontend: a pi-tui interface (a TTY is required) with differential
   rendering, an editor input, selector overlays for the session commands,
-  and Ctrl+C interrupting the current turn instead of killing the session.
+  Ctrl+C interrupting the current turn instead of killing the session, and a
+  statusline below the editor — model, a colored context-window gauge built
+  from the last turn's token usage (cache reads/writes, fresh input, output),
+  cwd, the git branch colored by working-tree state (red merge/rebase, yellow
+  dirty, green clean), and the time the last turn finished.
+- `-p <prompt>` auto-submits the prompt as the session's first message and
+  ends the session when its turn settles (exit code 1 if the turn errored).
+  Typing a prompt of your own during the run takes the session over and keeps
+  it open. The model can end any session with `end_session`, and `/exit
+  [message]` / `end_session({message})` print the parting message to stdout
+  after the TUI releases the terminal — the last, clean, capturable line of
+  the run.
 - Models are explicit: `-m <provider>/<model-id>`. Without `-m`, the pinned
   default model (`/config default-model`) is used, falling back to the
   built-in `openai-native/gpt-5.5`. Any registered pi-ai provider works. At
@@ -138,13 +152,14 @@ list to choose), since rath development inside `rath run` wants them on hand.
   `/websearch [on|off]` toggles hosted web search, `/tools [names|none]`
   shows or sets client-side tools, `/save [path]` writes the context now and
   saves there on exit, `/go`/`/slow` (or `/mode`) switch interaction mode,
-  `/exit` quits. Changes take effect on the next turn. In the TUI, bare
-  `/model` and `/reasoning` open selector overlays.
+  `/exit [message]` quits (printing the message after the TUI closes).
+  Changes take effect on the next turn. Bare `/model` and `/reasoning` open
+  selector overlays.
 - Two interaction modes (`--mode go|slow`, default `go`): **go** runs at full
   speed, tools execute immediately. **slow** gates every tool call behind a
   per-call confirmation (also the mitigation for prompt-injection driving
-  tools while web search is on) and pages long output — through `$PAGER` in
-  the plain REPL, a scrollable overlay in the TUI.
+  tools while web search is on) and pages long output through `$PAGER`,
+  suspending the TUI for the pager's duration.
 - Any registered pi-ai provider works, plus rath's own hosted-tool providers:
   `openai-native/<model>` and `openrouter-native/<model>` (OpenRouter's
   server-side web search with citations; see below).
@@ -162,6 +177,14 @@ list to choose), since rath development inside `rath run` wants them on hand.
   privileges in the current directory; the rest are rath's own tools, which
   give the model the same controls over the session that you have through the
   slash commands — the agent operates the harness as a peer, not a passenger.
+  (The Barbarian Reviewer is deliberately not a tool: it is its own program,
+  so the agent invokes `rath barbarian run` via bash — see below. The bundled
+  rath-barbarian skill is loaded by default, so the agent knows to do this.)
+- `--skill <path>` (repeatable) preloads an additional Agent Skill: the skill's
+  name and description are added to the system prompt and the model reads the
+  skill file (via `read`) when a task matches it. Explicit only — rath does no
+  skill discovery. (The rath-barbarian skill is already built in; `--skill` is
+  for your own skills.)
 - `request_human_edit` is rath's human-in-the-loop tool: it opens a file in
   your editor (`$VISUAL`/`$EDITOR`, falling back to the first of `code`, `vim`,
   `emacs`, `nano` on PATH; GUI editors like `code`/`cursor` get `--wait`
@@ -180,6 +203,45 @@ list to choose), since rath development inside `rath run` wants them on hand.
   — and in go mode they apply immediately.
 - `--save <path>` writes the context as JSON on exit; `--load <path>` resumes
   from one.
+
+### rath barbarian
+
+The Barbarian Reviewer (`src/agents/barbarian.ts`) is its own agent — a
+relentless, non-interactive reviewer that adversarially attacks the changes
+from a source commit-ish to a target commit-ish and reports defects. It is a
+program, not a tool: a human or another agent invokes it. `rath barbarian` is
+a parent command with two subcommands.
+
+- `rath barbarian run` reviews a range. It is not a linter — it hunts defects
+  (correctness, regressions, broken contracts, security exposure, bad tests,
+  incomplete changes) and proves findings by reproduction where possible,
+  staging disposable `git worktree`s under a temp artifact root.
+  - Defaults: `--source` is `main` (falling back to `master`); `--target` is
+    the current repository state — staged, unstaged, and untracked changes
+    captured as a synthetic commit in a disposable worktree, so the review
+    covers work in progress without ever touching your tree. `--repo` points
+    at any path inside the target repository (default: cwd). `--model` /
+    `--reasoning` choose the model (default: the pinned default) and effort
+    (default: `high`); `--instructions` appends extra reviewer instructions.
+  - The findings report prints to stdout; progress (the reasoning summary and
+    reply tokens as they generate, plus tool calls and the artifact path) goes
+    to stderr. Redirect stdout to save it (`rath barbarian run > out.md`).
+    Hosted web search is disabled (an unattended agent has no business
+    following injectable web content). If the model errors out the review
+    retries; if it still cannot finish, the command fails (non-zero) rather
+    than emit a partial report as if complete.
+  - **Checkpointing.** After every turn the review writes its transcript and
+    range to `<artifact-root>/checkpoint.json` (the artifact path printed on
+    stderr). If a long review dies — a sustained rate limit, a crash, an
+    interrupt — resume it with `rath barbarian run --resume <artifact-root>`:
+    it reloads the transcript and continues from where it stopped, reusing the
+    same range and reproduction worktrees, so no investigation is lost.
+- `rath barbarian skill` prints the rath-barbarian Agent Skill to stdout, or
+  installs it with `-m <mode>` (`claude`, `claude-project`, `codex`,
+  `universal`, `github`, …) or `-o <dir>` (`-f` to overwrite). The skill
+  teaches another coding agent to drive `rath barbarian run` itself —
+  including the checkpoint/resume flow. Preload it into a rath session with
+  `rath run --skill <path>`.
 
 ## Integration tests
 
@@ -211,8 +273,8 @@ cost real money (fractions of a cent in tokens, plus per-use fees for hosted
 tools such as web search and code interpreter containers), which is why they
 are not part of the pre-commit checks. (Several tests are the exception:
 `request-human-edit`, `config-preferences`, `configure-tool`, `session-tools`,
-and `slow-mode-gate` call no API and need no key — they exercise the CLI tools
-and config store directly; `catalogue` needs network but no key, hitting
+`slow-mode-gate`, `statusline`, and `barbarian-git` call no API and need no
+key — they exercise the CLI tools and config store directly; `catalogue` needs network but no key, hitting
 OpenRouter's keyless `/api/v1/models`, and skips cleanly when offline.)
 `RATH_TEST_MODEL` overrides the model used by the
 API tests (default: `gpt-5.5`; the OpenRouter test uses `openai/gpt-5.5`).
@@ -256,6 +318,16 @@ to prove what was actually sent to the API.
 - `session-tools` — the session-operating tools (no API, no key): list_models
   enumerates and filters the catalog, save_context writes the session JSON and
   sets the save-on-exit path, and end_session requests exit and terminates.
+- `statusline` — the TUI statusline (no API, no key): context-bar
+  apportionment (proportional, floored for non-zero categories, clamped),
+  token/timestamp formatting, full-line rendering with and without usage, and
+  `gitInfo` against throwaway repositories in each working-tree state (unborn
+  branch, clean, dirty, detached HEAD, not-a-repo).
+- `barbarian-git` — the Barbarian Reviewer's git plumbing (no API, no key):
+  repo-root resolution, the main→master source fallback, change detection,
+  and the synthetic target commit (staged + unstaged + untracked captured in
+  a disposable worktree, with the user's tree left untouched and the diff
+  covering exactly the working-tree changes).
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

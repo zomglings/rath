@@ -18,8 +18,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@earendil-works/pi-agent-core";
-import { loadTools, type RunFlags, resolveModel } from "../commands/run.js";
+import { loadTools, type RunFlags } from "../commands/run.js";
 import { loadPreferences, registerOpenAINative, registerOpenRouterNative } from "../index.js";
+import { resolveModel } from "../models.js";
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);
@@ -45,7 +46,6 @@ async function main(): Promise<void> {
     reasoning: "low",
     webSearch: true,
     tools: ["configure"],
-    tui: false,
     mode: "go",
   };
 

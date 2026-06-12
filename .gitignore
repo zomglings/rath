@@ -145,5 +145,8 @@ vite.config.ts.timestamp-*
 # Throwaway verification scripts / scratch artifacts
 tmp/
 
+# Saved rath session contexts (rath run --save / --load dumps)
+*-session.json
+
 # Claude Code worktrees and session state
 .claude/
