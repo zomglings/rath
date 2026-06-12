@@ -232,35 +232,46 @@ export interface BarbarianResult {
   reasoning: ReasoningLevel;
 }
 
+// git output is captured as raw bytes, never decoded as a string: patch bytes
+// (`git diff --binary`) and file content can contain non-UTF-8 sequences, and
+// `{ encoding: "utf8" }` would replace them with U+FFFD before `git apply`,
+// corrupting the synthetic target. maxBuffer is raised well above the 1 MB
+// default so a large uncommitted diff is not truncated (which fails the spawn).
+const GIT_MAX_BUFFER = 1024 * 1024 * 1024; // 1 GiB
+const GIT_ENV = {
+  // The synthetic commit must succeed on machines with no git identity.
+  GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "Barbarian Reviewer",
+  GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "barbarian@rath.invalid",
+  GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "Barbarian Reviewer",
+  GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "barbarian@rath.invalid",
+};
+
 /**
- * Run git and return RAW stdout. Do not trim here: patch bytes (`git diff
- * --binary`) and NUL-delimited path lists (`ls-files -z`) are data, where
- * trimming corrupts trailing whitespace in the last patch line or a leading
- * space in the first filename. Scalar outputs (SHAs, status checks) trim at
- * the call site via runGitScalar.
+ * Run git and return RAW stdout as a Buffer. Bytes are preserved exactly: patch
+ * bytes (`git diff --binary`) and NUL-delimited path lists (`ls-files -z`) are
+ * binary data, and decoding/trimming would corrupt them. Scalar outputs (SHAs,
+ * status checks) decode and trim at the call site via runGitScalar.
  */
-function runGit(repo: string, args: string[], input?: string): string {
+function runGit(repo: string, args: string[], input?: Buffer): Buffer {
   const result = spawnSync("git", ["-C", repo, ...args], {
-    encoding: "utf8",
     input,
-    env: {
-      ...process.env,
-      // The synthetic commit must succeed on machines with no git identity.
-      GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "Barbarian Reviewer",
-      GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "barbarian@rath.invalid",
-      GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "Barbarian Reviewer",
-      GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "barbarian@rath.invalid",
-    },
+    maxBuffer: GIT_MAX_BUFFER,
+    env: { ...process.env, ...GIT_ENV },
   });
+  if (result.error) {
+    throw new Error(`git -C ${repo} ${args.join(" ")} failed: ${result.error.message}`);
+  }
   if (result.status !== 0) {
-    throw new Error(`git -C ${repo} ${args.join(" ")} failed:\n${result.stderr || result.stdout}`);
+    const stderr = result.stderr?.toString("utf8") ?? "";
+    const stdout = result.stdout?.toString("utf8") ?? "";
+    throw new Error(`git -C ${repo} ${args.join(" ")} failed:\n${stderr || stdout}`);
   }
   return result.stdout;
 }
 
-/** runGit for single-value outputs (SHAs, refs): trailing newline trimmed. */
+/** runGit for single-value outputs (SHAs, refs): decoded and trimmed. */
 function runGitScalar(repo: string, args: string[]): string {
-  return runGit(repo, args).trim();
+  return runGit(repo, args).toString("utf8").trim();
 }
 
 /** Repo root for any path inside a work tree; throws when outside one. */
@@ -308,17 +319,22 @@ export function hasChanges(repo: string): boolean {
 export function createSyntheticTarget(repo: string, artifactRoot: string): string {
   const worktree = join(artifactRoot, "current-state");
   runGit(repo, ["worktree", "add", "--detach", worktree, "HEAD"]);
-  // Patch bytes pass through untouched (see runGit); emptiness is tested on
-  // a trimmed copy only.
+  // Patch bytes pass through untouched as Buffers (see runGit). A non-empty
+  // diff is non-empty bytes; git emits nothing when there is no diff, so a
+  // length check is the emptiness test (no decode, no trim of binary data).
   const staged = runGit(repo, ["diff", "--binary", "--cached"]);
-  if (staged.trim()) {
+  if (staged.length > 0) {
     runGit(worktree, ["apply", "--index", "--binary", "-"], staged);
   }
   const unstaged = runGit(repo, ["diff", "--binary"]);
-  if (unstaged.trim()) {
+  if (unstaged.length > 0) {
     runGit(worktree, ["apply", "--binary", "-"], unstaged);
   }
-  const untracked = runGit(repo, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  // Paths from `ls-files -z` are NUL-delimited; decode for path handling
+  // (filenames are conventionally UTF-8) but copy file content byte-for-byte.
+  const untracked = runGit(repo, ["ls-files", "--others", "--exclude-standard", "-z"]).toString(
+    "utf8",
+  );
   for (const rel of untracked.split("\0").filter(Boolean)) {
     const from = join(repo, rel);
     const to = join(worktree, rel);
