@@ -53,7 +53,7 @@ export interface StatuslineData {
   lastInteraction?: number;
 }
 
-export const STATUSLINE_BAR_WIDTH = 30;
+export const STATUSLINE_BAR_WIDTH = 50;
 
 /** Cells of the context bar assigned to each usage category. */
 export interface BarSegments {
@@ -177,9 +177,9 @@ const PINK = "\x1b[38;5;218m";
 const FULL_BLOCK = "█";
 const LIGHT_SHADE = "░";
 // Leading-edge partial cell, in eighths: PARTIAL_BLOCKS[k-1] is k/8 of a cell.
-// One cell of a 30-wide bar over a 200k window is ~6.7k tokens — too coarse to
-// see a single turn's growth — so the first empty cell renders as a partial
-// block, giving ~8x finer visible progress.
+// One cell of a 50-wide bar over a 200k window is 4k tokens — still too coarse
+// to see a single turn's growth — so the first empty cell renders as a partial
+// block, giving ~8x finer visible progress (~500 tokens per visible step).
 const PARTIAL_BLOCKS = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"] as const;
 
 const GIT_STATE_COLOR: Record<GitTreeState, string> = {
