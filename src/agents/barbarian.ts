@@ -16,7 +16,15 @@
  * barbarian runs unattended where latency is cheap).
  */
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
@@ -312,12 +320,35 @@ export function createSyntheticTarget(repo: string, artifactRoot: string): strin
   }
   const untracked = runGit(repo, ["ls-files", "--others", "--exclude-standard", "-z"]);
   for (const rel of untracked.split("\0").filter(Boolean)) {
+    const from = join(repo, rel);
     const to = join(worktree, rel);
+    // git reports an untracked embedded git repository as a single directory
+    // entry (trailing slash), not its individual files. cpSync without
+    // `recursive` throws EISDIR on a directory, and copying a nested repo's
+    // contents (and its .git) into the synthetic target would misrepresent it
+    // anyway — `git add -A` treats an embedded repo as a gitlink, not content.
+    // Skip it with a diagnostic so a stray nested repo cannot crash the review.
+    if (rel.endsWith("/") || statSync(from).isDirectory()) {
+      process.stderr.write(
+        `[barbarian] skipping untracked nested git repository (not in synthetic target): ${rel}\n`,
+      );
+      continue;
+    }
     mkdirSync(dirname(to), { recursive: true });
-    cpSync(join(repo, rel), to, { dereference: false, preserveTimestamps: true });
+    cpSync(from, to, { dereference: false, preserveTimestamps: true });
   }
   runGit(worktree, ["add", "-A"]);
-  runGit(worktree, ["commit", "--no-gpg-sign", "-m", "Synthetic barbarian target"]);
+  // --allow-empty: when every working-tree change was skipped (e.g. the only
+  // untracked entry was a nested git repo), the synthetic tree equals HEAD and
+  // a plain commit would fail with "nothing to commit". An empty commit yields
+  // a target whose tree matches HEAD, which diffs correctly against the source.
+  runGit(worktree, [
+    "commit",
+    "--no-gpg-sign",
+    "--allow-empty",
+    "-m",
+    "Synthetic barbarian target",
+  ]);
   return runGitScalar(worktree, ["rev-parse", "HEAD"]);
 }
 
