@@ -125,6 +125,13 @@ export interface BarbarianOptions {
   reasoning?: ReasoningLevel;
   /** Observer for agent events (progress reporting). */
   onEvent?: (event: AgentEvent) => void;
+  /**
+   * Called once with the resolved review metadata, before the agent loop runs
+   * (so a progress observer has the details to report alongside live events).
+   */
+  onResolve?: (details: Omit<BarbarianResult, "findings">) => void;
+  /** Abort signal. When it fires, the nested agent loop stops. */
+  signal?: AbortSignal;
 }
 
 export interface BarbarianResult {
@@ -279,6 +286,19 @@ export async function runBarbarianReview(options: BarbarianOptions): Promise<Bar
     : join(artifactRoot, "findings.md");
   mkdirSync(dirname(findingsPath), { recursive: true });
 
+  // Surface the resolved metadata before the loop, so a progress observer can
+  // report it alongside live events (the findings are only known at the end).
+  options.onResolve?.({
+    repo,
+    source,
+    target,
+    findingsPath,
+    artifactRoot,
+    ...(syntheticTarget !== undefined && { syntheticTarget }),
+    modelSpec,
+    reasoning,
+  });
+
   const instructions = options.instructions?.trim();
   const prompt = `SOURCE: ${source}
 TARGET: ${target}
@@ -339,7 +359,10 @@ Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in
         });
       },
     },
-    undefined,
+    // Abort signal: when the caller (e.g. the barbarian_review tool, whose
+    // parent turn was interrupted) aborts, the nested loop stops instead of
+    // running to completion in the background.
+    options.signal,
     // Hosted web search stays off: the barbarian reviews code, and a
     // prompt-injectable hosted tool has no place in an unattended run.
     (m, ctx, opts) => streamSimple(m, ctx, { ...opts, webSearch: false } as SimpleStreamOptions),

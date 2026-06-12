@@ -70,7 +70,40 @@ export function createBarbarianReviewTool(): AgentTool<typeof PARAMETERS, Barbar
       "to the findings file; reproduction artifacts land under a temp artifact root. " +
       "Optionally choose the barbarian's model and reasoning level.",
     parameters: PARAMETERS,
-    execute: async (_toolCallId, params): Promise<AgentToolResult<BarbarianReviewDetails>> => {
+    execute: async (
+      _toolCallId,
+      params,
+      signal,
+      onUpdate,
+    ): Promise<AgentToolResult<BarbarianReviewDetails>> => {
+      // Stream the sub-review's progress into onUpdate so a watching TUI shows
+      // live activity (reasoning summary, decoder tokens, tool calls) instead
+      // of a silent "running" until the end. tool_execution_update is UI-only:
+      // the model still receives just the final result returned below.
+      let details: BarbarianReviewDetails | undefined;
+      // Sliding-window progress so a long review can't grow the streamed text
+      // (and per-update render cost) without bound.
+      const MAX = 8000;
+      let progress = "";
+      const append = (text: string) => {
+        progress += text;
+        if (progress.length > MAX) {
+          progress = `…${progress.slice(-MAX)}`;
+        }
+      };
+      let lastEmit = 0;
+      const emit = (force: boolean) => {
+        if (!onUpdate || !details) {
+          return;
+        }
+        const now = Date.now();
+        if (!force && now - lastEmit < 100) {
+          return; // throttle per-token deltas to ~10 updates/sec
+        }
+        lastEmit = now;
+        onUpdate({ content: [{ type: "text", text: progress }], details });
+      };
+
       const result = await runBarbarianReview({
         repo: params.repo,
         source: params.source,
@@ -79,21 +112,63 @@ export function createBarbarianReviewTool(): AgentTool<typeof PARAMETERS, Barbar
         instructions: params.instructions,
         model: params.model,
         reasoning: params.reasoning as ReasoningLevel | undefined,
+        signal,
+        onResolve: (resolved) => {
+          details = resolved;
+        },
+        onEvent: (event) => {
+          if (event.type === "agent_start") {
+            append("reviewing…\n");
+            emit(true);
+          } else if (event.type === "message_update") {
+            const e = event.assistantMessageEvent;
+            switch (e.type) {
+              case "thinking_start":
+                append("\n[thinking] ");
+                emit(true);
+                break;
+              case "thinking_delta":
+                append(e.delta);
+                emit(false);
+                break;
+              case "text_start":
+                append("\n");
+                emit(true);
+                break;
+              case "text_delta":
+                append(e.delta);
+                emit(false);
+                break;
+              case "thinking_end":
+              case "text_end":
+                // Flush the completed block so the last tokens (which may have
+                // been throttled) reach the live view, not just the final result.
+                emit(true);
+                break;
+            }
+          } else if (event.type === "tool_execution_start") {
+            const args = JSON.stringify(event.args);
+            append(
+              `\n$ ${event.toolName} ${args.length > 120 ? `${args.slice(0, 120)}…` : args}\n`,
+            );
+            emit(true);
+          }
+        },
       });
-      const { findings, ...details } = result;
+      const { findings, ...finalDetails } = result;
       return {
         content: [
           {
             type: "text",
             text:
-              `Barbarian review complete (${details.modelSpec}, reasoning ${details.reasoning}).\n` +
-              `Reviewed: ${details.source} -> ${details.target}` +
-              `${details.syntheticTarget ? " (synthetic target from working tree)" : ""}\n` +
-              `Findings file: ${details.findingsPath}\nArtifacts: ${details.artifactRoot}\n\n` +
+              `Barbarian review complete (${finalDetails.modelSpec}, reasoning ${finalDetails.reasoning}).\n` +
+              `Reviewed: ${finalDetails.source} -> ${finalDetails.target}` +
+              `${finalDetails.syntheticTarget ? " (synthetic target from working tree)" : ""}\n` +
+              `Findings file: ${finalDetails.findingsPath}\nArtifacts: ${finalDetails.artifactRoot}\n\n` +
               findings,
           },
         ],
-        details,
+        details: finalDetails,
       };
     },
   };
