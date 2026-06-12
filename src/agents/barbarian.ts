@@ -19,10 +19,12 @@ import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  statSync,
+  readlinkSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -338,13 +340,26 @@ export function createSyntheticTarget(repo: string, artifactRoot: string): strin
   for (const rel of untracked.split("\0").filter(Boolean)) {
     const from = join(repo, rel);
     const to = join(worktree, rel);
+    // lstat (not stat): never follow the link itself. A symlink is a file entry
+    // to git, stored as its target path (mode 120000) whether or not the target
+    // exists or is a directory.
+    const info = lstatSync(from);
+    if (info.isSymbolicLink()) {
+      // Re-create the symlink verbatim. cpSync cannot copy a symlink whose
+      // target is a directory (EISDIR) or missing (ENOENT) even with
+      // dereference:false; readlink+symlink reproduces it exactly, and
+      // `git add -A` then records the mode-120000 entry.
+      mkdirSync(dirname(to), { recursive: true });
+      symlinkSync(readlinkSync(from), to);
+      continue;
+    }
     // git reports an untracked embedded git repository as a single directory
     // entry (trailing slash), not its individual files. cpSync without
     // `recursive` throws EISDIR on a directory, and copying a nested repo's
     // contents (and its .git) into the synthetic target would misrepresent it
     // anyway — `git add -A` treats an embedded repo as a gitlink, not content.
     // Skip it with a diagnostic so a stray nested repo cannot crash the review.
-    if (rel.endsWith("/") || statSync(from).isDirectory()) {
+    if (rel.endsWith("/") || info.isDirectory()) {
       process.stderr.write(
         `[barbarian] skipping untracked nested git repository (not in synthetic target): ${rel}\n`,
       );
