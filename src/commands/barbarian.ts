@@ -3,8 +3,9 @@
  *
  * A thin CLI over runBarbarianReview (src/agents/barbarian.ts): flags map
  * one-to-one onto BarbarianOptions. Non-interactive by design — progress
- * (tool calls, turn boundaries) streams to stderr, the findings report goes
- * to stdout, and the exit code is 0 only when the review completed.
+ * streams to stderr (the reasoning summary and reply tokens as they generate,
+ * plus tool calls), the findings report goes to stdout, and the exit code is 0
+ * only when the review completed.
  */
 
 import { runBarbarianReview } from "../agents/barbarian.js";
@@ -139,6 +140,17 @@ export const barbarianCommand: Command = {
     // Best-effort live catalogue so openrouter-native model specs resolve.
     await ensureCatalogue();
 
+    // Stream the barbarian's reasoning summary and reply tokens to stderr as
+    // they arrive, alongside the tool-call progress. `streaming` tracks whether
+    // we are mid-line (no trailing newline yet) so a following progress line
+    // starts cleanly. The final report still goes to stdout in full.
+    let streaming = false;
+    const endStreamLine = () => {
+      if (streaming) {
+        process.stderr.write("\n");
+        streaming = false;
+      }
+    };
     try {
       const result = await runBarbarianReview({
         repo,
@@ -151,7 +163,35 @@ export const barbarianCommand: Command = {
         onEvent: (event) => {
           if (event.type === "agent_start") {
             process.stderr.write(dim("[barbarian] reviewing…\n"));
+          } else if (event.type === "message_update") {
+            // assistantMessageEvent carries the per-token deltas: thinking_delta
+            // is the reasoning summary, text_delta is the decoder output.
+            const e = event.assistantMessageEvent;
+            switch (e.type) {
+              case "thinking_start":
+                endStreamLine();
+                process.stderr.write(dim("[barbarian] thinking: "));
+                streaming = true;
+                break;
+              case "thinking_delta":
+                process.stderr.write(dim(e.delta));
+                break;
+              case "text_start":
+                endStreamLine();
+                process.stderr.write(dim("[barbarian] "));
+                streaming = true;
+                break;
+              case "text_delta":
+                // Decoder tokens, undimmed so the content stands out.
+                process.stderr.write(e.delta);
+                break;
+              case "thinking_end":
+              case "text_end":
+                endStreamLine();
+                break;
+            }
           } else if (event.type === "tool_execution_start") {
+            endStreamLine();
             const args = JSON.stringify(event.args);
             process.stderr.write(
               dim(
@@ -161,6 +201,7 @@ export const barbarianCommand: Command = {
               ),
             );
           } else if (event.type === "message_end" && event.message.role === "assistant") {
+            endStreamLine();
             const m = event.message;
             if (m.stopReason === "error" || m.stopReason === "aborted") {
               process.stderr.write(dim(`[barbarian] ${m.stopReason}: ${m.errorMessage ?? ""}\n`));
