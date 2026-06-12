@@ -337,6 +337,10 @@ export function createSyntheticTarget(repo: string, artifactRoot: string): strin
   const untracked = runGit(repo, ["ls-files", "--others", "--exclude-standard", "-z"]).toString(
     "utf8",
   );
+  // Untracked embedded git repositories cannot be represented as content (git
+  // records them as gitlinks, not files). They are skipped, and remembered so
+  // an all-skipped review can name them when it fails below.
+  const skippedEmbedded: string[] = [];
   for (const rel of untracked.split("\0").filter(Boolean)) {
     const from = join(repo, rel);
     const to = join(worktree, rel);
@@ -358,28 +362,34 @@ export function createSyntheticTarget(repo: string, artifactRoot: string): strin
     // `recursive` throws EISDIR on a directory, and copying a nested repo's
     // contents (and its .git) into the synthetic target would misrepresent it
     // anyway — `git add -A` treats an embedded repo as a gitlink, not content.
-    // Skip it with a diagnostic so a stray nested repo cannot crash the review.
     if (rel.endsWith("/") || info.isDirectory()) {
       process.stderr.write(
         `[barbarian] skipping untracked nested git repository (not in synthetic target): ${rel}\n`,
       );
+      skippedEmbedded.push(rel);
       continue;
     }
     mkdirSync(dirname(to), { recursive: true });
     cpSync(from, to, { dereference: false, preserveTimestamps: true });
   }
   runGit(worktree, ["add", "-A"]);
-  // --allow-empty: when every working-tree change was skipped (e.g. the only
-  // untracked entry was a nested git repo), the synthetic tree equals HEAD and
-  // a plain commit would fail with "nothing to commit". An empty commit yields
-  // a target whose tree matches HEAD, which diffs correctly against the source.
-  runGit(worktree, [
-    "commit",
-    "--no-gpg-sign",
-    "--allow-empty",
-    "-m",
-    "Synthetic barbarian target",
-  ]);
+  // The synthetic target must actually differ from HEAD. createSyntheticTarget
+  // is only called when the working tree is dirty, so an index identical to
+  // HEAD here means every change was unrepresentable — a dirty/changed submodule
+  // (a gitlink the working-tree patch cannot apply) or a skipped embedded repo.
+  // Committing that with --allow-empty would hand the reviewer an empty diff and
+  // a false "no findings". Fail loudly instead, naming what could not be captured.
+  if (!runGitScalar(worktree, ["diff", "--cached", "--name-only", "HEAD"])) {
+    const detail = skippedEmbedded.length
+      ? `untracked embedded git repositories: ${skippedEmbedded.join(", ")}`
+      : "changed submodules/gitlinks";
+    throw new Error(
+      "the working tree has uncommitted changes, but none can be represented in the " +
+        `synthetic review target (${detail}). Commit or stage them, or review an explicit ` +
+        "range with --source/--target.",
+    );
+  }
+  runGit(worktree, ["commit", "--no-gpg-sign", "-m", "Synthetic barbarian target"]);
   return runGitScalar(worktree, ["rev-parse", "HEAD"]);
 }
 
