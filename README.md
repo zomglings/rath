@@ -110,9 +110,13 @@ rath <command> -h         # help for any (sub)command
 `rath run` starts a generic agent loop with nothing implicit: no skill
 discovery, no context-file walking (AGENTS.md is never read). The model sees
 exactly what the flags specify; the provider API key is the only input taken
-from the environment. The one convenience default is tools: `--tools` enables
-all client-side tools when omitted (pass `--tools none` to disable them, or a
-list to choose), since rath development inside `rath run` wants them on hand.
+from the environment. Two convenience defaults: tools — `--tools` enables all
+client-side tools when omitted (pass `--tools none` to disable them, or a list
+to choose), since rath development inside `rath run` wants them on hand; and the
+bundled rath-barbarian skill, whose full text is injected into the system prompt
+so the agent knows it can invoke `rath barbarian run` (this is the only built-in
+skill; rath still does no skill discovery — a future `--skipskills` will opt
+out).
 
 - One frontend: a pi-tui interface (a TTY is required) with differential
   rendering, an editor input, selector overlays for the session commands,
@@ -174,14 +178,13 @@ list to choose), since rath development inside `rath run` wants them on hand.
   give the model the same controls over the session that you have through the
   slash commands — the agent operates the harness as a peer, not a passenger.
   (The Barbarian Reviewer is deliberately not a tool: it is its own program,
-  so the agent invokes `rath barbarian run` via bash — see below — or you
-  preload its skill with `--skill`.)
-- `--skill <path>` (repeatable) preloads an Agent Skill: the skill's name and
-  description are added to the system prompt and the model reads the skill file
-  (via `read`) when a task matches it. Explicit only — rath does no skill
-  discovery. Install the bundled rath-barbarian skill with
-  `rath barbarian skill -m claude-project` (or `-o <dir>`), then
-  `rath run --skill .claude/skills/rath-barbarian`.
+  so the agent invokes `rath barbarian run` via bash — see below. The bundled
+  rath-barbarian skill is loaded by default, so the agent knows to do this.)
+- `--skill <path>` (repeatable) preloads an additional Agent Skill: the skill's
+  name and description are added to the system prompt and the model reads the
+  skill file (via `read`) when a task matches it. Explicit only — rath does no
+  skill discovery. (The rath-barbarian skill is already built in; `--skill` is
+  for your own skills.)
 - `request_human_edit` is rath's human-in-the-loop tool: it opens a file in
   your editor (`$VISUAL`/`$EDITOR`, falling back to the first of `code`, `vim`,
   `emacs`, `nano` on PATH; GUI editors like `code`/`cursor` get `--wait`

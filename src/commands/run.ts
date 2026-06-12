@@ -43,6 +43,7 @@ import {
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { barbarianSkillPrompt } from "../barbarian-skill.js";
 import { ensureCatalogue } from "../catalogue.js";
 import { type Command, fullName, helpText } from "../command.js";
 import { clearDefaultModel, configDir, loadPreferences, setDefaultModel } from "../config.js";
@@ -567,9 +568,8 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
     ["tools (available)", TOOL_NAMES.join(", ")],
     [
       "skills",
-      flags.skills?.length
-        ? `${flags.skills.join(", ")} (preloaded via --skill)`
-        : "none (no discovery; --skill <path> to preload)",
+      `${(flags.skills?.length ? flags.skills : ["rath-barbarian"]).join(", ")} ` +
+        "(rath-barbarian built-in; --skill <path> to add more, no discovery)",
     ],
     ["system prompt", "/sys to view or set"],
     ["messages in context", String(agent.state.messages.length)],
@@ -1199,9 +1199,14 @@ export const runCommand: Command = {
       let systemPrompt = systemPromptExplicit
         ? flags.systemPrompt
         : (loaded?.systemPrompt ?? flags.systemPrompt);
-      // Explicitly preload Agent Skills from --skill paths (no discovery): add
-      // their name/description to the system prompt; the model reads the skill
-      // file (via the read tool) when a task matches.
+      // The bundled barbarian skill is loaded by default: its full text is
+      // injected straight into the system prompt so the agent knows
+      // `rath barbarian run` exists from its first turn (a future --skipskills
+      // will opt out). Additional --skill paths are loaded from disk on top (no
+      // discovery): their name/description are added and the model reads the
+      // skill file via the read tool when a task matches.
+      const loadedSkills: string[] = ["rath-barbarian"];
+      systemPrompt = `${systemPrompt}\n\n${barbarianSkillPrompt()}`;
       if (flags.skillPaths?.length) {
         const piCa = await import("@earendil-works/pi-coding-agent");
         const { skills, diagnostics } = piCa.loadSkills({
@@ -1215,9 +1220,10 @@ export const runCommand: Command = {
         }
         if (skills.length > 0) {
           systemPrompt = `${systemPrompt}\n\n${piCa.formatSkillsForPrompt(skills)}`;
-          flags.skills = skills.map((s) => s.name);
+          loadedSkills.push(...skills.map((s) => s.name));
         }
       }
+      flags.skills = loadedSkills;
       agent = new Agent({
         initialState: {
           systemPrompt,

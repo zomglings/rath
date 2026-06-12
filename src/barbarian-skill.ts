@@ -107,6 +107,26 @@ function bundleContents(): Record<string, string> {
   return { "SKILL.md": BARBARIAN_SKILL_MD };
 }
 
+/**
+ * The bundled barbarian skill rendered for direct injection into a `rath run`
+ * agent's system prompt. Unlike `--skill` (which adds a name/description pointer
+ * and lets the model read the file on demand), this inlines the full skill text
+ * straight into the process — no file on disk, no read-tool round trip — so the
+ * agent knows `rath barbarian run` exists from its first turn. The YAML
+ * frontmatter is stripped; the name is carried on the wrapper element.
+ */
+export function barbarianSkillPrompt(): string {
+  const body = BARBARIAN_SKILL_MD.replace(/^---\n[\s\S]*?\n---\n+/, "").trimEnd();
+  return [
+    "The following skill provides specialized instructions for a specific task.",
+    "It is built in — its full instructions are inlined here (there is no file to read).",
+    "",
+    `<skill name="${SKILL_NAME}">`,
+    body,
+    "</skill>",
+  ].join("\n");
+}
+
 function expandHome(path: string): string {
   if (path === "~") {
     return homedir();
