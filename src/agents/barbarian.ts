@@ -1,24 +1,31 @@
 /**
  * The Barbarian Reviewer: a non-interactive subagent that reviews the changes
  * from a source commit-ish to a target commit-ish in a git repository and
- * writes a findings report.
+ * returns a findings report (its final message; the caller prints it).
  *
  * This module is the whole agent: the system prompt, the git plumbing that
  * prepares the review range (including a synthetic commit capturing the
  * working tree when no target is given), and the agent loop that runs the
- * review in-process. It is deliberately frontend-free — `rath barbarian`
- * (src/commands/barbarian.ts) and the `barbarian_review` tool
- * (src/tools/barbarian.ts) are thin wrappers over runBarbarianReview.
+ * review in-process. It is deliberately frontend-free — the `rath barbarian
+ * run` command (src/commands/barbarian.ts) is a thin wrapper over
+ * runBarbarianReview. The barbarian is its own program: anything that wants a
+ * review (a human, or an agent in `rath run` via bash) invokes that command.
  *
  * The caller chooses the barbarian's model and reasoning level; they default
  * to the pinned default model and "high" (reviews want depth, and the
  * barbarian runs unattended where latency is cheap).
  */
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { type AgentContext, type AgentEvent, agentLoop } from "@earendil-works/pi-agent-core";
+import {
+  type AgentContext,
+  type AgentEvent,
+  type AgentMessage,
+  agentLoop,
+  type StreamFn,
+} from "@earendil-works/pi-agent-core";
 import {
   type AssistantMessage,
   type Message,
@@ -39,7 +46,6 @@ Inputs are supplied in the initial user message:
 - \`SOURCE\`: source commit-ish
 - \`TARGET\`: target commit-ish
 - \`ARTIFACT_ROOT\`: directory for disposable worktrees, repro scripts, logs, and other review artifacts
-- \`FINDINGS_FILE\`: path where the runner will write your final findings report
 
 Operating procedure:
 
@@ -68,12 +74,11 @@ Finding standard:
 
 Final response contract:
 
-Your final assistant message is the complete content the runner writes to \`FINDINGS_FILE\`. It must contain the report only. Do not wrap it in Markdown fences. Do not include chatter about having written the file.
+Your final assistant message IS the findings report — it is printed as the result of the review. It must contain the report only. Do not wrap it in Markdown fences. Do not include chatter.
 
 Output format:
 
 \`\`\`text
-Findings file: <FINDINGS_FILE>
 Reviewed: <source-sha>..<target-sha>
 
 Findings:
@@ -101,6 +106,74 @@ Tone:
 - No praise.
 - No hedging unless the evidence is actually uncertain.`;
 
+/**
+ * Injected to continue a review whose previous turn ended in a provider error
+ * or content filter, instead of discarding the whole run. Also nudges toward
+ * neutral phrasing, since security findings phrased as exploit payloads are a
+ * common (and transient) content-filter trigger.
+ */
+const BARBARIAN_CONTINUE_NUDGE =
+  "Your previous turn was cut off by a provider error or content filter. " +
+  "Continue and complete the review. State each finding neutrally — name the " +
+  "defect and its impact, but do not reproduce exploit payloads or step-by-step " +
+  "attack instructions. End with your complete findings report.";
+
+/** Injected when resuming a checkpointed review so the agent picks up cleanly. */
+const BARBARIAN_RESUME_NUDGE =
+  "This review was interrupted and is being resumed from a checkpoint. Pick up " +
+  "where you left off: finish any open investigation, then end with your " +
+  "complete findings report.";
+
+const CHECKPOINT_FILE = "checkpoint.json";
+
+/**
+ * On-disk checkpoint of an in-progress review, written to the artifact root
+ * after each turn so a review that dies (rate limit, crash, interrupt) can be
+ * resumed instead of restarted.
+ */
+interface BarbarianCheckpoint {
+  version: 1;
+  repo: string;
+  source: string;
+  target: string;
+  syntheticTarget?: string;
+  modelSpec: string;
+  reasoning: ReasoningLevel;
+  artifactRoot: string;
+  messages: AgentMessage[];
+}
+
+/**
+ * True when a resumable checkpoint exists at the artifact root. The CLI uses
+ * this to decide whether to suggest `--resume` on failure: a pre-flight failure
+ * (bad model spec, synthetic-target error) leaves an artifact root with no
+ * checkpoint, and resuming it would only fail with "no barbarian checkpoint".
+ */
+export function hasCheckpoint(artifactRoot: string): boolean {
+  return existsSync(join(artifactRoot, CHECKPOINT_FILE));
+}
+
+function loadCheckpoint(artifactRoot: string): BarbarianCheckpoint {
+  const path = join(artifactRoot, CHECKPOINT_FILE);
+  if (!existsSync(path)) {
+    throw new Error(`no barbarian checkpoint at ${path}`);
+  }
+  let parsed: BarbarianCheckpoint;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as BarbarianCheckpoint;
+  } catch (error) {
+    throw new Error(
+      `${path} is not a valid barbarian checkpoint (unreadable JSON): ${
+        error instanceof Error ? error.message : error
+      }`,
+    );
+  }
+  if (parsed.version !== 1 || !Array.isArray(parsed.messages)) {
+    throw new Error(`${path} is not a valid barbarian checkpoint`);
+  }
+  return parsed;
+}
+
 export interface BarbarianOptions {
   /** Git repository (any path inside it). Defaults to the process cwd. */
   repo?: string;
@@ -112,11 +185,6 @@ export interface BarbarianOptions {
    * in a disposable worktree (the user's tree is never touched).
    */
   target?: string;
-  /**
-   * Findings file path; relative paths resolve against the repo root.
-   * Defaults to findings.md under the artifact root.
-   */
-  output?: string;
   /** Extra reviewer instructions appended to the prompt. */
   instructions?: string;
   /** Model spec <provider>/<model-id>. Defaults to the pinned default model. */
@@ -126,21 +194,29 @@ export interface BarbarianOptions {
   /** Observer for agent events (progress reporting). */
   onEvent?: (event: AgentEvent) => void;
   /**
-   * Called once with the resolved review metadata, before the agent loop runs
-   * (so a progress observer has the details to report alongside live events).
+   * Called once with the artifact root as soon as it is known — BEFORE the
+   * first turn — so the caller can report the --resume path even if the review
+   * later fails (the whole point of the checkpoint is to resume a failed run).
    */
-  onResolve?: (details: Omit<BarbarianResult, "findings">) => void;
-  /** Abort signal. When it fires, the nested agent loop stops. */
+  onArtifactRoot?: (artifactRoot: string) => void;
+  /** Abort signal. When it fires, the agent loop stops. */
   signal?: AbortSignal;
+  /**
+   * Resume a prior, interrupted review from its artifact root (the directory
+   * printed as "artifacts:" on the original run). The checkpointed transcript
+   * and range are reloaded and the review continues. Other options that the
+   * checkpoint already supplies (repo/source/target) are ignored; model and
+   * reasoning may be overridden.
+   */
+  resume?: string;
 }
 
 export interface BarbarianResult {
   repo: string;
   source: string;
   target: string;
-  findingsPath: string;
   artifactRoot: string;
-  /** The findings report (also written to findingsPath). */
+  /** The findings report (the agent's final message). */
   findings: string;
   /** Set when the target was synthesized from the working tree. */
   syntheticTarget?: string;
@@ -255,59 +331,91 @@ function finalText(message: AssistantMessage): string {
 /**
  * Run a barbarian review. Resolves the repo, source, and target (synthesizing
  * a target commit from the working tree when none is given), runs the agent
- * loop to completion, writes the findings file, and returns the report.
+ * loop to completion, and returns the findings report (the agent's final
+ * message). The report is not written to a file — the caller prints it.
  *
  * The caller must have registered the providers (registerOpenAINative /
  * registerOpenRouterNative) and primed the catalogue if openrouter-native
  * model specs should resolve against the live list.
  */
 export async function runBarbarianReview(options: BarbarianOptions): Promise<BarbarianResult> {
-  const cwd = process.cwd();
-  const repoArg = options.repo?.trim() || cwd;
-  const repo = repoRoot(isAbsolute(repoArg) ? repoArg : resolve(cwd, repoArg));
-  const modelSpec =
-    options.model?.trim() || loadPreferences().defaultModel || DEFAULT_DEFAULT_MODEL;
-  const model = resolveModel(modelSpec);
-  const reasoning = options.reasoning ?? "high";
-
-  const artifactRoot = mkdtempSync(join(tmpdir(), "rath-barbarian-"));
-  const source = resolveSource(repo, options.source?.trim() || undefined);
-  let target = options.target?.trim();
+  let repo: string;
+  let source: string;
+  let target: string;
   let syntheticTarget: string | undefined;
-  if (!target) {
-    syntheticTarget = hasChanges(repo) ? createSyntheticTarget(repo, artifactRoot) : undefined;
-    target = syntheticTarget ?? "HEAD";
-  }
-  const output = options.output?.trim();
-  const findingsPath = output
-    ? isAbsolute(output)
-      ? output
-      : resolve(repo, output)
-    : join(artifactRoot, "findings.md");
-  mkdirSync(dirname(findingsPath), { recursive: true });
+  let modelSpec: string;
+  let reasoning: ReasoningLevel;
+  let artifactRoot: string;
+  // The accumulated transcript and the prompt for the first loop iteration.
+  // A resume seeds the transcript from the checkpoint and prompts a resume
+  // nudge; a fresh review starts empty with the review prompt.
+  let transcript: AgentMessage[];
+  let promptMessages: AgentMessage[];
 
-  // Surface the resolved metadata before the loop, so a progress observer can
-  // report it alongside live events (the findings are only known at the end).
-  options.onResolve?.({
-    repo,
-    source,
-    target,
-    findingsPath,
-    artifactRoot,
-    ...(syntheticTarget !== undefined && { syntheticTarget }),
-    modelSpec,
-    reasoning,
-  });
-
-  const instructions = options.instructions?.trim();
-  const prompt = `SOURCE: ${source}
+  if (options.resume) {
+    const checkpoint = loadCheckpoint(options.resume);
+    repo = checkpoint.repo;
+    source = checkpoint.source;
+    target = checkpoint.target;
+    syntheticTarget = checkpoint.syntheticTarget;
+    modelSpec = options.model?.trim() || checkpoint.modelSpec;
+    reasoning = options.reasoning ?? checkpoint.reasoning;
+    artifactRoot = checkpoint.artifactRoot;
+    transcript = checkpoint.messages;
+    promptMessages = [{ role: "user", content: BARBARIAN_RESUME_NUDGE, timestamp: Date.now() }];
+  } else {
+    const cwd = process.cwd();
+    const repoArg = options.repo?.trim() || cwd;
+    repo = repoRoot(isAbsolute(repoArg) ? repoArg : resolve(cwd, repoArg));
+    modelSpec = options.model?.trim() || loadPreferences().defaultModel || DEFAULT_DEFAULT_MODEL;
+    reasoning = options.reasoning ?? "high";
+    artifactRoot = mkdtempSync(join(tmpdir(), "rath-barbarian-"));
+    source = resolveSource(repo, options.source?.trim() || undefined);
+    const requestedTarget = options.target?.trim();
+    if (!requestedTarget) {
+      syntheticTarget = hasChanges(repo) ? createSyntheticTarget(repo, artifactRoot) : undefined;
+      target = syntheticTarget ?? "HEAD";
+    } else {
+      target = requestedTarget;
+    }
+    const instructions = options.instructions?.trim();
+    const prompt = `SOURCE: ${source}
 TARGET: ${target}
 ARTIFACT_ROOT: ${artifactRoot}
-FINDINGS_FILE: ${findingsPath}
 
-Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in disposable worktrees under ARTIFACT_ROOT when possible. Your final assistant message must be the complete contents to write to FINDINGS_FILE. Do not ask questions. Do not wait for approval.${
-    instructions ? `\n\nExtra instructions:\n${instructions}` : ""
-  }`;
+Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in disposable worktrees under ARTIFACT_ROOT when possible. Your final assistant message is the complete findings report. Do not ask questions. Do not wait for approval.${
+      instructions ? `\n\nExtra instructions:\n${instructions}` : ""
+    }`;
+    transcript = [];
+    promptMessages = [{ role: "user", content: prompt, timestamp: Date.now() }];
+  }
+  // Surface the artifact root before the first turn so the caller can print the
+  // --resume path even if the review later fails — resuming a failed run is the
+  // whole point of the checkpoint.
+  options.onArtifactRoot?.(artifactRoot);
+  const model = resolveModel(modelSpec);
+
+  // After every turn, persist the transcript and range so an interrupted review
+  // (rate limit, crash, abort) can be resumed from this artifact root rather
+  // than restarted. Best-effort: a write failure must not break the review.
+  const writeCheckpoint = (messages: AgentMessage[]): void => {
+    try {
+      const checkpoint: BarbarianCheckpoint = {
+        version: 1,
+        repo,
+        source,
+        target,
+        ...(syntheticTarget !== undefined && { syntheticTarget }),
+        modelSpec,
+        reasoning,
+        artifactRoot,
+        messages,
+      };
+      writeFileSync(join(artifactRoot, CHECKPOINT_FILE), JSON.stringify(checkpoint, null, 2));
+    } catch {
+      // best-effort
+    }
+  };
 
   // The barbarian's tools run with the repo as cwd. It gets the read/search
   // set plus bash (reproductions) and write (repro scripts under the
@@ -326,69 +434,103 @@ Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in
     ],
   };
 
-  const events = agentLoop(
-    [{ role: "user", content: prompt, timestamp: Date.now() }],
-    context,
-    {
-      model,
-      // pi-ai's stream-level reasoning has no "off" member; omitting the
-      // option is how reasoning is disabled.
-      ...(reasoning !== "off" && { reasoning }),
-      // Drop failed turns and their orphaned tool results so a transient
-      // provider error mid-review does not poison every later request.
-      // Contract: must not throw.
-      convertToLlm: (messages) => {
-        const droppedToolCallIds = new Set<string>();
-        for (const m of messages) {
-          if (m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted")) {
-            for (const block of m.content) {
-              if (block.type === "toolCall") {
-                droppedToolCallIds.add(block.id);
-              }
+  const loopConfig = {
+    model,
+    // pi-ai's stream-level reasoning has no "off" member; omitting the option
+    // is how reasoning is disabled.
+    ...(reasoning !== "off" && { reasoning }),
+    // Drop failed turns and their orphaned tool results so a transient provider
+    // error mid-review does not poison every later request. Contract: no throw.
+    convertToLlm: (messages: AgentMessage[]) => {
+      const droppedToolCallIds = new Set<string>();
+      for (const m of messages) {
+        if (m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted")) {
+          for (const block of m.content) {
+            if (block.type === "toolCall") {
+              droppedToolCallIds.add(block.id);
             }
           }
         }
-        return messages.filter((m): m is Message => {
-          if (m.role === "user") {
-            return true;
-          }
-          if (m.role === "toolResult") {
-            return !droppedToolCallIds.has(m.toolCallId);
-          }
-          return m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted";
-        });
-      },
+      }
+      return messages.filter((m): m is Message => {
+        if (m.role === "user") {
+          return true;
+        }
+        if (m.role === "toolResult") {
+          return !droppedToolCallIds.has(m.toolCallId);
+        }
+        return m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted";
+      });
     },
-    // Abort signal: when the caller (e.g. the barbarian_review tool, whose
-    // parent turn was interrupted) aborts, the nested loop stops instead of
-    // running to completion in the background.
-    options.signal,
-    // Hosted web search stays off: the barbarian reviews code, and a
-    // prompt-injectable hosted tool has no place in an unattended run.
-    (m, ctx, opts) => streamSimple(m, ctx, { ...opts, webSearch: false } as SimpleStreamOptions),
-  );
+  };
+  // Hosted web search stays off: the barbarian reviews code, and a
+  // prompt-injectable hosted tool has no place in an unattended run.
+  const streamFn: StreamFn = (m, ctx, opts) =>
+    streamSimple(m, ctx, { ...opts, webSearch: false } as SimpleStreamOptions);
 
-  if (options.onEvent) {
+  // Run the review, surviving a single errored/content-filtered turn rather
+  // than discarding the whole review: drop that turn (convertToLlm already
+  // strips it from the request) and continue with a neutralizing nudge, up to
+  // MAX_CONTINUES times. Abort is honored immediately (it is a real cancel).
+  const MAX_CONTINUES = 2;
+  let final: AssistantMessage | undefined;
+  for (let attempt = 0; ; attempt++) {
+    const events = agentLoop(
+      promptMessages,
+      { ...context, messages: transcript },
+      loopConfig,
+      options.signal,
+      streamFn,
+    );
+    // Mirror the transcript as turns complete so the checkpoint is written
+    // after EACH turn (agentLoop.result() only resolves at the end of the
+    // whole invocation). live === transcript once produced is folded in below.
+    const live: AgentMessage[] = [...transcript, ...promptMessages];
+    writeCheckpoint(live);
     for await (const event of events) {
-      options.onEvent(event);
+      options.onEvent?.(event);
+      if (event.type === "turn_end") {
+        live.push(event.message, ...event.toolResults);
+        writeCheckpoint(live);
+      }
     }
+    const produced = await events.result();
+    transcript.push(...produced);
+    writeCheckpoint(transcript);
+    const lastAssistant = produced
+      .filter((m): m is AssistantMessage => m.role === "assistant")
+      .at(-1);
+    if (lastAssistant) {
+      final = lastAssistant;
+    }
+    if (!final) {
+      throw new Error("barbarian review produced no assistant message");
+    }
+    if (final.stopReason === "aborted") {
+      throw new Error(`barbarian review aborted: ${final.errorMessage ?? "aborted"}`);
+    }
+    if (final.stopReason !== "error" || attempt >= MAX_CONTINUES) {
+      break;
+    }
+    promptMessages = [{ role: "user", content: BARBARIAN_CONTINUE_NUDGE, timestamp: Date.now() }];
   }
-  const messages = await events.result();
-  const final = messages.filter((m): m is AssistantMessage => m.role === "assistant").at(-1);
-  if (!final) {
-    throw new Error("barbarian review produced no assistant message");
-  }
-  if (final.stopReason === "error" || final.stopReason === "aborted") {
-    throw new Error(`barbarian review failed: ${final.errorMessage ?? final.stopReason}`);
+
+  // The retry above recovers a SINGLE transient/content-filtered turn. If the
+  // final turn is STILL an error after exhausting the retries, the review did
+  // not complete — fail loudly. Do NOT fabricate a success: the CLI must exit
+  // non-zero and the tool must surface an error rather than label a broken run
+  // "complete".
+  if (final.stopReason === "error") {
+    throw new Error(
+      `barbarian review failed after ${MAX_CONTINUES + 1} attempts: ${final.errorMessage ?? "error"}`,
+    );
   }
   const findings = finalText(final).trimEnd();
-  writeFileSync(findingsPath, `${findings}\n`);
 
   return {
     repo,
     source,
     target,
-    findingsPath,
     artifactRoot,
     findings,
     ...(syntheticTarget !== undefined && { syntheticTarget }),

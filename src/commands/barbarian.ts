@@ -1,16 +1,19 @@
 /**
- * `rath barbarian`: run the Barbarian Reviewer against a git repository.
+ * `rath barbarian`: the Barbarian Reviewer CLI. A parent command with two
+ * subcommands — `run` (review a git range) and `skill` (print/install the
+ * Agent Skill that teaches another agent how to drive it).
  *
- * A thin CLI over runBarbarianReview (src/agents/barbarian.ts): flags map
- * one-to-one onto BarbarianOptions. Non-interactive by design — progress
- * streams to stderr (the reasoning summary and reply tokens as they generate,
- * plus tool calls), the findings report goes to stdout, and the exit code is 0
- * only when the review completed.
+ * `rath barbarian run` is a thin wrapper over runBarbarianReview
+ * (src/agents/barbarian.ts). Non-interactive by design — progress streams to
+ * stderr (the reasoning summary and reply tokens as they generate, plus tool
+ * calls), the findings report goes to stdout, and the exit code is 0 only when
+ * the review completed.
  */
 
-import { runBarbarianReview } from "../agents/barbarian.js";
+import { hasCheckpoint, runBarbarianReview } from "../agents/barbarian.js";
+import { barbarianSkillCommand } from "../barbarian-skill.js";
 import { ensureCatalogue } from "../catalogue.js";
-import { type Command, fullName, helpRequested, helpText } from "../command.js";
+import { type Command, fullName, helpRequested, helpText, runSubcommands } from "../command.js";
 import { registerOpenAINative, registerOpenRouterNative } from "../index.js";
 import { REASONING_LEVELS, type ReasoningLevel } from "../models.js";
 
@@ -21,15 +24,15 @@ function dim(text: string): string {
   return process.stderr.isTTY ? `${DIM}${text}${RESET}` : text;
 }
 
-export const barbarianCommand: Command = {
-  name: "barbarian",
-  summary: "Run the Barbarian Reviewer on a git repo",
+const barbarianRunCommand: Command = {
+  name: "run",
+  summary: "Run a review on a git range",
   description:
     "Reviews the changes from a source commit-ish to a target commit-ish and\n" +
-    "writes a findings report. Non-interactive: the barbarian never asks\n" +
+    "reports its findings. Non-interactive: the barbarian never asks\n" +
     "questions; it reads the repo, stages reproductions in disposable\n" +
-    "worktrees under a temp artifact root, and reports. The report is written\n" +
-    "to the findings file and printed to stdout; progress goes to stderr.\n" +
+    "worktrees under a temp artifact root, and reports. The report prints to\n" +
+    "stdout (redirect to save it); progress goes to stderr.\n" +
     "\n" +
     "Defaults: source is main (master if no main); target is the current\n" +
     "repository state including staged, unstaged, and untracked changes,\n" +
@@ -56,13 +59,6 @@ export const barbarianCommand: Command = {
         "Target commit-ish (default: the current repo state, including uncommitted changes)",
     },
     {
-      long: "output",
-      short: "o",
-      takesValue: true,
-      description:
-        "Findings file path, relative to the repo root (default: findings.md in the artifact root)",
-    },
-    {
       long: "instructions",
       short: "i",
       takesValue: true,
@@ -79,6 +75,13 @@ export const barbarianCommand: Command = {
       takesValue: true,
       description: `Barbarian's reasoning effort: ${REASONING_LEVELS.join(", ")} (default: high)`,
     },
+    {
+      long: "resume",
+      takesValue: true,
+      description:
+        "Resume an interrupted review from its artifact root (the 'artifacts:' " +
+        "path printed by the original run); reuses its range and transcript",
+    },
   ],
   async run(prefix, argv) {
     if (helpRequested(argv)) {
@@ -88,10 +91,10 @@ export const barbarianCommand: Command = {
     let repo: string | undefined;
     let source: string | undefined;
     let target: string | undefined;
-    let output: string | undefined;
     let instructions: string | undefined;
     let model: string | undefined;
     let reasoning: ReasoningLevel | undefined;
+    let resume: string | undefined;
     for (let i = 0; i < argv.length; i++) {
       const token = argv[i]!;
       const value = (): string => {
@@ -108,8 +111,6 @@ export const barbarianCommand: Command = {
           source = value();
         } else if (token === "-t" || token === "--target") {
           target = value();
-        } else if (token === "-o" || token === "--output") {
-          output = value();
         } else if (token === "-i" || token === "--instructions") {
           instructions = value();
         } else if (token === "-m" || token === "--model") {
@@ -123,6 +124,8 @@ export const barbarianCommand: Command = {
             return 1;
           }
           reasoning = level;
+        } else if (token === "--resume") {
+          resume = value();
         } else {
           process.stderr.write(
             `Unknown argument: ${token}\nRun "${fullName(this, prefix)} -h" for usage.\n`,
@@ -151,15 +154,22 @@ export const barbarianCommand: Command = {
         streaming = false;
       }
     };
+    // Captured the moment the artifact root is known (before the first turn), so
+    // a failed run still tells the user where to --resume from.
+    let artifactRoot: string | undefined;
     try {
       const result = await runBarbarianReview({
         repo,
         source,
         target,
-        output,
         instructions,
         model,
         reasoning,
+        resume,
+        onArtifactRoot: (root) => {
+          artifactRoot = root;
+          process.stderr.write(dim(`[barbarian] artifacts: ${root}\n`));
+        },
         onEvent: (event) => {
           if (event.type === "agent_start") {
             process.stderr.write(dim("[barbarian] reviewing…\n"));
@@ -213,16 +223,40 @@ export const barbarianCommand: Command = {
         dim(
           `[barbarian] ${result.source} -> ${
             result.syntheticTarget ? `${result.target} (synthetic)` : result.target
-          } | model: ${result.modelSpec} | reasoning: ${result.reasoning}\n` +
-            `[barbarian] findings: ${result.findingsPath}\n` +
-            `[barbarian] artifacts: ${result.artifactRoot}\n`,
+          } | model: ${result.modelSpec} | reasoning: ${result.reasoning}\n`,
         ),
       );
       process.stdout.write(`${result.findings}\n`);
       return 0;
     } catch (error) {
+      endStreamLine();
       process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
+      // The artifact root was printed when the run started; repeat the resume
+      // hint here so a failed run shows exactly how to pick up where it stopped.
+      // Only suggest --resume when a checkpoint actually exists: a pre-flight
+      // failure (bad model spec, synthetic-target error) leaves an artifact root
+      // with no checkpoint, and resuming it would only fail.
+      if (artifactRoot && hasCheckpoint(artifactRoot)) {
+        process.stderr.write(
+          dim(`[barbarian] resume with: rath barbarian run --resume ${artifactRoot}\n`),
+        );
+      }
       return 1;
     }
   },
+};
+
+export const barbarianCommand: Command = {
+  name: "barbarian",
+  summary: "The Barbarian Reviewer (run reviews, or install its skill)",
+  description:
+    "The Barbarian Reviewer is its own agent: a relentless, non-interactive\n" +
+    "code reviewer that adversarially attacks a git diff and reports defects.\n" +
+    "It is a program, not a tool — a human or another agent invokes it.\n" +
+    "\n" +
+    "  rath barbarian run     review a git range (see `run -h`)\n" +
+    "  rath barbarian skill   print or install the Agent Skill that teaches\n" +
+    "                         another agent how to drive `rath barbarian run`",
+  subcommands: [barbarianRunCommand, barbarianSkillCommand],
+  run: runSubcommands,
 };

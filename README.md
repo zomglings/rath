@@ -167,16 +167,21 @@ list to choose), since rath development inside `rath run` wants them on hand.
   citations, and it is stripped before replay to openai-native, which
   reconstructs the real annotations itself.
 - `--tools` enables client-side tools (the full set:
-  `read,bash,edit,write,grep,find,ls,request_human_edit,barbarian_review,configure,list_models,save_context,end_session`).
+  `read,bash,edit,write,grep,find,ls,request_human_edit,configure,list_models,save_context,end_session`).
   Omitting `--tools` enables all of them; `--tools none` disables them. The
   first seven come from `@earendil-works/pi-coding-agent` and run with your
   privileges in the current directory; the rest are rath's own tools, which
   give the model the same controls over the session that you have through the
   slash commands — the agent operates the harness as a peer, not a passenger.
-- `barbarian_review` spawns the Barbarian Reviewer (see `rath barbarian`
-  below) from inside a session: the model can ask for an adversarial review
-  of a repo's changes and gets the findings report back as the tool result,
-  optionally choosing the barbarian's model and reasoning level.
+  (The Barbarian Reviewer is deliberately not a tool: it is its own program,
+  so the agent invokes `rath barbarian run` via bash — see below — or you
+  preload its skill with `--skill`.)
+- `--skill <path>` (repeatable) preloads an Agent Skill: the skill's name and
+  description are added to the system prompt and the model reads the skill file
+  (via `read`) when a task matches it. Explicit only — rath does no skill
+  discovery. Install the bundled rath-barbarian skill with
+  `rath barbarian skill -m claude-project` (or `-o <dir>`), then
+  `rath run --skill .claude/skills/rath-barbarian`.
 - `request_human_edit` is rath's human-in-the-loop tool: it opens a file in
   your editor (`$VISUAL`/`$EDITOR`, falling back to the first of `code`, `vim`,
   `emacs`, `nano` on PATH; GUI editors like `code`/`cursor` get `--wait`
@@ -198,29 +203,42 @@ list to choose), since rath development inside `rath run` wants them on hand.
 
 ### rath barbarian
 
-`rath barbarian` runs the Barbarian Reviewer: a non-interactive subagent
-(`src/agents/barbarian.ts`) that adversarially reviews the changes from a
-source commit-ish to a target commit-ish in a git repository and writes a
-findings report. It is not a linter — it hunts defects (correctness,
-regressions, broken contracts, security exposure, bad tests, incomplete
-changes) and is expected to prove findings by reproduction where possible,
-staging disposable `git worktree`s under a temp artifact root.
+The Barbarian Reviewer (`src/agents/barbarian.ts`) is its own agent — a
+relentless, non-interactive reviewer that adversarially attacks the changes
+from a source commit-ish to a target commit-ish and reports defects. It is a
+program, not a tool: a human or another agent invokes it. `rath barbarian` is
+a parent command with two subcommands.
 
-- Defaults: `--source` is `main` (falling back to `master`); `--target` is
-  the current repository state — staged, unstaged, and untracked changes
-  captured as a synthetic commit in a disposable worktree, so the review
-  covers work in progress without ever touching your tree.
-- `--repo` points at any path inside the target repository (default: cwd).
-- `--model` and `--reasoning` choose the barbarian's model (default: the
-  pinned default model) and effort (default: `high`).
-- `--output` names the findings file (relative to the repo root); by default
-  it lands in the artifact root. `--instructions` appends extra reviewer
-  instructions to the prompt.
-- The findings report prints to stdout; progress and the artifact/findings
-  paths go to stderr. Hosted web search is disabled for the barbarian (an
-  unattended agent has no business following injectable web content).
-- The same agent is available inside `rath run` as the `barbarian_review`
-  tool.
+- `rath barbarian run` reviews a range. It is not a linter — it hunts defects
+  (correctness, regressions, broken contracts, security exposure, bad tests,
+  incomplete changes) and proves findings by reproduction where possible,
+  staging disposable `git worktree`s under a temp artifact root.
+  - Defaults: `--source` is `main` (falling back to `master`); `--target` is
+    the current repository state — staged, unstaged, and untracked changes
+    captured as a synthetic commit in a disposable worktree, so the review
+    covers work in progress without ever touching your tree. `--repo` points
+    at any path inside the target repository (default: cwd). `--model` /
+    `--reasoning` choose the model (default: the pinned default) and effort
+    (default: `high`); `--instructions` appends extra reviewer instructions.
+  - The findings report prints to stdout; progress (the reasoning summary and
+    reply tokens as they generate, plus tool calls and the artifact path) goes
+    to stderr. Redirect stdout to save it (`rath barbarian run > out.md`).
+    Hosted web search is disabled (an unattended agent has no business
+    following injectable web content). If the model errors out the review
+    retries; if it still cannot finish, the command fails (non-zero) rather
+    than emit a partial report as if complete.
+  - **Checkpointing.** After every turn the review writes its transcript and
+    range to `<artifact-root>/checkpoint.json` (the artifact path printed on
+    stderr). If a long review dies — a sustained rate limit, a crash, an
+    interrupt — resume it with `rath barbarian run --resume <artifact-root>`:
+    it reloads the transcript and continues from where it stopped, reusing the
+    same range and reproduction worktrees, so no investigation is lost.
+- `rath barbarian skill` prints the rath-barbarian Agent Skill to stdout, or
+  installs it with `-m <mode>` (`claude`, `claude-project`, `codex`,
+  `universal`, `github`, …) or `-o <dir>` (`-f` to overwrite). The skill
+  teaches another coding agent to drive `rath barbarian run` itself —
+  including the checkpoint/resume flow. Preload it into a rath session with
+  `rath run --skill <path>`.
 
 ## Integration tests
 

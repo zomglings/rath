@@ -45,7 +45,7 @@ import type * as PiTui from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { ensureCatalogue } from "../catalogue.js";
 import { type Command, fullName, helpText } from "../command.js";
-import { clearDefaultModel, loadPreferences, setDefaultModel } from "../config.js";
+import { clearDefaultModel, configDir, loadPreferences, setDefaultModel } from "../config.js";
 import {
   applyCitationTrailer,
   contentBlocks,
@@ -64,7 +64,6 @@ import {
   resolveModel,
 } from "../models.js";
 import { gitInfo, renderStatusline, type StatuslineData } from "../statusline.js";
-import { createBarbarianReviewTool } from "../tools/barbarian.js";
 import { createRequestHumanEditTool } from "../tools/request-human-edit.js";
 import { isOnPath } from "../which.js";
 
@@ -87,7 +86,6 @@ export const TOOL_NAMES = [
   "find",
   "ls",
   "request_human_edit",
-  "barbarian_review",
   "configure",
   "list_models",
   "save_context",
@@ -99,7 +97,6 @@ export type ToolName = (typeof TOOL_NAMES)[number];
 // filesystem. Everything else comes from @earendil-works/pi-coding-agent.
 const RATH_TOOLS = [
   "request_human_edit",
-  "barbarian_review",
   "configure",
   "list_models",
   "save_context",
@@ -128,6 +125,10 @@ export interface RunFlags {
   mode: Mode;
   loadPath?: string;
   savePath?: string;
+  /** Paths to Agent Skills to preload (from --skill); set during startup. */
+  skillPaths?: string[];
+  /** Names of skills actually loaded, for the /config display. */
+  skills?: string[];
 }
 
 // Paging threshold: output longer than this many lines is paged in slow mode.
@@ -195,9 +196,6 @@ export async function loadTools(
         tools.push(
           createRequestHumanEditTool({ cwd, suspendTerminal: ctx.suspendTerminal }) as AgentTool,
         );
-        break;
-      case "barbarian_review":
-        tools.push(createBarbarianReviewTool() as AgentTool);
         break;
       case "configure":
         // Pass the WHOLE ctx (incl. requestExit) so a configure-driven tools
@@ -567,7 +565,12 @@ export function sessionInfo(agent: Agent, flags: RunFlags): [string, string][] {
     ["web search", flags.webSearch ? "on (hosted, openai-native / openrouter-native only)" : "off"],
     ["tools (active)", tools.length > 0 ? tools.join(", ") : "none"],
     ["tools (available)", TOOL_NAMES.join(", ")],
-    ["skills", "none (rath run loads no skills or context files)"],
+    [
+      "skills",
+      flags.skills?.length
+        ? `${flags.skills.join(", ")} (preloaded via --skill)`
+        : "none (no discovery; --skill <path> to preload)",
+    ],
     ["system prompt", "/sys to view or set"],
     ["messages in context", String(agent.state.messages.length)],
     ...(flags.loadPath ? [["loaded from", flags.loadPath] as [string, string]] : []),
@@ -1022,6 +1025,15 @@ export const runCommand: Command = {
         "privileges in the current directory.",
     },
     {
+      long: "skill",
+      takesValue: true,
+      repeatable: true,
+      description:
+        "Preload an Agent Skill from a path (file or directory; repeatable). Its name and " +
+        "description are added to the system prompt and the model reads the skill file when " +
+        "the task matches. Explicit only — no skill discovery.",
+    },
+    {
       long: "load",
       takesValue: true,
       description: "Load a previously saved context (JSON) before starting",
@@ -1116,6 +1128,12 @@ export const runCommand: Command = {
               }
             }
           }
+        } else if (token === "--skill") {
+          const skillPath = value();
+          if (!flags.skillPaths) {
+            flags.skillPaths = [];
+          }
+          flags.skillPaths.push(skillPath);
         } else if (token === "--load") {
           flags.loadPath = value();
         } else if (token === "--save") {
@@ -1178,9 +1196,28 @@ export const runCommand: Command = {
       }
       const loaded = flags.loadPath ? loadContext(flags.loadPath) : undefined;
       // A loaded context supplies the system prompt unless a flag overrides it.
-      const systemPrompt = systemPromptExplicit
+      let systemPrompt = systemPromptExplicit
         ? flags.systemPrompt
         : (loaded?.systemPrompt ?? flags.systemPrompt);
+      // Explicitly preload Agent Skills from --skill paths (no discovery): add
+      // their name/description to the system prompt; the model reads the skill
+      // file (via the read tool) when a task matches.
+      if (flags.skillPaths?.length) {
+        const piCa = await import("@earendil-works/pi-coding-agent");
+        const { skills, diagnostics } = piCa.loadSkills({
+          cwd: process.cwd(),
+          agentDir: configDir(),
+          skillPaths: flags.skillPaths,
+          includeDefaults: false,
+        });
+        for (const d of diagnostics) {
+          process.stderr.write(`${dim(`skill: ${d.message}`)}\n`);
+        }
+        if (skills.length > 0) {
+          systemPrompt = `${systemPrompt}\n\n${piCa.formatSkillsForPrompt(skills)}`;
+          flags.skills = skills.map((s) => s.name);
+        }
+      }
       agent = new Agent({
         initialState: {
           systemPrompt,
