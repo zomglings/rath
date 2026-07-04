@@ -226,6 +226,26 @@ const barbarianRunCommand: Command = {
           } | model: ${result.modelSpec} | reasoning: ${result.reasoning}\n`,
         ),
       );
+      // Aggregate spend for the whole review (checkpointed turns included on
+      // --resume). Zero cost with non-zero tokens means the model carries no
+      // pricing; zero tokens means the provider reported no usage at all —
+      // name each case rather than print a silently wrong $0.
+      const usage = result.usage;
+      const n = (v: number): string => v.toLocaleString("en-US");
+      const totalIn = usage.input + usage.cacheRead + usage.cacheWrite;
+      const caveat =
+        usage.totalTokens === 0
+          ? " (provider reported no usage)"
+          : usage.cost.total === 0
+            ? " (no pricing for model)"
+            : "";
+      process.stderr.write(
+        dim(
+          `[barbarian] tokens: ${n(totalIn)} in (${n(usage.cacheRead)} cache read, ` +
+            `${n(usage.cacheWrite)} cache write), ${n(usage.output)} out | ` +
+            `cost: $${usage.cost.total.toFixed(4)}${caveat}\n`,
+        ),
+      );
       process.stdout.write(`${result.findings}\n`);
       return 0;
     } catch (error) {

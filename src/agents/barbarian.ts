@@ -41,6 +41,7 @@ import {
   type Message,
   type SimpleStreamOptions,
   streamSimple,
+  type Usage,
 } from "@earendil-works/pi-ai";
 import { loadPreferences } from "../config.js";
 import { DEFAULT_DEFAULT_MODEL, type ReasoningLevel, resolveModel } from "../models.js";
@@ -232,6 +233,15 @@ export interface BarbarianResult {
   syntheticTarget?: string;
   modelSpec: string;
   reasoning: ReasoningLevel;
+  /**
+   * Aggregate token usage and cost (USD) summed over every assistant turn in
+   * the review's transcript. On a resume this includes the turns restored
+   * from the checkpoint, so the total covers the whole review, not just the
+   * final leg. Cost components are 0 when the model carries no pricing (e.g.
+   * dynamic-priced OpenRouter auto-routers, or a provider that reports no
+   * usage).
+   */
+  usage: Usage;
 }
 
 // git output is captured as raw bytes, never decoded as a string: patch bytes
@@ -391,6 +401,48 @@ export function createSyntheticTarget(repo: string, artifactRoot: string): strin
   }
   runGit(worktree, ["commit", "--no-gpg-sign", "-m", "Synthetic barbarian target"]);
   return runGitScalar(worktree, ["rev-parse", "HEAD"]);
+}
+
+/**
+ * Sum token usage and cost across every assistant message in a transcript.
+ * Errored and aborted turns count too: the provider may have reported usage
+ * before the turn failed, and that spend is real. Non-assistant messages
+ * carry no usage and contribute nothing.
+ */
+export function totalUsage(messages: AgentMessage[]): Usage {
+  const total: Usage = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  for (const message of messages) {
+    if (message.role !== "assistant") {
+      continue;
+    }
+    // Checkpointed transcripts come from JSON.parse, so a hand-edited or
+    // older-format message may lack usage; skip rather than crash.
+    const usage = (message as AssistantMessage).usage;
+    if (!usage) {
+      continue;
+    }
+    total.input += usage.input;
+    total.output += usage.output;
+    total.cacheRead += usage.cacheRead;
+    total.cacheWrite += usage.cacheWrite;
+    if (usage.cacheWrite1h) {
+      total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
+    }
+    total.totalTokens += usage.totalTokens;
+    total.cost.input += usage.cost.input;
+    total.cost.output += usage.cost.output;
+    total.cost.cacheRead += usage.cost.cacheRead;
+    total.cost.cacheWrite += usage.cost.cacheWrite;
+    total.cost.total += usage.cost.total;
+  }
+  return total;
 }
 
 function finalText(message: AssistantMessage): string {
@@ -608,5 +660,6 @@ Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in
     ...(syntheticTarget !== undefined && { syntheticTarget }),
     modelSpec,
     reasoning,
+    usage: totalUsage(transcript),
   };
 }
