@@ -1,4 +1,11 @@
 export {
+  type BarbarianOptions,
+  type BarbarianResult,
+  hasCheckpoint,
+  runBarbarianReview,
+  totalUsage,
+} from "./agents/barbarian.js";
+export {
   ensureCatalogue,
   openRouterCatalogue,
   type RawOpenRouterModel,

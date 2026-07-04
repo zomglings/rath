@@ -237,9 +237,9 @@ export interface BarbarianResult {
    * Aggregate token usage and cost (USD) summed over every assistant turn in
    * the review's transcript. On a resume this includes the turns restored
    * from the checkpoint, so the total covers the whole review, not just the
-   * final leg. Cost components are 0 when the model carries no pricing (e.g.
-   * dynamic-priced OpenRouter auto-routers, or a provider that reports no
-   * usage).
+   * final leg. Cost components are 0 for a zero-priced (free) model, when the
+   * model's pricing is unknown (e.g. dynamic-priced OpenRouter auto-routers),
+   * or when the provider reports no usage.
    */
   usage: Usage;
 }

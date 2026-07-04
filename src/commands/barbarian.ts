@@ -227,9 +227,11 @@ const barbarianRunCommand: Command = {
         ),
       );
       // Aggregate spend for the whole review (checkpointed turns included on
-      // --resume). Zero cost with non-zero tokens means the model carries no
-      // pricing; zero tokens means the provider reported no usage at all —
-      // name each case rather than print a silently wrong $0.
+      // --resume). Zero cost with non-zero tokens means the model resolved
+      // with all-zero pricing — genuinely free (":free" variants) or pricing
+      // unknown (dynamic-priced auto-routers, clamped sentinels), which are
+      // indistinguishable here; zero tokens means the provider reported no
+      // usage at all. Name each case rather than print a silently wrong $0.
       const usage = result.usage;
       const n = (v: number): string => v.toLocaleString("en-US");
       const totalIn = usage.input + usage.cacheRead + usage.cacheWrite;
@@ -237,7 +239,7 @@ const barbarianRunCommand: Command = {
         usage.totalTokens === 0
           ? " (provider reported no usage)"
           : usage.cost.total === 0
-            ? " (no pricing for model)"
+            ? " (zero-priced or unpriced model)"
             : "";
       process.stderr.write(
         dim(

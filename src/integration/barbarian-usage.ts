@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { totalUsage } from "../agents/barbarian.js";
+import * as publicApi from "../index.js";
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);
@@ -151,6 +152,21 @@ async function main(): Promise<void> {
   assert.equal(sentinel.cost.total, 0.05, "total is the sum of clamped components");
   assert.equal(sentinel.totalTokens, 220, "token counts unaffected by cost clamping");
   log("Case 4 OK: negative pricing sentinels clamped to zero");
+
+  // Case 5: the README-documented programmatic API is actually exported from
+  // the package root (the only subpath package.json exposes).
+  assert.equal(
+    typeof publicApi.runBarbarianReview,
+    "function",
+    "runBarbarianReview exported from the package root",
+  );
+  assert.equal(publicApi.totalUsage, totalUsage, "totalUsage exported from the package root");
+  assert.equal(
+    typeof publicApi.hasCheckpoint,
+    "function",
+    "hasCheckpoint exported from the package root",
+  );
+  log("Case 5 OK: programmatic API exported from the package root");
 
   log("All assertions passed.");
 }
