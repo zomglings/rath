@@ -230,6 +230,15 @@ a parent command with two subcommands.
     following injectable web content). If the model errors out the review
     retries; if it still cannot finish, the command fails (non-zero) rather
     than emit a partial report as if complete.
+  - **Cost tracking.** After the report, a stderr summary reports the review's
+    aggregate token usage and cost in USD, summed over every assistant turn
+    (checkpointed turns included on `--resume`). Programmatic callers get the
+    same aggregate as `result.usage` from `runBarbarianReview` — exported from
+    `@zomglings/rath`, alongside `totalUsage` for summing a checkpoint
+    transcript yourself. A zero cost is annotated: with non-zero tokens the
+    model resolved with all-zero pricing (a genuinely free model and one with
+    unknown pricing — dynamic-priced auto-routers — are indistinguishable
+    here); with zero tokens the provider reported no usage.
   - **Checkpointing.** After every turn the review writes its transcript and
     range to `<artifact-root>/checkpoint.json` (the artifact path printed on
     stderr). If a long review dies — a sustained rate limit, a crash, an

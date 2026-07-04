@@ -72,6 +72,11 @@ rath barbarian run -r /path/to/repo      # review a different repo
   (rate limit, transient content filter) the review retries; if it still cannot
   finish, the command exits non-zero and prints no report — never treat a
   non-zero exit as a clean review.
+- **Cost tracking.** After a completed review, a stderr summary reports the
+  review's total token usage and cost in USD:
+  \`[barbarian] tokens: <in> in (<r> cache read, <w> cache write), <out> out | cost: $<usd>\`.
+  The total is summed over every turn (including checkpointed turns on
+  \`--resume\`). Read that line when you need to report what a review cost.
 - The provider API key must be in the environment (e.g. \`OPENAI_API_KEY\`).
 
 ## Checkpoint and resume
