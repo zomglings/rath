@@ -436,11 +436,25 @@ export function totalUsage(messages: AgentMessage[]): Usage {
       total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
     }
     total.totalTokens += usage.totalTokens;
-    total.cost.input += usage.cost.input;
-    total.cost.output += usage.cost.output;
-    total.cost.cacheRead += usage.cost.cacheRead;
-    total.cost.cacheWrite += usage.cost.cacheWrite;
-    total.cost.total += usage.cost.total;
+    // pi-ai's bundled registry preserves OpenRouter's negative pricing
+    // sentinel for dynamic-priced auto-routers (e.g. openrouter/auto,
+    // -1/token), and calculateCost multiplies it straight into negative
+    // per-turn costs. A negative cost means "pricing unknown", not a refund —
+    // clamp each component so the aggregate never goes negative and a fully
+    // unpriced run reports $0 (which the CLI annotates as unpriced).
+    // The total is re-derived from the clamped components (not clamped
+    // independently) so it always equals their sum, even for a turn with
+    // mixed priced and sentinel components.
+    const clamped = (cost: number): number => (cost > 0 ? cost : 0);
+    const input = clamped(usage.cost.input);
+    const output = clamped(usage.cost.output);
+    const cacheRead = clamped(usage.cost.cacheRead);
+    const cacheWrite = clamped(usage.cost.cacheWrite);
+    total.cost.input += input;
+    total.cost.output += output;
+    total.cost.cacheRead += cacheRead;
+    total.cost.cacheWrite += cacheWrite;
+    total.cost.total += input + output + cacheRead + cacheWrite;
   }
   return total;
 }

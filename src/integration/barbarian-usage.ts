@@ -120,6 +120,38 @@ async function main(): Promise<void> {
   assert.equal(survived.totalTokens, 0, "usage-less assistant message contributes nothing");
   log("Case 3 OK: usage-less assistant message skipped");
 
+  // Case 4: negative cost components — pi-ai's bundled registry preserves
+  // OpenRouter's -1/token sentinel for dynamic-priced auto-routers (e.g.
+  // openrouter/auto), and calculateCost multiplies it into negative per-turn
+  // costs. The aggregate clamps them to zero ("pricing unknown", not a
+  // refund), and a mixed-sign turn's total is the sum of the clamped
+  // components, never the raw negative total.
+  const sentinel = totalUsage([
+    assistant(
+      usage({
+        input: 100,
+        output: 10,
+        totalTokens: 110,
+        cost: { input: -100, output: -10, cacheRead: 0, cacheWrite: 0, total: -110 },
+      }),
+      "stop",
+    ),
+    assistant(
+      usage({
+        input: 100,
+        output: 10,
+        totalTokens: 110,
+        cost: { input: 0.05, output: -10, cacheRead: 0, cacheWrite: 0, total: -9.95 },
+      }),
+      "stop",
+    ),
+  ]);
+  assert.equal(sentinel.cost.input, 0.05, "negative input cost clamped, priced turn kept");
+  assert.equal(sentinel.cost.output, 0, "negative output cost clamped");
+  assert.equal(sentinel.cost.total, 0.05, "total is the sum of clamped components");
+  assert.equal(sentinel.totalTokens, 220, "token counts unaffected by cost clamping");
+  log("Case 4 OK: negative pricing sentinels clamped to zero");
+
   log("All assertions passed.");
 }
 
