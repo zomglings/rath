@@ -12,7 +12,7 @@
  */
 import assert from "node:assert/strict";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { totalUsage } from "../agents/barbarian.js";
 import * as publicApi from "../index.js";
 

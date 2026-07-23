@@ -42,7 +42,7 @@ import {
   type SimpleStreamOptions,
   streamSimple,
   type Usage,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 import { loadPreferences } from "../config.js";
 import { DEFAULT_DEFAULT_MODEL, type ReasoningLevel, resolveModel } from "../models.js";
 

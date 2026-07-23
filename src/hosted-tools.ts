@@ -18,7 +18,7 @@ import type {
   TextContent,
   ThinkingContent,
   ToolCall,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 
 /** Structured citation extracted from a `url_citation` annotation (web search). */
 export interface UrlCitation {

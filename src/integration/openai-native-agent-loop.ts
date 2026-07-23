@@ -14,7 +14,12 @@
  */
 import assert from "node:assert/strict";
 import { type AgentContext, type AgentTool, agentLoop } from "@earendil-works/pi-agent-core";
-import { type Message, type SimpleStreamOptions, streamSimple, Type } from "@earendil-works/pi-ai";
+import {
+  type Message,
+  type SimpleStreamOptions,
+  streamSimple,
+  Type,
+} from "@earendil-works/pi-ai/compat";
 import { getHostedToolCalls, openaiNativeModel, registerOpenAINative } from "../index.js";
 
 const MODEL_ID = process.env.RATH_TEST_MODEL || "gpt-5.5";

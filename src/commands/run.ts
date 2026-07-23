@@ -39,7 +39,7 @@ import {
   type Model,
   type SimpleStreamOptions,
   streamSimple,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 import type * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import type * as PiTui from "@earendil-works/pi-tui";
 import { Type } from "typebox";

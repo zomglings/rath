@@ -11,12 +11,12 @@
  */
 import {
   type Api,
+  type BuiltinProvider,
   getModel,
   getModels,
   getProviders,
-  type KnownProvider,
   type Model,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 import { openRouterCatalogue } from "./catalogue.js";
 import { OPENAI_NATIVE_API, openaiNativeModel } from "./providers/openai-native.js";
 import { OPENROUTER_NATIVE_API, openrouterNativeModel } from "./providers/openrouter-native.js";
@@ -42,7 +42,7 @@ export function resolveModel(spec: string): Model<Api> {
   if (provider === OPENROUTER_NATIVE_API) {
     return openrouterNativeModel(modelId) as Model<Api>;
   }
-  const model = getModel(provider as KnownProvider, modelId as never) as Model<Api> | undefined;
+  const model = getModel(provider as BuiltinProvider, modelId as never) as Model<Api> | undefined;
   if (!model) {
     throw new Error(`Unknown model: ${spec}`);
   }
