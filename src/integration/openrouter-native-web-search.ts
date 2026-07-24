@@ -23,7 +23,7 @@
  * losslessly), not as an echoed request item.
  */
 import assert from "node:assert/strict";
-import { type AssistantMessage, type Context, stream } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Context, stream } from "@earendil-works/pi-ai/compat";
 import {
   contentBlocks,
   getCitations,

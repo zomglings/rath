@@ -10,7 +10,7 @@
  * Requires OPENAI_API_KEY. Exits 0 on success, 1 on failure.
  */
 import assert from "node:assert/strict";
-import { type AssistantMessage, type Context, stream } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Context, stream } from "@earendil-works/pi-ai/compat";
 import {
   getHostedToolCalls,
   type HostedToolCallItem,

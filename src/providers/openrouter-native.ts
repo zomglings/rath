@@ -52,16 +52,14 @@ import {
   createAssistantMessageEventStream,
   getEnvApiKey,
   getModel,
-  type KnownProvider,
   type Model,
-  type Provider,
   parseStreamingJson,
   registerApiProvider,
   type StopReason,
   type StreamFunction,
   type StreamOptions,
   type ToolCall,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 import OpenAI from "openai";
 import type {
   ChatCompletionAssistantMessageParam,
@@ -160,7 +158,7 @@ export function openrouterNativeModel(modelId: string): Model<typeof OPENROUTER_
   }
   // No live catalogue (offline, or used as a library without priming): fall
   // back to pi-ai's bundled registry.
-  const base = getModel("openrouter" as KnownProvider, modelId as never) as Model<string>;
+  const base = getModel("openrouter", modelId as never) as Model<string>;
   if (!base) {
     throw new Error(`Unknown OpenRouter model: ${modelId}`);
   }
@@ -184,7 +182,7 @@ function liveOpenRouterModel(raw: RawOpenRouterModel): Model<typeof OPENROUTER_N
     id: raw.id,
     name: raw.name ?? raw.id,
     api: OPENROUTER_NATIVE_API,
-    provider: "openrouter" as Provider,
+    provider: "openrouter",
     baseUrl: "https://openrouter.ai/api/v1",
     reasoning: raw.supported_parameters?.includes("reasoning") ?? false,
     input: input.length > 0 ? input : ["text"],

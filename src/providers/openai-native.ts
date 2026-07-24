@@ -29,7 +29,6 @@ import {
   createAssistantMessageEventStream,
   getEnvApiKey,
   getModel,
-  type KnownProvider,
   type Model,
   parseStreamingJson,
   registerApiProvider,
@@ -37,7 +36,7 @@ import {
   type StreamFunction,
   type StreamOptions,
   type ToolCall,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 import OpenAI from "openai";
 import type {
   FileSearchTool,
@@ -123,7 +122,7 @@ export interface OpenAINativeOptions extends StreamOptions {
  * provider. Pass any model id from pi-ai's `openai` registry.
  */
 export function openaiNativeModel(modelId: string): Model<typeof OPENAI_NATIVE_API> {
-  const base = getModel("openai" as KnownProvider, modelId as never) as Model<string>;
+  const base = getModel("openai", modelId as never) as Model<string>;
   if (!base) {
     throw new Error(`Unknown OpenAI model: ${modelId}`);
   }
