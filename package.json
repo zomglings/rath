@@ -31,7 +31,9 @@
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js",
     "check": "tsc --noEmit && biome check .",
-    "fix": "biome check --write ."
+    "fix": "biome check --write .",
+    "prepack": "npm run build",
+    "test:package": "node scripts/test-package.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
