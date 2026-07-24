@@ -41,10 +41,10 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.81.1",
-    "@earendil-works/pi-ai": "^0.81.1",
-    "@earendil-works/pi-coding-agent": "^0.81.1",
-    "@earendil-works/pi-tui": "^0.81.1",
+    "@earendil-works/pi-agent-core": "^0.82.0",
+    "@earendil-works/pi-ai": "^0.82.0",
+    "@earendil-works/pi-coding-agent": "^0.82.0",
+    "@earendil-works/pi-tui": "^0.82.0",
     "diff": "^8.0.4",
     "openai": "^6.42.0",
     "typebox": "^1.2.8"
