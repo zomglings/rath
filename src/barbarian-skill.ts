@@ -1,11 +1,11 @@
 /**
  * The `rath barbarian skill` subcommand: print or install the Agent Skill that
- * teaches another agent how to drive `rath barbarian run`.
+ * teaches another agent how to drive `rath barbarian solo` and `horde`.
  *
  * The barbarian is its own program. Rather than expose it as an in-process tool
  * of `rath run` (which couples a long, expensive sub-agent to the parent loop),
  * we ship an Agent Skill: a SKILL.md another coding agent loads so it knows to
- * invoke `rath barbarian run` via its shell. Install/print mirrors how clacks
+ * invoke the appropriate `rath barbarian` mode via its shell. Install/print mirrors how clacks
  * ships its skill — default prints SKILL.md; --mode installs to a known agent
  * skills directory; --outdir writes anywhere; --force overwrites.
  */
@@ -34,7 +34,7 @@ export const BARBARIAN_SKILL_MD = `---
 name: rath-barbarian
 description: >-
   Run an adversarial code review with the Barbarian Reviewer via the rath CLI
-  (\`rath barbarian run\`). Use when asked to review a diff, PR, branch, or
+  (\`rath barbarian solo\` or \`rath barbarian horde\`). Use when asked to review a diff, PR, branch, or
   commit range for real defects (correctness, regressions, security, data loss,
   bad migrations/tests), or to have a change torn down before merging.
 ---
@@ -42,7 +42,8 @@ description: >-
 # Barbarian Reviewer (rath barbarian)
 
 The Barbarian Reviewer is a relentless, non-interactive code reviewer. It is its
-own agent — you drive it from the shell with \`rath barbarian run\`; do not try
+own agent — you drive it from the shell with \`rath barbarian solo\` or
+\`rath barbarian horde\`; do not try
 to review the diff yourself when this skill applies. It reads the repo, stages
 reproductions in disposable git worktrees, and prints a findings report.
 
@@ -52,22 +53,30 @@ reproductions in disposable git worktrees, and prints a findings report.
 # Review a range. Defaults: --source main (or master); --target the current
 # working-tree state (staged + unstaged + untracked), captured as a synthetic
 # commit in a disposable worktree — your tree is never touched.
-rath barbarian run --source <source-commit-ish> --target <target-commit-ish>
+rath barbarian solo --source <source-commit-ish> --target <target-commit-ish>
 
 # Common shapes:
-rath barbarian run                       # main..working-tree
-rath barbarian run -s HEAD               # last commit..working-tree (just uncommitted work)
-rath barbarian run -s main -t HEAD       # everything on this branch vs main
-rath barbarian run -r /path/to/repo      # review a different repo
+rath barbarian solo                       # original reviewer; main..working-tree
+rath barbarian solo -s HEAD               # last commit..working-tree
+rath barbarian solo -s main -t HEAD       # this branch vs main
+rath barbarian solo -r /path/to/repo      # review a different repo
+rath barbarian horde -s main -t HEAD      # chieftain + 4 live attacks (default)
+rath barbarian horde --concurrency 8      # override the positive attack limit
 \`\`\`
 
 - **The findings report prints to stdout**; redirect to save it
-  (\`rath barbarian run -s HEAD > findings.md\`). Progress — the reviewer's
+  (\`rath barbarian solo -s HEAD > findings.md\`). Progress — the reviewer's
   reasoning summary, reply tokens, and tool calls — streams to **stderr**, so
   capturing stdout gives you only the report.
 - \`-i/--instructions "..."\` appends extra reviewer instructions (e.g. focus
   areas). \`-m/--model <provider>/<model-id>\` and \`--reasoning <level>\` choose
   the reviewer's model and effort (default effort: high).
+- Horde mode accepts a positive \`--concurrency <n>\` (default: 4), limiting
+  live attacks. The primary \`--model\` is the chieftain; \`--horde-model\` and
+  \`--horde-reasoning\` select the attack agents and default to the chieftain
+  settings. The chieftain can steer live attacks or reopen completed ones from
+  their checkpoints. The chieftain and every attack run in separate detached
+  worktrees, isolating them from the user's tree.
 - **Exit code is 0 only on a completed review.** If the model errors out
   (rate limit, transient content filter) the review retries; if it still cannot
   finish, the command exits non-zero and prints no report — never treat a
@@ -85,13 +94,18 @@ A review can be long and expensive. After every turn the barbarian writes a
 checkpoint (the full transcript plus the resolved range/model) to
 \`<artifact-root>/checkpoint.json\`. The artifact root is a temp directory
 printed on stderr as \`[barbarian] artifacts: <path>\` (it also holds the
-reproduction worktrees).
+reproduction worktrees). Horde reviews also checkpoint each attack under
+\`<artifact-root>/attacks/<attack-id>/\`, including its transcript, steering
+queue, status, and result.
 
 If a review dies partway — a sustained rate limit, a crash, an interrupt —
 resume it instead of starting over:
 
 \`\`\`bash
-rath barbarian run --resume <artifact-root>
+rath barbarian solo --resume <artifact-root>
+
+# Horde checkpoints resume through horde mode; concurrency remains positive.
+rath barbarian horde --resume <artifact-root> --concurrency 4
 \`\`\`
 
 Resume reloads the checkpointed transcript and continues from where it stopped,
@@ -125,7 +139,7 @@ export const BARBARIAN_SKILL_MARKER = `<skill name="${SKILL_NAME}">`;
  * agent's system prompt. Unlike `--skill` (which adds a name/description pointer
  * and lets the model read the file on demand), this inlines the full skill text
  * straight into the process — no file on disk, no read-tool round trip — so the
- * agent knows `rath barbarian run` exists from its first turn. The YAML
+ * agent knows the `rath barbarian` review modes exist from its first turn. The YAML
  * frontmatter is stripped; the name is carried on the wrapper element.
  */
 export function barbarianSkillPrompt(): string {
@@ -177,7 +191,7 @@ export const barbarianSkillCommand: Command = {
     "Without a flag, prints SKILL.md to stdout. With --mode, installs the\n" +
     "skill bundle into a known agent skills directory; with --outdir, into an\n" +
     "arbitrary directory. The skill teaches another coding agent to run\n" +
-    `'rath barbarian run' itself.\n\nModes: ${Object.keys(MODE_DIRS).join(", ")}.`,
+    `'rath barbarian solo' or 'rath barbarian horde' itself.\n\nModes: ${Object.keys(MODE_DIRS).join(", ")}.`,
   flags: [
     {
       long: "mode",

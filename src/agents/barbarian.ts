@@ -3,13 +3,12 @@
  * from a source commit-ish to a target commit-ish in a git repository and
  * returns a findings report (its final message; the caller prints it).
  *
- * This module is the whole agent: the system prompt, the git plumbing that
- * prepares the review range (including a synthetic commit capturing the
- * working tree when no target is given), and the agent loop that runs the
- * review in-process. It is deliberately frontend-free — the `rath barbarian
- * run` command (src/commands/barbarian.ts) is a thin wrapper over
- * runBarbarianReview. The barbarian is its own program: anything that wants a
- * review (a human, or an agent in `rath run` via bash) invokes that command.
+ * This module contains the original solo reviewer and shared git plumbing.
+ * `runBarbarianReview` preserves that path when concurrency is zero and loads
+ * the chieftain/horde implementation from barbarian-horde.ts for positive
+ * concurrency. It is deliberately frontend-free — the `rath barbarian solo`
+ * and `rath barbarian horde`
+ * command is a thin wrapper over this programmatic API.
  *
  * The caller chooses the barbarian's model and reasoning level; they default
  * to the pinned default model and "high" (reviews want depth, and the
@@ -202,8 +201,20 @@ export interface BarbarianOptions {
   model?: string;
   /** Reasoning effort. Defaults to "high". */
   reasoning?: ReasoningLevel;
+  /**
+   * Maximum concurrently active horde attacks. Zero or omitted preserves the
+   * original single-agent reviewer exactly; a positive value enables the
+   * chieftain/horde reviewer.
+   */
+  concurrency?: number;
+  /** Horde attack model. Defaults to the chieftain's `model`. */
+  hordeModel?: string;
+  /** Horde attack reasoning effort. Defaults to the chieftain's `reasoning`. */
+  hordeReasoning?: ReasoningLevel;
   /** Observer for agent events (progress reporting). */
   onEvent?: (event: AgentEvent) => void;
+  /** Observer for horde worker events, keyed by durable attack id. */
+  onHordeEvent?: (attackId: string, event: AgentEvent) => void;
   /**
    * Called once with the artifact root as soon as it is known — BEFORE the
    * first turn — so the caller can report the --resume path even if the review
@@ -233,6 +244,12 @@ export interface BarbarianResult {
   syntheticTarget?: string;
   modelSpec: string;
   reasoning: ReasoningLevel;
+  /** Zero for the original solo reviewer; positive for horde mode. Optional for API compatibility. */
+  concurrency?: number;
+  /** Present in horde mode. */
+  hordeModelSpec?: string;
+  /** Present in horde mode. */
+  hordeReasoning?: ReasoningLevel;
   /**
    * Aggregate token usage and cost (USD) summed over every assistant turn in
    * the review's transcript. On a resume this includes the turns restored
@@ -250,7 +267,46 @@ export interface BarbarianResult {
 // corrupting the synthetic target. maxBuffer is raised well above the 1 MB
 // default so a large uncommitted diff is not truncated (which fails the spawn).
 const GIT_MAX_BUFFER = 1024 * 1024 * 1024; // 1 GiB
-const GIT_ENV = {
+const GIT_REPOSITORY_ENV_KEYS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CEILING_DIRECTORIES",
+] as const;
+
+export function barbarianGitEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const environment = { ...process.env, ...extra };
+  for (const key of GIT_REPOSITORY_ENV_KEYS) {
+    delete environment[key];
+  }
+  return environment;
+}
+
+/** Return an empty hooks directory owned by this run. */
+export function barbarianHooksPath(artifactRoot: string): string {
+  const hooks = join(artifactRoot, ".empty-git-hooks");
+  mkdirSync(hooks, { recursive: true });
+  return hooks;
+}
+
+/** Prefix Git arguments with the run's empty hooks directory. */
+export function barbarianNoHooksArgs(artifactRoot: string, args: string[]): string[] {
+  return ["-c", `core.hooksPath=${barbarianHooksPath(artifactRoot)}`, ...args];
+}
+
+/** Build a detached-worktree command with repository hooks disabled. */
+export function barbarianWorktreeAddArgs(
+  artifactRoot: string,
+  worktree: string,
+  target: string,
+): string[] {
+  return barbarianNoHooksArgs(artifactRoot, ["worktree", "add", "--detach", worktree, target]);
+}
+
+const GIT_IDENTITY_ENV = {
   // The synthetic commit must succeed on machines with no git identity.
   GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "Barbarian Reviewer",
   GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "barbarian@rath.invalid",
@@ -268,7 +324,7 @@ function runGit(repo: string, args: string[], input?: Buffer): Buffer {
   const result = spawnSync("git", ["-C", repo, ...args], {
     input,
     maxBuffer: GIT_MAX_BUFFER,
-    env: { ...process.env, ...GIT_ENV },
+    env: barbarianGitEnvironment(GIT_IDENTITY_ENV),
   });
   if (result.error) {
     throw new Error(`git -C ${repo} ${args.join(" ")} failed: ${result.error.message}`);
@@ -290,6 +346,7 @@ function runGitScalar(repo: string, args: string[]): string {
 export function repoRoot(path: string): string {
   const result = spawnSync("git", ["-C", path, "rev-parse", "--show-toplevel"], {
     encoding: "utf8",
+    env: barbarianGitEnvironment(),
   });
   if (result.status !== 0) {
     throw new Error(`${path} is not in a git work tree`);
@@ -306,7 +363,7 @@ export function resolveSource(repo: string, source?: string): string {
     const probe = spawnSync(
       "git",
       ["-C", repo, "rev-parse", "--verify", "--quiet", `${candidate}^{commit}`],
-      { encoding: "utf8" },
+      { encoding: "utf8", env: barbarianGitEnvironment() },
     );
     if (probe.status === 0) {
       return candidate;
@@ -330,7 +387,7 @@ export function hasChanges(repo: string): boolean {
  */
 export function createSyntheticTarget(repo: string, artifactRoot: string): string {
   const worktree = join(artifactRoot, "current-state");
-  runGit(repo, ["worktree", "add", "--detach", worktree, "HEAD"]);
+  runGit(repo, barbarianWorktreeAddArgs(artifactRoot, worktree, "HEAD"));
   // Patch bytes pass through untouched as Buffers (see runGit). A non-empty
   // diff is non-empty bytes; git emits nothing when there is no diff, so a
   // length check is the emptiness test (no decode, no trim of binary data).
@@ -399,7 +456,15 @@ export function createSyntheticTarget(repo: string, artifactRoot: string): strin
         "range with --source/--target.",
     );
   }
-  runGit(worktree, ["commit", "--no-gpg-sign", "-m", "Synthetic barbarian target"]);
+  runGit(
+    worktree,
+    barbarianNoHooksArgs(artifactRoot, [
+      "commit",
+      "--no-gpg-sign",
+      "-m",
+      "Synthetic barbarian target",
+    ]),
+  );
   return runGitScalar(worktree, ["rev-parse", "HEAD"]);
 }
 
@@ -476,7 +541,7 @@ function finalText(message: AssistantMessage): string {
  * registerOpenRouterNative) and primed the catalogue if openrouter-native
  * model specs should resolve against the live list.
  */
-export async function runBarbarianReview(options: BarbarianOptions): Promise<BarbarianResult> {
+async function runSoloBarbarianReview(options: BarbarianOptions): Promise<BarbarianResult> {
   let repo: string;
   let source: string;
   let target: string;
@@ -674,6 +739,73 @@ Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in
     ...(syntheticTarget !== undefined && { syntheticTarget }),
     modelSpec,
     reasoning,
+    concurrency: 0,
     usage: totalUsage(transcript),
   };
+}
+
+function checkpointVersion(artifactRoot: string): number {
+  const path = join(artifactRoot, CHECKPOINT_FILE);
+  if (!existsSync(path)) {
+    throw new Error(`no barbarian checkpoint at ${path}`);
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+      version?: unknown;
+      kind?: unknown;
+    };
+    if (parsed.kind === "horde-attack") {
+      throw new Error(
+        "an attack checkpoint must be resumed through its parent horde artifact root",
+      );
+    }
+    if (typeof parsed.version !== "number") {
+      throw new Error("missing numeric version");
+    }
+    return parsed.version;
+  } catch (error) {
+    throw new Error(
+      `${path} is not a valid barbarian checkpoint: ${
+        error instanceof Error ? error.message : error
+      }`,
+    );
+  }
+}
+
+/**
+ * Run a Barbarian review. `concurrency: 0` (the default) is the original solo
+ * reviewer. A positive concurrency enables the chieftain/horde reviewer.
+ */
+export async function runBarbarianReview(options: BarbarianOptions): Promise<BarbarianResult> {
+  const concurrency = options.concurrency ?? 0;
+  if (!Number.isSafeInteger(concurrency) || concurrency < 0) {
+    throw new Error(`barbarian concurrency must be a non-negative integer (got ${concurrency})`);
+  }
+
+  if (options.resume) {
+    const version = checkpointVersion(options.resume);
+    if (version === 2) {
+      if (concurrency === 0) {
+        throw new Error("resuming a horde checkpoint requires --concurrency <positive integer>");
+      }
+      const { runBarbarianHordeReview } = await import("./barbarian-horde.js");
+      return runBarbarianHordeReview(options, concurrency);
+    }
+    if (version !== 1) {
+      throw new Error(`unsupported barbarian checkpoint version: ${version}`);
+    }
+    if (concurrency > 0) {
+      throw new Error("a solo checkpoint cannot be resumed in horde mode");
+    }
+    return runSoloBarbarianReview(options);
+  }
+
+  if (concurrency === 0) {
+    if (options.hordeModel || options.hordeReasoning) {
+      throw new Error("--horde-model/--horde-reasoning require --concurrency > 0");
+    }
+    return runSoloBarbarianReview(options);
+  }
+  const { runBarbarianHordeReview } = await import("./barbarian-horde.js");
+  return runBarbarianHordeReview(options, concurrency);
 }

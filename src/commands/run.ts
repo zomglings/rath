@@ -1201,7 +1201,7 @@ export const runCommand: Command = {
         : (loaded?.systemPrompt ?? flags.systemPrompt);
       // The bundled barbarian skill is loaded by default: its full text is
       // injected straight into the system prompt so the agent knows
-      // `rath barbarian run` exists from its first turn (a future --skipskills
+      // the `rath barbarian` solo/horde modes exist from its first turn (a future --skipskills
       // will opt out). Inject only when absent: a system prompt restored from a
       // saved context already carries the skill, and re-injecting would grow the
       // prompt by a copy on every save/load cycle. Additional --skill paths are

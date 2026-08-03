@@ -10,7 +10,16 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSyntheticTarget, hasChanges, repoRoot, resolveSource } from "../agents/barbarian.js";
@@ -81,10 +90,21 @@ async function main(): Promise<void> {
     mkdirSync(join(repo, "deep"), { recursive: true });
     writeFileSync(join(repo, "deep", "untracked.txt"), "untracked\n");
 
+    const hookMarker = join(dir, "post-checkout-hook-ran");
+    const postCheckoutHook = join(repo, ".git", "hooks", "post-checkout");
+    writeFileSync(postCheckoutHook, `#!/bin/sh\nprintf ran > "${hookMarker}"\nexit 97\n`);
+    chmodSync(postCheckoutHook, 0o755);
+    const preCommitMarker = join(dir, "pre-commit-hook-ran");
+    const preCommitHook = join(repo, ".git", "hooks", "pre-commit");
+    writeFileSync(preCommitHook, `#!/bin/sh\nprintf ran > "${preCommitMarker}"\nexit 98\n`);
+    chmodSync(preCommitHook, 0o755);
+
     const before = git(repo, "status", "--porcelain=v1", "-uall");
     const artifactRoot = mkdtempSync(join(tmpdir(), "rath-barbarian-artifacts-"));
     const sha = createSyntheticTarget(repo, artifactRoot);
     assert.match(sha, /^[0-9a-f]{40}$/, "synthetic target is a full SHA");
+    assert.equal(existsSync(hookMarker), false, "synthetic worktree creation disables hooks");
+    assert.equal(existsSync(preCommitMarker), false, "synthetic commit disables hooks");
 
     // The commit is reachable from the main repo (shared object store).
     const show = (path: string) => git(repo, "show", `${sha}:${path}`);
@@ -107,7 +127,7 @@ async function main(): Promise<void> {
       ["a.txt", "deep/untracked.txt", "staged.txt"],
       "diff covers exactly the working-tree changes",
     );
-    log("Case 4 OK: createSyntheticTarget (staged+unstaged+untracked, tree untouched)");
+    log("Case 4 OK: createSyntheticTarget (changes captured, tree untouched, hooks disabled)");
 
     // Cleanup: prune the worktree so the temp dirs can be removed.
     git(repo, "worktree", "remove", "--force", join(artifactRoot, "current-state"));
