@@ -114,7 +114,7 @@ from the environment. Two convenience defaults: tools — `--tools` enables all
 client-side tools when omitted (pass `--tools none` to disable them, or a list
 to choose), since rath development inside `rath run` wants them on hand; and the
 bundled rath-barbarian skill, whose full text is injected into the system prompt
-so the agent knows it can invoke `rath barbarian run` (this is the only built-in
+so the agent knows it can invoke `rath barbarian solo` or `horde` (this is the only built-in
 skill; rath still does no skill discovery — a future `--skipskills` will opt
 out).
 
@@ -178,7 +178,7 @@ out).
   give the model the same controls over the session that you have through the
   slash commands — the agent operates the harness as a peer, not a passenger.
   (The Barbarian Reviewer is deliberately not a tool: it is its own program,
-  so the agent invokes `rath barbarian run` via bash — see below. The bundled
+  so the agent invokes `rath barbarian solo` or `horde` via bash — see below. The bundled
   rath-barbarian skill is loaded by default, so the agent knows to do this.)
 - `--skill <path>` (repeatable) preloads an additional Agent Skill: the skill's
   name and description are added to the system prompt and the model reads the
@@ -210,9 +210,11 @@ The Barbarian Reviewer (`src/agents/barbarian.ts`) is its own agent — a
 relentless, non-interactive reviewer that adversarially attacks the changes
 from a source commit-ish to a target commit-ish and reports defects. It is a
 program, not a tool: a human or another agent invokes it. `rath barbarian` is
-a parent command with two subcommands.
+a parent command with explicit review modes plus the skill installer.
 
-- `rath barbarian run` reviews a range. It is not a linter — it hunts defects
+- `rath barbarian solo` runs the original single-intelligence review.
+- `rath barbarian horde` runs a chieftain plus parallel attack intelligences.
+  It is not a linter — both modes hunt defects
   (correctness, regressions, broken contracts, security exposure, bad tests,
   incomplete changes) and proves findings by reproduction where possible,
   staging disposable `git worktree`s under a temp artifact root.
@@ -223,9 +225,18 @@ a parent command with two subcommands.
     at any path inside the target repository (default: cwd). `--model` /
     `--reasoning` choose the model (default: the pinned default) and effort
     (default: `high`); `--instructions` appends extra reviewer instructions.
+  - **Parallel horde.** Horde mode makes the primary model the chieftain: it
+    generates hypotheses, launches concurrent attack
+    agents, steers or reopens them from checkpoints, and synthesizes their
+    evidence into the final report. The chieftain and every attack run in
+    separate detached worktrees, isolating them from the user's tree.
+    `--concurrency <n>` sets the positive maximum and defaults to `4`.
+    `--horde-model` and `--horde-reasoning`
+    select the attack agents; each defaults to the corresponding chieftain
+    setting. `--concurrency 1` exercises the horde architecture serially.
   - The findings report prints to stdout; progress (the reasoning summary and
     reply tokens as they generate, plus tool calls and the artifact path) goes
-    to stderr. Redirect stdout to save it (`rath barbarian run > out.md`).
+    to stderr. Redirect stdout to save it (`rath barbarian solo > out.md`).
     Hosted web search is disabled (an unattended agent has no business
     following injectable web content). If the model errors out the review
     retries; if it still cannot finish, the command fails (non-zero) rather
@@ -241,14 +252,16 @@ a parent command with two subcommands.
     here); with zero tokens the provider reported no usage.
   - **Checkpointing.** After every turn the review writes its transcript and
     range to `<artifact-root>/checkpoint.json` (the artifact path printed on
-    stderr). If a long review dies — a sustained rate limit, a crash, an
-    interrupt — resume it with `rath barbarian run --resume <artifact-root>`:
-    it reloads the transcript and continues from where it stopped, reusing the
-    same range and reproduction worktrees, so no investigation is lost.
+    stderr). Horde mode additionally stores each attack transcript, steering
+    queue, state, and result under `<artifact-root>/attacks/<attack-id>/`.
+    Resume a solo review with `rath barbarian solo --resume <artifact-root>`;
+    resume a horde review with `rath barbarian horde --resume <artifact-root>`
+    and optionally its positive concurrency, for example `--concurrency 4`.
+    Completed attacks are reused rather than rerun.
 - `rath barbarian skill` prints the rath-barbarian Agent Skill to stdout, or
   installs it with `-m <mode>` (`claude`, `claude-project`, `codex`,
   `universal`, `github`, …) or `-o <dir>` (`-f` to overwrite). The skill
-  teaches another coding agent to drive `rath barbarian run` itself —
+  teaches another coding agent to drive both review modes itself —
   including the checkpoint/resume flow. Preload it into a rath session with
   `rath run --skill <path>`.
 
