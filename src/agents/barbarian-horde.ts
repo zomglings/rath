@@ -1,17 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
-import { hostname, tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   type AgentContext,
   type AgentEvent,
@@ -30,8 +19,13 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { loadPreferences } from "../config.js";
-import { DEFAULT_DEFAULT_MODEL, type ReasoningLevel, resolveModel } from "../models.js";
+import {
+  acquireBarbarianRunLock,
+  canonicalBarbarianArtifactRoot,
+  createLockedBarbarianArtifactRoot,
+} from "../barbarian-artifacts.js";
+import { hordeIntelligence } from "../barbarian-defaults.js";
+import { REASONING_LEVELS, type ReasoningLevel, resolveModel } from "../models.js";
 import {
   type BarbarianOptions,
   type BarbarianResult,
@@ -49,7 +43,6 @@ const REVIEW_CHECKPOINT = "checkpoint.json";
 const ATTACK_CHECKPOINT = "checkpoint.json";
 const MAX_CONTINUES = 2;
 const WAIT_TIMEOUT_MS = 20_000;
-const LOCK_INITIALIZATION_GRACE_MS = 10_000;
 
 const CHIEFTAIN_SYSTEM_PROMPT = `You are the Barbarian Chieftain. You run non-interactively inside a git repository and command a horde of independent attack agents. Your task is to review SOURCE..TARGET and produce the final findings report. Never ask questions or request approval.
 
@@ -491,7 +484,22 @@ class HordeCoordinator {
     const number = this.checkpoint.nextAttackNumber++;
     const id = `attack-${String(number).padStart(3, "0")}`;
     const artifactRoot = join(this.checkpoint.artifactRoot, "attacks", id);
+    assertCheckpointPathComponents(
+      this.checkpoint.artifactRoot,
+      join(this.checkpoint.artifactRoot, "attacks"),
+      "checkpoint attacks directory",
+    );
+    assertCheckpointPathComponents(
+      this.checkpoint.artifactRoot,
+      artifactRoot,
+      `attack ${id} artifact root`,
+    );
     mkdirSync(artifactRoot, { recursive: true });
+    assertCheckpointPathComponents(
+      this.checkpoint.artifactRoot,
+      artifactRoot,
+      `attack ${id} artifact root`,
+    );
     const record: AttackCheckpoint = {
       version: 1,
       kind: "horde-attack",
@@ -851,167 +859,250 @@ function hordeTools(coordinator: HordeCoordinator): AgentTool[] {
   return [launch, wait, steer, cancel, list];
 }
 
-interface ReviewLockOwner {
-  version: 1;
-  hostname: string;
-  pid: number;
-  token: string;
-  startedAt: string;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function errno(error: unknown): string | undefined {
-  return error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+function isReasoningLevel(value: unknown): value is ReasoningLevel {
+  return typeof value === "string" && (REASONING_LEVELS as readonly string[]).includes(value);
 }
 
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return errno(error) === "EPERM";
+function optionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function strictDescendant(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+function assertCheckpointPathComponents(root: string, path: string, label: string): void {
+  const canonicalRoot = canonicalBarbarianArtifactRoot(root);
+  if (!strictDescendant(canonicalRoot, resolve(path))) {
+    throw new Error(`${label} must remain beneath ${canonicalRoot}`);
+  }
+  let cursor = canonicalRoot;
+  for (const component of relative(canonicalRoot, resolve(path)).split(sep)) {
+    cursor = join(cursor, component);
+    if (!existsSync(cursor)) break;
+    if (lstatSync(cursor).isSymbolicLink()) {
+      throw new Error(`${label} contains a symbolic-link path component: ${cursor}`);
+    }
+  }
+  if (existsSync(path) && !strictDescendant(canonicalRoot, canonicalBarbarianArtifactRoot(path))) {
+    throw new Error(`${label} resolves outside ${canonicalRoot}`);
   }
 }
 
-function readLockOwner(path: string): ReviewLockOwner | undefined {
-  try {
-    const owner = readJson<ReviewLockOwner>(path);
-    return owner.version === 1 && Number.isSafeInteger(owner.pid) ? owner : undefined;
-  } catch {
-    return undefined;
+function exactCheckpointPath(
+  value: unknown,
+  expected: string,
+  label: string,
+  containmentRoot?: string,
+): string {
+  if (typeof value !== "string" || resolve(value) !== resolve(expected)) {
+    throw new Error(`${label} must be ${expected}`);
   }
-}
-
-/** Acquire exclusive ownership of one persisted horde review. */
-function acquireReviewLock(artifactRoot: string): () => void {
-  const lock = join(artifactRoot, ".review-lock");
-  const ownerPath = join(lock, "owner.json");
-  const localHostname = hostname();
-  const owner: ReviewLockOwner = {
-    version: 1,
-    hostname: localHostname,
-    pid: process.pid,
-    token: randomUUID(),
-    startedAt: new Date().toISOString(),
-  };
-  for (;;) {
-    try {
-      mkdirSync(lock);
-      try {
-        writeFileSync(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { flag: "wx" });
-      } catch (error) {
-        rmSync(lock, { recursive: true, force: true });
-        throw error;
-      }
-      return () => {
-        if (readLockOwner(ownerPath)?.token === owner.token) {
-          rmSync(lock, { recursive: true, force: true });
-        }
-      };
-    } catch (error) {
-      if (errno(error) !== "EEXIST") throw error;
-    }
-
-    const current = readLockOwner(ownerPath);
-    if (current) {
-      if (current.hostname !== localHostname) {
-        throw new Error(
-          `horde review is already active on ${current.hostname} (pid ${current.pid})`,
-        );
-      }
-      if (processIsAlive(current.pid)) {
-        throw new Error(`horde review is already active (pid ${current.pid})`);
-      }
-    } else {
-      let age = 0;
-      try {
-        age = Date.now() - statSync(lock).mtimeMs;
-      } catch (error) {
-        if (errno(error) === "ENOENT") continue;
-        throw error;
-      }
-      if (age < LOCK_INITIALIZATION_GRACE_MS) {
-        throw new Error("horde review lock is currently being initialized");
-      }
-    }
-
-    const stale = `${lock}.stale-${randomUUID()}`;
-    try {
-      renameSync(lock, stale);
-    } catch (error) {
-      if (errno(error) === "ENOENT") continue;
-      throw error;
-    }
-    rmSync(stale, { recursive: true, force: true });
+  if (containmentRoot) assertCheckpointPathComponents(containmentRoot, expected, label);
+  if (
+    existsSync(value) &&
+    canonicalBarbarianArtifactRoot(value) !== canonicalBarbarianArtifactRoot(expected)
+  ) {
+    throw new Error(`${label} resolves outside ${expected}`);
   }
+  return resolve(expected);
 }
 
 function loadHordeCheckpoint(artifactRoot: string): HordeCheckpoint {
   const path = join(artifactRoot, REVIEW_CHECKPOINT);
-  const checkpoint = readJson<HordeCheckpoint>(path);
-  if (checkpoint.version !== 2 || checkpoint.mode !== "horde") {
+  const value = readJson<unknown>(path);
+  if (!isRecord(value) || value.version !== 2 || value.mode !== "horde") {
     throw new Error(`${path} is not a horde checkpoint`);
   }
+  const checkpoint = value as Partial<HordeCheckpoint>;
+  const strings = [
+    checkpoint.repo,
+    checkpoint.source,
+    checkpoint.target,
+    checkpoint.chieftainModelSpec,
+    checkpoint.hordeModelSpec,
+  ];
+  if (
+    strings.some((entry) => typeof entry !== "string" || entry.length === 0) ||
+    !optionalString(checkpoint.syntheticTarget) ||
+    !optionalString(checkpoint.instructions) ||
+    !isReasoningLevel(checkpoint.chieftainReasoning) ||
+    !isReasoningLevel(checkpoint.hordeReasoning) ||
+    !Number.isSafeInteger(checkpoint.concurrency) ||
+    (checkpoint.concurrency ?? 0) <= 0 ||
+    !Array.isArray(checkpoint.chieftainMessages) ||
+    !Array.isArray(checkpoint.attackIds) ||
+    !checkpoint.attackIds.every((id) => typeof id === "string" && /^attack-\d{3,}$/.test(id)) ||
+    new Set(checkpoint.attackIds).size !== checkpoint.attackIds.length ||
+    !Number.isSafeInteger(checkpoint.nextAttackNumber) ||
+    (checkpoint.nextAttackNumber ?? 0) <= 0 ||
+    !Number.isSafeInteger(checkpoint.revision) ||
+    (checkpoint.revision ?? -1) < 0
+  ) {
+    throw new Error(`${path} is not a complete horde checkpoint`);
+  }
+  const canonicalRoot = canonicalBarbarianArtifactRoot(artifactRoot);
+  checkpoint.artifactRoot = exactCheckpointPath(
+    checkpoint.artifactRoot,
+    canonicalRoot,
+    "checkpoint artifact root",
+  );
+  const canonicalRepo = canonicalBarbarianArtifactRoot(checkpoint.repo!);
+  if (canonicalBarbarianArtifactRoot(repoRoot(canonicalRepo)) !== canonicalRepo) {
+    throw new Error(`checkpoint repo is not a canonical Git work tree root: ${checkpoint.repo}`);
+  }
+  checkpoint.repo = canonicalRepo;
+  checkpoint.chieftainWorktree = exactCheckpointPath(
+    checkpoint.chieftainWorktree,
+    join(canonicalRoot, "chieftain-worktree"),
+    "checkpoint chieftain worktree",
+    canonicalRoot,
+  );
+  assertCheckpointPathComponents(
+    canonicalRoot,
+    join(canonicalRoot, "attacks"),
+    "checkpoint attacks directory",
+  );
+  const source = resolveCommit(canonicalRepo, checkpoint.source!);
+  const target = resolveCommit(canonicalRepo, checkpoint.target!);
+  if (source !== checkpoint.source || target !== checkpoint.target) {
+    throw new Error(`${path} must store resolved source and target commit IDs`);
+  }
+  const highestAttack = checkpoint.attackIds.reduce(
+    (highest, id) => Math.max(highest, Number(id.slice("attack-".length))),
+    0,
+  );
+  if (checkpoint.nextAttackNumber! <= highestAttack) {
+    throw new Error(`${path} next attack number would overwrite an existing attack`);
+  }
   checkpoint.chieftainMessages = repairDanglingToolCalls(checkpoint.chieftainMessages);
-  return checkpoint;
+  return checkpoint as HordeCheckpoint;
 }
 
 function loadAttacks(checkpoint: HordeCheckpoint): Map<string, AttackCheckpoint> {
   const records = new Map<string, AttackCheckpoint>();
   for (const id of checkpoint.attackIds) {
     const path = join(checkpoint.artifactRoot, "attacks", id, ATTACK_CHECKPOINT);
-    const record = readJson<AttackCheckpoint>(path);
-    if (record.version !== 1 || record.kind !== "horde-attack" || record.id !== id) {
+    const value = readJson<unknown>(path);
+    if (!isRecord(value)) {
       throw new Error(`${path} is not a valid attack checkpoint`);
     }
+    const record = value as Partial<AttackCheckpoint>;
+    const statuses: readonly AttackStatus[] = [
+      "queued",
+      "running",
+      "completed",
+      "failed",
+      "cancelled",
+      "interrupted",
+    ];
+    if (
+      record.version !== 1 ||
+      record.kind !== "horde-attack" ||
+      record.id !== id ||
+      typeof record.hypothesis !== "string" ||
+      typeof record.objective !== "string" ||
+      record.repo !== checkpoint.repo ||
+      record.source !== checkpoint.source ||
+      record.target !== checkpoint.target ||
+      typeof record.modelSpec !== "string" ||
+      !isReasoningLevel(record.reasoning) ||
+      !statuses.includes(record.status as AttackStatus) ||
+      !Array.isArray(record.messages) ||
+      !Array.isArray(record.steering) ||
+      !record.steering.every(
+        (instruction) =>
+          isRecord(instruction) &&
+          Number.isSafeInteger(instruction.sequence) &&
+          (instruction.sequence as number) > 0 &&
+          typeof instruction.content === "string" &&
+          typeof instruction.delivered === "boolean",
+      ) ||
+      !Number.isSafeInteger(record.nextSteeringSequence) ||
+      (record.nextSteeringSequence ?? 0) <= 0 ||
+      !optionalString(record.latestProgress) ||
+      !optionalString(record.result) ||
+      !optionalString(record.error)
+    ) {
+      throw new Error(`${path} is not a complete attack checkpoint`);
+    }
+    record.artifactRoot = exactCheckpointPath(
+      record.artifactRoot,
+      join(checkpoint.artifactRoot, "attacks", id),
+      `attack ${id} artifact root`,
+      checkpoint.artifactRoot,
+    );
+    record.worktree = exactCheckpointPath(
+      record.worktree,
+      join(record.artifactRoot, "worktree"),
+      `attack ${id} worktree`,
+      checkpoint.artifactRoot,
+    );
     record.messages = repairDanglingToolCalls(record.messages);
-    records.set(id, record);
+    records.set(id, record as AttackCheckpoint);
   }
   return records;
 }
 
-function prepareFresh(options: BarbarianOptions, concurrency: number): HordeCheckpoint {
+function prepareFresh(
+  options: BarbarianOptions,
+  concurrency: number,
+): { checkpoint: HordeCheckpoint; release: () => void } {
   const cwd = process.cwd();
   const repoArg = options.repo?.trim() || cwd;
   const repo = repoRoot(isAbsolute(repoArg) ? repoArg : resolve(cwd, repoArg));
-  const preferences = loadPreferences();
-  const chieftainModelSpec =
-    options.model?.trim() || preferences.defaultModel || DEFAULT_DEFAULT_MODEL;
-  const chieftainReasoning = options.reasoning ?? "high";
-  const hordeModelSpec = options.hordeModel?.trim() || chieftainModelSpec;
-  const hordeReasoning = options.hordeReasoning ?? chieftainReasoning;
+  const { chieftainModelSpec, chieftainReasoning, hordeModelSpec, hordeReasoning } =
+    hordeIntelligence(options);
   resolveModel(chieftainModelSpec);
   resolveModel(hordeModelSpec);
-  const artifactRoot = mkdtempSync(join(tmpdir(), "rath-barbarian-horde-"));
-  mkdirSync(join(artifactRoot, "attacks"), { recursive: true });
-  const source = resolveCommit(repo, resolveSource(repo, options.source?.trim() || undefined));
-  const requestedTarget = options.target?.trim();
-  const syntheticTarget = requestedTarget
-    ? undefined
-    : hasChanges(repo)
-      ? createSyntheticTarget(repo, artifactRoot)
-      : undefined;
-  const target = resolveCommit(repo, requestedTarget || syntheticTarget || "HEAD");
-  const instructions = options.instructions?.trim();
-  return {
-    version: 2,
-    mode: "horde",
+  const { artifactRoot, release } = createLockedBarbarianArtifactRoot(
+    "horde",
     repo,
-    source,
-    target,
-    ...(syntheticTarget !== undefined && { syntheticTarget }),
-    artifactRoot,
-    chieftainWorktree: join(artifactRoot, "chieftain-worktree"),
-    chieftainModelSpec,
-    chieftainReasoning,
-    hordeModelSpec,
-    hordeReasoning,
-    concurrency,
-    ...(instructions && { instructions }),
-    chieftainMessages: [],
-    attackIds: [],
-    nextAttackNumber: 1,
-    revision: 0,
-  };
+    options.barbarianDir,
+  );
+  try {
+    mkdirSync(join(artifactRoot, "attacks"), { recursive: true });
+    const source = resolveCommit(repo, resolveSource(repo, options.source?.trim() || undefined));
+    const requestedTarget = options.target?.trim();
+    const syntheticTarget = requestedTarget
+      ? undefined
+      : hasChanges(repo)
+        ? createSyntheticTarget(repo, artifactRoot)
+        : undefined;
+    const target = resolveCommit(repo, requestedTarget || syntheticTarget || "HEAD");
+    const instructions = options.instructions?.trim();
+    return {
+      checkpoint: {
+        version: 2,
+        mode: "horde",
+        repo,
+        source,
+        target,
+        ...(syntheticTarget !== undefined && { syntheticTarget }),
+        artifactRoot,
+        chieftainWorktree: join(artifactRoot, "chieftain-worktree"),
+        chieftainModelSpec,
+        chieftainReasoning,
+        hordeModelSpec,
+        hordeReasoning,
+        concurrency,
+        ...(instructions && { instructions }),
+        chieftainMessages: [],
+        attackIds: [],
+        nextAttackNumber: 1,
+        revision: 0,
+      },
+      release,
+    };
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 async function runLockedHordeReview(
@@ -1019,6 +1110,8 @@ async function runLockedHordeReview(
   concurrency: number,
   checkpoint: HordeCheckpoint,
 ): Promise<BarbarianResult> {
+  // Validate every persisted path before creating or loading a worktree.
+  const records = loadAttacks(checkpoint);
   checkpoint.concurrency = concurrency;
   if (options.model?.trim()) {
     checkpoint.chieftainModelSpec = options.model.trim();
@@ -1047,7 +1140,6 @@ async function runLockedHordeReview(
   atomicWriteJson(join(checkpoint.artifactRoot, REVIEW_CHECKPOINT), checkpoint);
   options.onArtifactRoot?.(checkpoint.artifactRoot);
 
-  const records = loadAttacks(checkpoint);
   const coordinator = new HordeCoordinator({
     checkpoint,
     records,
@@ -1162,26 +1254,29 @@ async function runLockedHordeReview(
 export async function runBarbarianHordeReview(
   options: BarbarianOptions,
   concurrency: number,
+  lockedResumeRoot?: string,
 ): Promise<BarbarianResult> {
   let checkpoint: HordeCheckpoint;
-  let release: () => void;
+  let release: (() => void) | undefined;
   if (options.resume) {
-    const artifactRoot = resolve(options.resume);
-    release = acquireReviewLock(artifactRoot);
+    const artifactRoot = lockedResumeRoot ?? canonicalBarbarianArtifactRoot(options.resume);
+    if (!lockedResumeRoot) release = acquireBarbarianRunLock(artifactRoot);
     try {
       checkpoint = loadHordeCheckpoint(artifactRoot);
+      if (canonicalBarbarianArtifactRoot(checkpoint.artifactRoot) !== artifactRoot) {
+        throw new Error(`checkpoint artifact root does not match --resume path: ${artifactRoot}`);
+      }
     } catch (error) {
-      release();
+      release?.();
       throw error;
     }
   } else {
-    checkpoint = prepareFresh(options, concurrency);
-    release = acquireReviewLock(checkpoint.artifactRoot);
+    ({ checkpoint, release } = prepareFresh(options, concurrency));
   }
   try {
     return await runLockedHordeReview(options, concurrency, checkpoint);
   } finally {
-    release();
+    release?.();
   }
 }
 

@@ -16,17 +16,28 @@ const parent = run(["barbarian", "-h"]);
 assert.equal(parent.status, 0);
 assert.match(parent.stdout, /solo\s+Review with one intelligence/);
 assert.match(parent.stdout, /horde\s+Review with a parallel chieftain and horde/);
+assert.match(parent.stdout, /clean\s+Remove retained Barbarian runs/);
 assert.doesNotMatch(parent.stdout, /^\s*run\s/m);
 
 const solo = run(["barbarian", "solo", "-h"]);
 assert.equal(solo.status, 0);
 assert.doesNotMatch(solo.stdout, /--concurrency/);
 assert.doesNotMatch(solo.stdout, /--horde-model/);
+assert.match(solo.stdout, /--barbarian-dir/);
 
 const horde = run(["barbarian", "horde", "-h"]);
 assert.equal(horde.status, 0);
 assert.match(horde.stdout, /--concurrency <value>.*default: 4/);
 assert.match(horde.stdout, /--horde-model <value>/);
+assert.match(horde.stdout, /openrouter-native\/openai\/gpt-5\.6-sol/);
+assert.match(horde.stdout, /openrouter-native\/openai\/gpt-5\.6-terra/);
+assert.match(horde.stdout, /--horde-reasoning <value>.*default: medium/);
+
+const clean = run(["barbarian", "clean", "-h"]);
+assert.equal(clean.status, 0);
+assert.match(clean.stdout, /--repo <value>/);
+assert.match(clean.stdout, /--barbarian-dir <value>/);
+assert.match(clean.stdout, /--dry-run/);
 
 const zero = run(["barbarian", "horde", "--concurrency", "0"]);
 assert.equal(zero.status, 1);

@@ -20,13 +20,11 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readlinkSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   type AgentContext,
@@ -42,6 +40,11 @@ import {
   streamSimple,
   type Usage,
 } from "@earendil-works/pi-ai/compat";
+import {
+  acquireBarbarianRunLock,
+  canonicalBarbarianArtifactRoot,
+  createLockedBarbarianArtifactRoot,
+} from "../barbarian-artifacts.js";
 import { loadPreferences } from "../config.js";
 import { DEFAULT_DEFAULT_MODEL, type ReasoningLevel, resolveModel } from "../models.js";
 
@@ -223,6 +226,8 @@ export interface BarbarianOptions {
   onArtifactRoot?: (artifactRoot: string) => void;
   /** Abort signal. When it fires, the agent loop stops. */
   signal?: AbortSignal;
+  /** Parent directory for fresh Barbarian artifact roots. */
+  barbarianDir?: string;
   /**
    * Resume a prior, interrupted review from its artifact root (the directory
    * printed as "artifacts:" on the original run). The checkpointed transcript
@@ -541,7 +546,10 @@ function finalText(message: AssistantMessage): string {
  * registerOpenRouterNative) and primed the catalogue if openrouter-native
  * model specs should resolve against the live list.
  */
-async function runSoloBarbarianReview(options: BarbarianOptions): Promise<BarbarianResult> {
+async function runSoloBarbarianReview(
+  options: BarbarianOptions,
+  lockedResumeRoot?: string,
+): Promise<BarbarianResult> {
   let repo: string;
   let source: string;
   let target: string;
@@ -554,194 +562,207 @@ async function runSoloBarbarianReview(options: BarbarianOptions): Promise<Barbar
   // nudge; a fresh review starts empty with the review prompt.
   let transcript: AgentMessage[];
   let promptMessages: AgentMessage[];
+  let release: (() => void) | undefined;
 
-  if (options.resume) {
-    const checkpoint = loadCheckpoint(options.resume);
-    repo = checkpoint.repo;
-    source = checkpoint.source;
-    target = checkpoint.target;
-    syntheticTarget = checkpoint.syntheticTarget;
-    modelSpec = options.model?.trim() || checkpoint.modelSpec;
-    reasoning = options.reasoning ?? checkpoint.reasoning;
-    artifactRoot = checkpoint.artifactRoot;
-    transcript = checkpoint.messages;
-    promptMessages = [{ role: "user", content: BARBARIAN_RESUME_NUDGE, timestamp: Date.now() }];
-  } else {
-    const cwd = process.cwd();
-    const repoArg = options.repo?.trim() || cwd;
-    repo = repoRoot(isAbsolute(repoArg) ? repoArg : resolve(cwd, repoArg));
-    modelSpec = options.model?.trim() || loadPreferences().defaultModel || DEFAULT_DEFAULT_MODEL;
-    reasoning = options.reasoning ?? "high";
-    artifactRoot = mkdtempSync(join(tmpdir(), "rath-barbarian-"));
-    source = resolveSource(repo, options.source?.trim() || undefined);
-    const requestedTarget = options.target?.trim();
-    if (!requestedTarget) {
-      syntheticTarget = hasChanges(repo) ? createSyntheticTarget(repo, artifactRoot) : undefined;
-      target = syntheticTarget ?? "HEAD";
+  try {
+    if (options.resume) {
+      artifactRoot = lockedResumeRoot ?? canonicalBarbarianArtifactRoot(options.resume);
+      if (!lockedResumeRoot) release = acquireBarbarianRunLock(artifactRoot);
+      const checkpoint = loadCheckpoint(artifactRoot);
+      if (canonicalBarbarianArtifactRoot(checkpoint.artifactRoot) !== artifactRoot) {
+        throw new Error(`checkpoint artifact root does not match --resume path: ${artifactRoot}`);
+      }
+      repo = checkpoint.repo;
+      source = checkpoint.source;
+      target = checkpoint.target;
+      syntheticTarget = checkpoint.syntheticTarget;
+      modelSpec = options.model?.trim() || checkpoint.modelSpec;
+      reasoning = options.reasoning ?? checkpoint.reasoning;
+      transcript = checkpoint.messages;
+      promptMessages = [{ role: "user", content: BARBARIAN_RESUME_NUDGE, timestamp: Date.now() }];
     } else {
-      target = requestedTarget;
-    }
-    const instructions = options.instructions?.trim();
-    const prompt = `SOURCE: ${source}
+      const cwd = process.cwd();
+      const repoArg = options.repo?.trim() || cwd;
+      repo = repoRoot(isAbsolute(repoArg) ? repoArg : resolve(cwd, repoArg));
+      modelSpec = options.model?.trim() || loadPreferences().defaultModel || DEFAULT_DEFAULT_MODEL;
+      reasoning = options.reasoning ?? "high";
+      ({ artifactRoot, release } = createLockedBarbarianArtifactRoot(
+        "solo",
+        repo,
+        options.barbarianDir,
+      ));
+      source = resolveSource(repo, options.source?.trim() || undefined);
+      const requestedTarget = options.target?.trim();
+      if (!requestedTarget) {
+        syntheticTarget = hasChanges(repo) ? createSyntheticTarget(repo, artifactRoot) : undefined;
+        target = syntheticTarget ?? "HEAD";
+      } else {
+        target = requestedTarget;
+      }
+      const instructions = options.instructions?.trim();
+      const prompt = `SOURCE: ${source}
 TARGET: ${target}
 ARTIFACT_ROOT: ${artifactRoot}
 
 Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in disposable worktrees under ARTIFACT_ROOT when possible. Your final assistant message is the complete findings report. Do not ask questions. Do not wait for approval.${
-      instructions ? `\n\nExtra instructions:\n${instructions}` : ""
-    }`;
-    transcript = [];
-    promptMessages = [{ role: "user", content: prompt, timestamp: Date.now() }];
-  }
-  // Surface the artifact root before the first turn so the caller can print the
-  // --resume path even if the review later fails — resuming a failed run is the
-  // whole point of the checkpoint.
-  options.onArtifactRoot?.(artifactRoot);
-  const model = resolveModel(modelSpec);
-
-  // After every turn, persist the transcript and range so an interrupted review
-  // (rate limit, crash, abort) can be resumed from this artifact root rather
-  // than restarted. Best-effort: a write failure must not break the review.
-  const writeCheckpoint = (messages: AgentMessage[]): void => {
-    try {
-      const checkpoint: BarbarianCheckpoint = {
-        version: 1,
-        repo,
-        source,
-        target,
-        ...(syntheticTarget !== undefined && { syntheticTarget }),
-        modelSpec,
-        reasoning,
-        artifactRoot,
-        messages,
-      };
-      writeFileSync(join(artifactRoot, CHECKPOINT_FILE), JSON.stringify(checkpoint, null, 2));
-    } catch {
-      // best-effort
+        instructions ? `\n\nExtra instructions:\n${instructions}` : ""
+      }`;
+      transcript = [];
+      promptMessages = [{ role: "user", content: prompt, timestamp: Date.now() }];
     }
-  };
+    // Surface the artifact root before the first turn so the caller can print the
+    // --resume path even if the review later fails — resuming a failed run is the
+    // whole point of the checkpoint.
+    options.onArtifactRoot?.(artifactRoot);
+    const model = resolveModel(modelSpec);
 
-  // The barbarian's tools run with the repo as cwd. It gets the read/search
-  // set plus bash (reproductions) and write (repro scripts under the
-  // artifact root; the prompt forbids writes elsewhere).
-  const pi = await import("@earendil-works/pi-coding-agent");
-  const context: AgentContext = {
-    systemPrompt: BARBARIAN_SYSTEM_PROMPT,
-    messages: [],
-    tools: [
-      pi.createReadTool(repo),
-      pi.createBashTool(repo),
-      pi.createGrepTool(repo),
-      pi.createFindTool(repo),
-      pi.createLsTool(repo),
-      pi.createWriteTool(repo),
-    ],
-  };
+    // After every turn, persist the transcript and range so an interrupted review
+    // (rate limit, crash, abort) can be resumed from this artifact root rather
+    // than restarted. Best-effort: a write failure must not break the review.
+    const writeCheckpoint = (messages: AgentMessage[]): void => {
+      try {
+        const checkpoint: BarbarianCheckpoint = {
+          version: 1,
+          repo,
+          source,
+          target,
+          ...(syntheticTarget !== undefined && { syntheticTarget }),
+          modelSpec,
+          reasoning,
+          artifactRoot,
+          messages,
+        };
+        writeFileSync(join(artifactRoot, CHECKPOINT_FILE), JSON.stringify(checkpoint, null, 2));
+      } catch {
+        // best-effort
+      }
+    };
 
-  const loopConfig = {
-    model,
-    // pi-ai's stream-level reasoning has no "off" member; omitting the option
-    // is how reasoning is disabled.
-    ...(reasoning !== "off" && { reasoning }),
-    // Drop failed turns and their orphaned tool results so a transient provider
-    // error mid-review does not poison every later request. Contract: no throw.
-    convertToLlm: (messages: AgentMessage[]) => {
-      const droppedToolCallIds = new Set<string>();
-      for (const m of messages) {
-        if (m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted")) {
-          for (const block of m.content) {
-            if (block.type === "toolCall") {
-              droppedToolCallIds.add(block.id);
+    // The barbarian's tools run with the repo as cwd. It gets the read/search
+    // set plus bash (reproductions) and write (repro scripts under the
+    // artifact root; the prompt forbids writes elsewhere).
+    const pi = await import("@earendil-works/pi-coding-agent");
+    const context: AgentContext = {
+      systemPrompt: BARBARIAN_SYSTEM_PROMPT,
+      messages: [],
+      tools: [
+        pi.createReadTool(repo),
+        pi.createBashTool(repo),
+        pi.createGrepTool(repo),
+        pi.createFindTool(repo),
+        pi.createLsTool(repo),
+        pi.createWriteTool(repo),
+      ],
+    };
+
+    const loopConfig = {
+      model,
+      // pi-ai's stream-level reasoning has no "off" member; omitting the option
+      // is how reasoning is disabled.
+      ...(reasoning !== "off" && { reasoning }),
+      // Drop failed turns and their orphaned tool results so a transient provider
+      // error mid-review does not poison every later request. Contract: no throw.
+      convertToLlm: (messages: AgentMessage[]) => {
+        const droppedToolCallIds = new Set<string>();
+        for (const m of messages) {
+          if (m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted")) {
+            for (const block of m.content) {
+              if (block.type === "toolCall") {
+                droppedToolCallIds.add(block.id);
+              }
             }
           }
         }
-      }
-      return messages.filter((m): m is Message => {
-        if (m.role === "user") {
-          return true;
+        return messages.filter((m): m is Message => {
+          if (m.role === "user") {
+            return true;
+          }
+          if (m.role === "toolResult") {
+            return !droppedToolCallIds.has(m.toolCallId);
+          }
+          return m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted";
+        });
+      },
+    };
+    // Hosted web search stays off: the barbarian reviews code, and a
+    // prompt-injectable hosted tool has no place in an unattended run.
+    const streamFn: StreamFn = (m, ctx, opts) =>
+      streamSimple(m, ctx, { ...opts, webSearch: false } as SimpleStreamOptions);
+
+    // Run the review, surviving a single errored/content-filtered turn rather
+    // than discarding the whole review: drop that turn (convertToLlm already
+    // strips it from the request) and continue with a neutralizing nudge, up to
+    // MAX_CONTINUES times. Abort is honored immediately (it is a real cancel).
+    const MAX_CONTINUES = 2;
+    let final: AssistantMessage | undefined;
+    for (let attempt = 0; ; attempt++) {
+      const events = agentLoop(
+        promptMessages,
+        { ...context, messages: transcript },
+        loopConfig,
+        options.signal,
+        streamFn,
+      );
+      // Mirror the transcript as turns complete so the checkpoint is written
+      // after EACH turn (agentLoop.result() only resolves at the end of the
+      // whole invocation). live === transcript once produced is folded in below.
+      const live: AgentMessage[] = [...transcript, ...promptMessages];
+      writeCheckpoint(live);
+      for await (const event of events) {
+        options.onEvent?.(event);
+        if (event.type === "turn_end") {
+          live.push(event.message, ...event.toolResults);
+          writeCheckpoint(live);
         }
-        if (m.role === "toolResult") {
-          return !droppedToolCallIds.has(m.toolCallId);
-        }
-        return m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted";
-      });
-    },
-  };
-  // Hosted web search stays off: the barbarian reviews code, and a
-  // prompt-injectable hosted tool has no place in an unattended run.
-  const streamFn: StreamFn = (m, ctx, opts) =>
-    streamSimple(m, ctx, { ...opts, webSearch: false } as SimpleStreamOptions);
-
-  // Run the review, surviving a single errored/content-filtered turn rather
-  // than discarding the whole review: drop that turn (convertToLlm already
-  // strips it from the request) and continue with a neutralizing nudge, up to
-  // MAX_CONTINUES times. Abort is honored immediately (it is a real cancel).
-  const MAX_CONTINUES = 2;
-  let final: AssistantMessage | undefined;
-  for (let attempt = 0; ; attempt++) {
-    const events = agentLoop(
-      promptMessages,
-      { ...context, messages: transcript },
-      loopConfig,
-      options.signal,
-      streamFn,
-    );
-    // Mirror the transcript as turns complete so the checkpoint is written
-    // after EACH turn (agentLoop.result() only resolves at the end of the
-    // whole invocation). live === transcript once produced is folded in below.
-    const live: AgentMessage[] = [...transcript, ...promptMessages];
-    writeCheckpoint(live);
-    for await (const event of events) {
-      options.onEvent?.(event);
-      if (event.type === "turn_end") {
-        live.push(event.message, ...event.toolResults);
-        writeCheckpoint(live);
       }
+      const produced = await events.result();
+      transcript.push(...produced);
+      writeCheckpoint(transcript);
+      const lastAssistant = produced
+        .filter((m): m is AssistantMessage => m.role === "assistant")
+        .at(-1);
+      if (lastAssistant) {
+        final = lastAssistant;
+      }
+      if (!final) {
+        throw new Error("barbarian review produced no assistant message");
+      }
+      if (final.stopReason === "aborted") {
+        throw new Error(`barbarian review aborted: ${final.errorMessage ?? "aborted"}`);
+      }
+      if (final.stopReason !== "error" || attempt >= MAX_CONTINUES) {
+        break;
+      }
+      promptMessages = [{ role: "user", content: BARBARIAN_CONTINUE_NUDGE, timestamp: Date.now() }];
     }
-    const produced = await events.result();
-    transcript.push(...produced);
-    writeCheckpoint(transcript);
-    const lastAssistant = produced
-      .filter((m): m is AssistantMessage => m.role === "assistant")
-      .at(-1);
-    if (lastAssistant) {
-      final = lastAssistant;
-    }
-    if (!final) {
-      throw new Error("barbarian review produced no assistant message");
-    }
-    if (final.stopReason === "aborted") {
-      throw new Error(`barbarian review aborted: ${final.errorMessage ?? "aborted"}`);
-    }
-    if (final.stopReason !== "error" || attempt >= MAX_CONTINUES) {
-      break;
-    }
-    promptMessages = [{ role: "user", content: BARBARIAN_CONTINUE_NUDGE, timestamp: Date.now() }];
-  }
 
-  // The retry above recovers a SINGLE transient/content-filtered turn. If the
-  // final turn is STILL an error after exhausting the retries, the review did
-  // not complete — fail loudly. Do NOT fabricate a success: the CLI must exit
-  // non-zero and the tool must surface an error rather than label a broken run
-  // "complete".
-  if (final.stopReason === "error") {
-    throw new Error(
-      `barbarian review failed after ${MAX_CONTINUES + 1} attempts: ${final.errorMessage ?? "error"}`,
-    );
-  }
-  const findings = finalText(final).trimEnd();
+    // The retry above recovers a SINGLE transient/content-filtered turn. If the
+    // final turn is STILL an error after exhausting the retries, the review did
+    // not complete — fail loudly. Do NOT fabricate a success: the CLI must exit
+    // non-zero and the tool must surface an error rather than label a broken run
+    // "complete".
+    if (final.stopReason === "error") {
+      throw new Error(
+        `barbarian review failed after ${MAX_CONTINUES + 1} attempts: ${final.errorMessage ?? "error"}`,
+      );
+    }
+    const findings = finalText(final).trimEnd();
 
-  return {
-    repo,
-    source,
-    target,
-    artifactRoot,
-    findings,
-    ...(syntheticTarget !== undefined && { syntheticTarget }),
-    modelSpec,
-    reasoning,
-    concurrency: 0,
-    usage: totalUsage(transcript),
-  };
+    return {
+      repo,
+      source,
+      target,
+      artifactRoot,
+      findings,
+      ...(syntheticTarget !== undefined && { syntheticTarget }),
+      modelSpec,
+      reasoning,
+      concurrency: 0,
+      usage: totalUsage(transcript),
+    };
+  } finally {
+    release?.();
+  }
 }
 
 function checkpointVersion(artifactRoot: string): number {
@@ -783,21 +804,28 @@ export async function runBarbarianReview(options: BarbarianOptions): Promise<Bar
   }
 
   if (options.resume) {
-    const version = checkpointVersion(options.resume);
-    if (version === 2) {
-      if (concurrency === 0) {
-        throw new Error("resuming a horde checkpoint requires --concurrency <positive integer>");
+    const artifactRoot = canonicalBarbarianArtifactRoot(options.resume);
+    const release = acquireBarbarianRunLock(artifactRoot);
+    try {
+      const version = checkpointVersion(artifactRoot);
+      const resumeOptions = { ...options, resume: artifactRoot };
+      if (version === 2) {
+        if (concurrency === 0) {
+          throw new Error("resuming a horde checkpoint requires --concurrency <positive integer>");
+        }
+        const { runBarbarianHordeReview } = await import("./barbarian-horde.js");
+        return await runBarbarianHordeReview(resumeOptions, concurrency, artifactRoot);
       }
-      const { runBarbarianHordeReview } = await import("./barbarian-horde.js");
-      return runBarbarianHordeReview(options, concurrency);
+      if (version !== 1) {
+        throw new Error(`unsupported barbarian checkpoint version: ${version}`);
+      }
+      if (concurrency > 0) {
+        throw new Error("a solo checkpoint cannot be resumed in horde mode");
+      }
+      return await runSoloBarbarianReview(resumeOptions, artifactRoot);
+    } finally {
+      release();
     }
-    if (version !== 1) {
-      throw new Error(`unsupported barbarian checkpoint version: ${version}`);
-    }
-    if (concurrency > 0) {
-      throw new Error("a solo checkpoint cannot be resumed in horde mode");
-    }
-    return runSoloBarbarianReview(options);
   }
 
   if (concurrency === 0) {
