@@ -15,7 +15,9 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
@@ -28,9 +30,22 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import { type BarbarianResult, runBarbarianReview } from "../agents/barbarian.js";
 import { barbarianBashSpawnHook, repairDanglingToolCalls } from "../agents/barbarian-horde.js";
+import {
+  DEFAULT_HORDE_ATTACK_MODEL,
+  DEFAULT_HORDE_ATTACK_REASONING,
+  DEFAULT_HORDE_CHIEFTAIN_MODEL,
+  DEFAULT_HORDE_CHIEFTAIN_REASONING,
+  hordeIntelligence,
+} from "../barbarian-defaults.js";
 
 const MODEL = "openai/gpt-4";
 const WORKER_DELAY_MS = 180;
+const HORDE_TEST_INTELLIGENCE = {
+  model: MODEL,
+  reasoning: "off",
+  hordeModel: MODEL,
+  hordeReasoning: "off",
+} as const;
 
 interface AttackView {
   id: string;
@@ -207,14 +222,33 @@ async function runCase(
     repo,
     source: "HEAD~1",
     target: "HEAD",
-    model: MODEL,
-    reasoning: "off",
+    ...HORDE_TEST_INTELLIGENCE,
     concurrency,
   });
   return { result, metrics, elapsed: performance.now() - started };
 }
 
 async function main(): Promise<void> {
+  assert.deepEqual(hordeIntelligence({}), {
+    chieftainModelSpec: DEFAULT_HORDE_CHIEFTAIN_MODEL,
+    chieftainReasoning: DEFAULT_HORDE_CHIEFTAIN_REASONING,
+    hordeModelSpec: DEFAULT_HORDE_ATTACK_MODEL,
+    hordeReasoning: DEFAULT_HORDE_ATTACK_REASONING,
+  });
+  assert.deepEqual(
+    hordeIntelligence({
+      model: "custom/chieftain",
+      reasoning: "xhigh",
+      hordeModel: "custom/attack",
+      hordeReasoning: "low",
+    }),
+    {
+      chieftainModelSpec: "custom/chieftain",
+      chieftainReasoning: "xhigh",
+      hordeModelSpec: "custom/attack",
+      hordeReasoning: "low",
+    },
+  );
   const group = mkdtempSync(join(tmpdir(), "rath-barbarian-horde-test-"));
   const repo = join(group, "repo");
   execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
@@ -255,6 +289,21 @@ async function main(): Promise<void> {
       1,
       "solo mode preserves the version-1 checkpoint",
     );
+    if (process.platform !== "win32") {
+      const soloAlias = join(group, "solo-resume-alias");
+      symlinkSync(solo.artifactRoot, soloAlias, "dir");
+      registration.setResponses([
+        fauxAssistantMessage(
+          "Reviewed: scripted-source..scripted-target\n\nFindings:\n\nNo finding: solo alias resume complete\n\nArtifacts:\n- none",
+        ),
+      ]);
+      const aliasResume = await runBarbarianReview({ resume: soloAlias });
+      assert.equal(
+        aliasResume.artifactRoot,
+        solo.artifactRoot,
+        "solo resume canonicalizes a symlink alias",
+      );
+    }
     const repaired = repairDanglingToolCalls([
       { role: "user", content: "safe prefix", timestamp: 0 },
       fauxAssistantMessage(fauxToolCall("bash", { command: "true" }), {
@@ -282,8 +331,7 @@ async function main(): Promise<void> {
         repo,
         source: "HEAD~1",
         target: "HEAD",
-        model: MODEL,
-        reasoning: "off",
+        ...HORDE_TEST_INTELLIGENCE,
         concurrency: 1,
         hordeModel: "not-a-provider/not-a-model",
       }),
@@ -377,8 +425,7 @@ async function main(): Promise<void> {
       repo,
       source: "HEAD~1",
       target: "HEAD",
-      model: MODEL,
-      reasoning: "off",
+      ...HORDE_TEST_INTELLIGENCE,
       concurrency: 1,
     });
     assert.match(
@@ -446,8 +493,7 @@ async function main(): Promise<void> {
       repo,
       source: "HEAD~1",
       target: "HEAD",
-      model: MODEL,
-      reasoning: "off",
+      ...HORDE_TEST_INTELLIGENCE,
       concurrency: 1,
       onArtifactRoot: (root) => announceExclusiveRoot?.(root),
     });
@@ -461,10 +507,9 @@ async function main(): Promise<void> {
       runBarbarianReview({
         resume: exclusiveRoot,
         concurrency: 1,
-        model: MODEL,
-        reasoning: "off",
+        ...HORDE_TEST_INTELLIGENCE,
       }),
-      /horde review is already active/,
+      /barbarian review is already active/,
       "a concurrent resume is rejected while the artifact owner is alive",
     );
     exclusiveResult = await exclusiveRun;
@@ -499,7 +544,222 @@ async function main(): Promise<void> {
       }),
       /attack checkpoint must be resumed through its parent horde artifact root/,
     );
+    const malformedSource = git(repo, "rev-parse", "HEAD~1");
+    const malformedTarget = git(repo, "rev-parse", "HEAD");
+    const canonicalRepo = realpathSync(repo);
+    const escapedChieftain = join(realpathSync(group), "escaped-chieftain-worktree");
+    const requestedMalformedHordeRoot = join(group, "malformed-horde-checkpoint");
+    mkdirSync(requestedMalformedHordeRoot);
+    const malformedHordeRoot = realpathSync(requestedMalformedHordeRoot);
+    writeFileSync(
+      join(malformedHordeRoot, "checkpoint.json"),
+      JSON.stringify({
+        version: 2,
+        mode: "horde",
+        repo: canonicalRepo,
+        source: malformedSource,
+        target: malformedTarget,
+        artifactRoot: malformedHordeRoot,
+        chieftainWorktree: escapedChieftain,
+        chieftainModelSpec: MODEL,
+        chieftainReasoning: "off",
+        hordeModelSpec: MODEL,
+        hordeReasoning: "off",
+        concurrency: 1,
+        chieftainMessages: [],
+        attackIds: [],
+        nextAttackNumber: 1,
+        revision: 0,
+      }),
+    );
+    await assert.rejects(
+      runBarbarianReview({
+        resume: malformedHordeRoot,
+        concurrency: 1,
+        ...HORDE_TEST_INTELLIGENCE,
+      }),
+      /checkpoint chieftain worktree must be/,
+      "resume rejects a checkpoint-controlled chieftain path before creating it",
+    );
+    assert.equal(existsSync(escapedChieftain), false);
+
+    const requestedMalformedAttackRoot = join(group, "malformed-attack-checkpoint");
+    mkdirSync(requestedMalformedAttackRoot);
+    const malformedAttackRoot = realpathSync(requestedMalformedAttackRoot);
+    const expectedAttackRoot = join(malformedAttackRoot, "attacks", "attack-001");
+    const escapedAttackRoot = join(realpathSync(group), "escaped-attack-root");
+    mkdirSync(expectedAttackRoot, { recursive: true });
+    writeFileSync(
+      join(malformedAttackRoot, "checkpoint.json"),
+      JSON.stringify({
+        version: 2,
+        mode: "horde",
+        repo: canonicalRepo,
+        source: malformedSource,
+        target: malformedTarget,
+        artifactRoot: malformedAttackRoot,
+        chieftainWorktree: join(malformedAttackRoot, "chieftain-worktree"),
+        chieftainModelSpec: MODEL,
+        chieftainReasoning: "off",
+        hordeModelSpec: MODEL,
+        hordeReasoning: "off",
+        concurrency: 1,
+        chieftainMessages: [],
+        attackIds: ["attack-001"],
+        nextAttackNumber: 2,
+        revision: 1,
+      }),
+    );
+    writeFileSync(
+      join(expectedAttackRoot, "checkpoint.json"),
+      JSON.stringify({
+        version: 1,
+        kind: "horde-attack",
+        id: "attack-001",
+        hypothesis: "malformed path",
+        objective: "must be rejected",
+        repo: canonicalRepo,
+        source: malformedSource,
+        target: malformedTarget,
+        artifactRoot: escapedAttackRoot,
+        worktree: join(escapedAttackRoot, "worktree"),
+        modelSpec: MODEL,
+        reasoning: "off",
+        status: "queued",
+        messages: [],
+        steering: [],
+        nextSteeringSequence: 1,
+      }),
+    );
+    await assert.rejects(
+      runBarbarianReview({
+        resume: malformedAttackRoot,
+        concurrency: 1,
+        ...HORDE_TEST_INTELLIGENCE,
+      }),
+      /attack attack-001 artifact root must be/,
+      "resume validates attack paths before creating the chieftain worktree",
+    );
+    assert.equal(existsSync(join(malformedAttackRoot, "chieftain-worktree")), false);
+    assert.equal(existsSync(escapedAttackRoot), false);
+
+    const requestedSymlinkAttackRoot = join(group, "symlink-attack-checkpoint");
+    mkdirSync(requestedSymlinkAttackRoot);
+    const symlinkAttackRoot = realpathSync(requestedSymlinkAttackRoot);
+    const outsideAttacks = join(realpathSync(group), "outside-attacks");
+    const outsideAttack = join(outsideAttacks, "attack-001");
+    mkdirSync(outsideAttack, { recursive: true });
+    symlinkSync(outsideAttacks, join(symlinkAttackRoot, "attacks"), "dir");
+    writeFileSync(
+      join(symlinkAttackRoot, "checkpoint.json"),
+      JSON.stringify({
+        version: 2,
+        mode: "horde",
+        repo: canonicalRepo,
+        source: malformedSource,
+        target: malformedTarget,
+        artifactRoot: symlinkAttackRoot,
+        chieftainWorktree: join(symlinkAttackRoot, "chieftain-worktree"),
+        chieftainModelSpec: MODEL,
+        chieftainReasoning: "off",
+        hordeModelSpec: MODEL,
+        hordeReasoning: "off",
+        concurrency: 1,
+        chieftainMessages: [],
+        attackIds: ["attack-001"],
+        nextAttackNumber: 2,
+        revision: 1,
+      }),
+    );
+    writeFileSync(
+      join(outsideAttack, "checkpoint.json"),
+      JSON.stringify({
+        version: 1,
+        kind: "horde-attack",
+        id: "attack-001",
+        hypothesis: "symlinked ancestor",
+        objective: "must be rejected",
+        repo: canonicalRepo,
+        source: malformedSource,
+        target: malformedTarget,
+        artifactRoot: join(symlinkAttackRoot, "attacks", "attack-001"),
+        worktree: join(symlinkAttackRoot, "attacks", "attack-001", "worktree"),
+        modelSpec: MODEL,
+        reasoning: "off",
+        status: "queued",
+        messages: [],
+        steering: [],
+        nextSteeringSequence: 1,
+      }),
+    );
+    await assert.rejects(
+      runBarbarianReview({
+        resume: symlinkAttackRoot,
+        concurrency: 1,
+        ...HORDE_TEST_INTELLIGENCE,
+      }),
+      /symbolic-link path component/,
+      "resume rejects symlinked path ancestors before creating worktrees",
+    );
+    assert.equal(existsSync(join(outsideAttack, "worktree")), false);
+
+    const requestedEmptySymlinkRoot = join(group, "empty-symlink-attack-checkpoint");
+    mkdirSync(requestedEmptySymlinkRoot);
+    const emptySymlinkRoot = realpathSync(requestedEmptySymlinkRoot);
+    const emptyOutsideAttacks = join(realpathSync(group), "empty-outside-attacks");
+    mkdirSync(emptyOutsideAttacks);
+    symlinkSync(emptyOutsideAttacks, join(emptySymlinkRoot, "attacks"), "dir");
+    writeFileSync(
+      join(emptySymlinkRoot, "checkpoint.json"),
+      JSON.stringify({
+        version: 2,
+        mode: "horde",
+        repo: canonicalRepo,
+        source: malformedSource,
+        target: malformedTarget,
+        artifactRoot: emptySymlinkRoot,
+        chieftainWorktree: join(emptySymlinkRoot, "chieftain-worktree"),
+        chieftainModelSpec: MODEL,
+        chieftainReasoning: "off",
+        hordeModelSpec: MODEL,
+        hordeReasoning: "off",
+        concurrency: 1,
+        chieftainMessages: [],
+        attackIds: [],
+        nextAttackNumber: 1,
+        revision: 0,
+      }),
+    );
+    await assert.rejects(
+      runBarbarianReview({
+        resume: emptySymlinkRoot,
+        concurrency: 1,
+        ...HORDE_TEST_INTELLIGENCE,
+      }),
+      /checkpoint attacks directory contains a symbolic-link path component/,
+      "resume validates the attacks container even before any attack exists",
+    );
+    assert.equal(existsSync(join(emptySymlinkRoot, "chieftain-worktree")), false);
+    assert.deepEqual(readdirSync(emptyOutsideAttacks), []);
     const workerCallsBeforeResume = parallel.metrics.workerCalls;
+    if (process.platform !== "win32") {
+      const swapAlias = join(group, "horde-resume-swap-alias");
+      symlinkSync(parallel.result.artifactRoot, swapAlias, "dir");
+      installResponses(registration, parallel.metrics);
+      const swappedResume = runBarbarianReview({
+        resume: swapAlias,
+        concurrency: 2,
+        ...HORDE_TEST_INTELLIGENCE,
+      });
+      rmSync(swapAlias);
+      symlinkSync(solo.artifactRoot, swapAlias, "dir");
+      const swapResult = await swappedResume;
+      assert.equal(
+        swapResult.artifactRoot,
+        parallel.result.artifactRoot,
+        "resume locks a canonical run before checkpoint-version dispatch",
+      );
+    }
     const staleLock = join(parallel.result.artifactRoot, ".review-lock");
     mkdirSync(staleLock);
     writeFileSync(
@@ -513,12 +773,21 @@ async function main(): Promise<void> {
       }),
     );
     installResponses(registration, parallel.metrics);
+    let hordeResumeRoot = parallel.result.artifactRoot;
+    if (process.platform !== "win32") {
+      hordeResumeRoot = join(group, "horde-resume-alias");
+      symlinkSync(parallel.result.artifactRoot, hordeResumeRoot, "dir");
+    }
     const resumed = await runBarbarianReview({
-      resume: parallel.result.artifactRoot,
+      resume: hordeResumeRoot,
       concurrency: 2,
-      model: MODEL,
-      reasoning: "off",
+      ...HORDE_TEST_INTELLIGENCE,
     });
+    assert.equal(
+      resumed.artifactRoot,
+      parallel.result.artifactRoot,
+      "horde resume canonicalizes a symlink alias",
+    );
     assert.equal(resumed.concurrency, 2);
     assert.equal(
       parallel.metrics.workerCalls,
@@ -552,8 +821,7 @@ async function main(): Promise<void> {
     await runBarbarianReview({
       resume: parallel.result.artifactRoot,
       concurrency: 2,
-      model: MODEL,
-      reasoning: "off",
+      ...HORDE_TEST_INTELLIGENCE,
     });
     assert.ok(resumeBootstrap.includes(`SOURCE: ${bootstrapCheckpoint.source}`));
     assert.ok(resumeBootstrap.includes("RESUME-MUST-RETAIN-THIS-INSTRUCTION"));
@@ -619,8 +887,7 @@ async function main(): Promise<void> {
       repo,
       source: "HEAD~1",
       target: "HEAD",
-      model: MODEL,
-      reasoning: "off",
+      ...HORDE_TEST_INTELLIGENCE,
       concurrency: 2,
     });
     assert.equal(
@@ -671,8 +938,7 @@ async function main(): Promise<void> {
         repo,
         source: "HEAD~1",
         target: "HEAD",
-        model: MODEL,
-        reasoning: "off",
+        ...HORDE_TEST_INTELLIGENCE,
         concurrency: 1,
         onArtifactRoot: (root) => {
           failedArtifactRoot = root;
@@ -726,8 +992,7 @@ async function main(): Promise<void> {
         repo,
         source: "HEAD~1",
         target: "HEAD",
-        model: MODEL,
-        reasoning: "off",
+        ...HORDE_TEST_INTELLIGENCE,
         concurrency: 1,
         onArtifactRoot: (root) => {
           cancelledArtifactRoot = root;
@@ -749,6 +1014,7 @@ async function main(): Promise<void> {
         `2=${parallel.elapsed.toFixed(0)}ms`,
     );
     log("Omitted concurrency preserved the solo reviewer and checkpoint format.");
+    log("Horde intelligence defaults and explicit overrides resolved independently.");
     log("Steering checkpoint and resume reuse verified.");
     log("Fast terminal attack snapshots reached the chieftain before synthesis.");
     log("Exclusive artifact ownership rejected concurrent resume and recovered a dead owner.");

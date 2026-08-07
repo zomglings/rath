@@ -214,34 +214,46 @@ a parent command with explicit review modes plus the skill installer.
 
 - `rath barbarian solo` runs the original single-intelligence review.
 - `rath barbarian horde` runs a chieftain plus parallel attack intelligences.
-  It is not a linter — both modes hunt defects
-  (correctness, regressions, broken contracts, security exposure, bad tests,
-  incomplete changes) and proves findings by reproduction where possible,
-  staging disposable `git worktree`s under a temp artifact root.
-  - Defaults: `--source` is `main` (falling back to `master`); `--target` is
+- `rath barbarian clean` explicitly removes inactive retained runs belonging
+  to a repository.
+
+The review modes are not linters: both hunt defects (correctness, regressions,
+broken contracts, security exposure, bad tests, incomplete changes) and prove
+findings by reproduction where possible, staging disposable `git worktree`s
+under a retained artifact root.
+
+- **Defaults.** `--source` is `main` (falling back to `master`); `--target` is
     the current repository state — staged, unstaged, and untracked changes
     captured as a synthetic commit in a disposable worktree, so the review
     covers work in progress without ever touching your tree. `--repo` points
-    at any path inside the target repository (default: cwd). `--model` /
-    `--reasoning` choose the model (default: the pinned default) and effort
-    (default: `high`); `--instructions` appends extra reviewer instructions.
-  - **Parallel horde.** Horde mode makes the primary model the chieftain: it
+    at any path inside the target repository (default: cwd). `--barbarian-dir`
+    selects the parent directory for retained run artifacts; its default is
+    `RATH_BARBARIAN_DIR`, then the OS temporary directory's `rath-barbarian`
+    child. The directory must be outside the reviewed repository so artifacts
+    cannot enter a synthetic target. `--instructions` appends extra reviewer
+    instructions.
+- **Parallel horde.** Horde mode makes the primary model the chieftain: it
     generates hypotheses, launches concurrent attack
     agents, steers or reopens them from checkpoints, and synthesizes their
     evidence into the final report. The chieftain and every attack run in
     separate detached worktrees, isolating them from the user's tree.
-    `--concurrency <n>` sets the positive maximum and defaults to `4`.
+    `--concurrency <n>` sets the positive maximum and defaults to `4`. The
+    chieftain defaults to `openrouter-native/openai/gpt-5.6-sol` with `high`
+    reasoning; attack agents default to
+    `openrouter-native/openai/gpt-5.6-terra` with `medium` reasoning.
     `--horde-model` and `--horde-reasoning`
-    select the attack agents; each defaults to the corresponding chieftain
-    setting. `--concurrency 1` exercises the horde architecture serially.
-  - The findings report prints to stdout; progress (the reasoning summary and
+    override the attack defaults. `--model` and `--reasoning` override the
+    chieftain defaults. `--concurrency 1` exercises the horde architecture
+    serially. Solo mode retains the pinned global model and `high` reasoning
+    defaults.
+- The findings report prints to stdout; progress (the reasoning summary and
     reply tokens as they generate, plus tool calls and the artifact path) goes
     to stderr. Redirect stdout to save it (`rath barbarian solo > out.md`).
     Hosted web search is disabled (an unattended agent has no business
     following injectable web content). If the model errors out the review
     retries; if it still cannot finish, the command fails (non-zero) rather
     than emit a partial report as if complete.
-  - **Cost tracking.** After the report, a stderr summary reports the review's
+- **Cost tracking.** After the report, a stderr summary reports the review's
     aggregate token usage and cost in USD, summed over every assistant turn
     (checkpointed turns included on `--resume`). Programmatic callers get the
     same aggregate as `result.usage` from `runBarbarianReview` — exported from
@@ -250,7 +262,7 @@ a parent command with explicit review modes plus the skill installer.
     model resolved with all-zero pricing (a genuinely free model and one with
     unknown pricing — dynamic-priced auto-routers — are indistinguishable
     here); with zero tokens the provider reported no usage.
-  - **Checkpointing.** After every turn the review writes its transcript and
+- **Checkpointing.** After every turn the review writes its transcript and
     range to `<artifact-root>/checkpoint.json` (the artifact path printed on
     stderr). Horde mode additionally stores each attack transcript, steering
     queue, state, and result under `<artifact-root>/attacks/<attack-id>/`.
@@ -258,6 +270,19 @@ a parent command with explicit review modes plus the skill installer.
     resume a horde review with `rath barbarian horde --resume <artifact-root>`
     and optionally its positive concurrency, for example `--concurrency 4`.
     Completed attacks are reused rather than rerun.
+- **Explicit cleanup.** Review commands never remove their artifact roots.
+    `rath barbarian clean` removes inactive runs owned by the current repository;
+    `--repo <path>` selects another repository, `--barbarian-dir <path>` uses a
+    different run directory, and `--dry-run` reports what would be removed.
+    Cleanup removes registered Git worktrees before deleting verified artifact
+    roots, holds each run's exclusive lock through deletion, rejects changed
+    directory identities and in-repository run directories, and refuses roots
+    containing Git repositories (including bare repositories) or worktrees not
+    registered to the selected repository. Dry-run applies the same protection
+    checks. Final deletion atomically moves the run away from its public path,
+    revalidates it, and preserves content that appears concurrently. Cleanup
+    skips live reviews and recognizes only complete, compatible checkpoints in
+    the legacy temp-directory layout when using the built-in default.
 - `rath barbarian skill` prints the rath-barbarian Agent Skill to stdout, or
   installs it with `-m <mode>` (`claude`, `claude-project`, `codex`,
   `universal`, `github`, …) or `-o <dir>` (`-f` to overwrite). The skill
@@ -350,6 +375,10 @@ to prove what was actually sent to the API.
   and the synthetic target commit (staged + unstaged + untracked captured in
   a disposable worktree, with the user's tree left untouched and the diff
   covering exactly the working-tree changes).
+- `barbarian-clean` — explicit Barbarian cleanup (no API, no key): repository
+  ownership schemas, directory and repository containment, dry-run, stale/live
+  lock races, nested foreign worktrees, and targeted legacy worktree metadata
+  removal through the public CLI.
 
 Not yet covered: `file_search` (needs a vector-store fixture) and
 `image_generation` (cost).

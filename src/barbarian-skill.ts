@@ -49,6 +49,11 @@ reproductions in disposable git worktrees, and prints a findings report.
 
 ## Running a review
 
+Horde mode defaults the chieftain to
+\`openrouter-native/openai/gpt-5.6-sol\` with \`high\` reasoning and attack agents
+to \`openrouter-native/openai/gpt-5.6-terra\` with \`medium\` reasoning. Pass the
+model or reasoning flags only to override those defaults.
+
 \`\`\`bash
 # Review a range. Defaults: --source main (or master); --target the current
 # working-tree state (staged + unstaged + untracked), captured as a synthetic
@@ -73,10 +78,13 @@ rath barbarian horde --concurrency 8      # override the positive attack limit
   the reviewer's model and effort (default effort: high).
 - Horde mode accepts a positive \`--concurrency <n>\` (default: 4), limiting
   live attacks. The primary \`--model\` is the chieftain; \`--horde-model\` and
-  \`--horde-reasoning\` select the attack agents and default to the chieftain
-  settings. The chieftain can steer live attacks or reopen completed ones from
-  their checkpoints. The chieftain and every attack run in separate detached
+  \`--horde-reasoning\` select the attack agents. The chieftain can steer live
+  attacks or reopen completed ones from their checkpoints. The chieftain and
+  every attack run in separate detached
   worktrees, isolating them from the user's tree.
+- \`--barbarian-dir <path>\` selects the parent directory for retained review
+  runs. \`RATH_BARBARIAN_DIR\` supplies the default override when the flag is
+  absent. The directory must be outside the reviewed repository.
 - **Exit code is 0 only on a completed review.** If the model errors out
   (rate limit, transient content filter) the review retries; if it still cannot
   finish, the command exits non-zero and prints no report — never treat a
@@ -92,7 +100,7 @@ rath barbarian horde --concurrency 8      # override the positive attack limit
 
 A review can be long and expensive. After every turn the barbarian writes a
 checkpoint (the full transcript plus the resolved range/model) to
-\`<artifact-root>/checkpoint.json\`. The artifact root is a temp directory
+\`<artifact-root>/checkpoint.json\`. The artifact root is a retained run directory
 printed on stderr as \`[barbarian] artifacts: <path>\` (it also holds the
 reproduction worktrees). Horde reviews also checkpoint each attack under
 \`<artifact-root>/attacks/<attack-id>/\`, including its transcript, steering
@@ -112,6 +120,26 @@ Resume reloads the checkpointed transcript and continues from where it stopped,
 reusing the same range, model, and reproduction worktrees. This is the right
 move after a rate-limit failure (wait for the window to reset, then resume) or
 any interruption — you keep all the prior investigation.
+
+## Cleanup
+
+Review commands never remove their own artifact roots. When retained runs are
+no longer useful, remove the inactive runs owned by a repository explicitly:
+
+\`\`\`bash
+rath barbarian clean --dry-run
+rath barbarian clean --repo /path/to/repo
+\`\`\`
+
+Cleanup uses the same \`--barbarian-dir\` / \`RATH_BARBARIAN_DIR\` resolution as
+fresh reviews, holds each candidate's exclusive lock through deletion, skips
+live runs, rejects changed directory identities and directories inside the
+repository, and removes only verified runs belonging to the selected repository.
+It refuses a run containing a Git worktree or repository that is not registered
+to the selected repository, including bare repositories, and applies the same
+checks during dry-run. Final deletion atomically quarantines and revalidates the
+run so concurrent writes to its public path are preserved. Do not delete
+worktree directories directly; doing so leaves stale Git worktree registrations.
 
 ## When to use it
 

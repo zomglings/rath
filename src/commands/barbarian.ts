@@ -1,8 +1,8 @@
 /**
- * `rath barbarian`: the Barbarian Reviewer CLI. A parent command with three
+ * `rath barbarian`: the Barbarian Reviewer CLI. A parent command with four
  * subcommands — `solo` (the original reviewer), `horde` (chieftain plus
- * parallel attacks), and `skill` (print/install the Agent Skill that teaches
- * another agent how to drive them).
+ * parallel attacks), `clean` (explicit retained-run cleanup), and `skill`
+ * (print/install the Agent Skill that teaches another agent how to drive them).
  *
  * The review subcommands are thin wrappers over runBarbarianReview
  * (src/agents/barbarian.ts). Non-interactive by design — progress streams to
@@ -11,7 +11,15 @@
  * the review completed.
  */
 
-import { hasCheckpoint, runBarbarianReview } from "../agents/barbarian.js";
+import { isAbsolute, resolve } from "node:path";
+import { hasCheckpoint, repoRoot, runBarbarianReview } from "../agents/barbarian.js";
+import { barbarianDir, cleanBarbarianRuns } from "../barbarian-artifacts.js";
+import {
+  DEFAULT_HORDE_ATTACK_MODEL,
+  DEFAULT_HORDE_ATTACK_REASONING,
+  DEFAULT_HORDE_CHIEFTAIN_MODEL,
+  DEFAULT_HORDE_CHIEFTAIN_REASONING,
+} from "../barbarian-defaults.js";
 import { barbarianSkillCommand } from "../barbarian-skill.js";
 import { ensureCatalogue } from "../catalogue.js";
 import { type Command, fullName, helpRequested, helpText, runSubcommands } from "../command.js";
@@ -57,6 +65,12 @@ function reviewCommand(name: string, mode: ReviewMode): Command {
         description: "Target git repository (default: the current working directory)",
       },
       {
+        long: "barbarian-dir",
+        takesValue: true,
+        description:
+          "Parent directory outside the repo for retained runs (default: $RATH_BARBARIAN_DIR or OS temp)",
+      },
+      {
         long: "source",
         short: "s",
         takesValue: true,
@@ -79,13 +93,16 @@ function reviewCommand(name: string, mode: ReviewMode): Command {
         long: "model",
         short: "m",
         takesValue: true,
-        description:
-          "Barbarian's model as <provider>/<model-id> (default: the pinned default model)",
+        description: `Barbarian's model as <provider>/<model-id> (default: ${
+          horde ? DEFAULT_HORDE_CHIEFTAIN_MODEL : "the pinned default model"
+        })`,
       },
       {
         long: "reasoning",
         takesValue: true,
-        description: `Barbarian's reasoning effort: ${REASONING_LEVELS.join(", ")} (default: high)`,
+        description: `Barbarian's reasoning effort: ${REASONING_LEVELS.join(", ")} (default: ${
+          horde ? DEFAULT_HORDE_CHIEFTAIN_REASONING : "high"
+        })`,
       },
       ...(horde
         ? [
@@ -97,12 +114,12 @@ function reviewCommand(name: string, mode: ReviewMode): Command {
             {
               long: "horde-model",
               takesValue: true,
-              description: "Horde attack model (default: the chieftain's --model)",
+              description: `Horde attack model (default: ${DEFAULT_HORDE_ATTACK_MODEL})`,
             },
             {
               long: "horde-reasoning",
               takesValue: true,
-              description: `Horde reasoning effort: ${REASONING_LEVELS.join(", ")} (default: chieftain)`,
+              description: `Horde reasoning effort: ${REASONING_LEVELS.join(", ")} (default: ${DEFAULT_HORDE_ATTACK_REASONING})`,
             },
           ]
         : []),
@@ -120,6 +137,7 @@ function reviewCommand(name: string, mode: ReviewMode): Command {
         return 0;
       }
       let repo: string | undefined;
+      let configuredBarbarianDir: string | undefined;
       let source: string | undefined;
       let target: string | undefined;
       let instructions: string | undefined;
@@ -141,6 +159,8 @@ function reviewCommand(name: string, mode: ReviewMode): Command {
         try {
           if (token === "-r" || token === "--repo") {
             repo = value();
+          } else if (token === "--barbarian-dir") {
+            configuredBarbarianDir = value();
           } else if (token === "-s" || token === "--source") {
             source = value();
           } else if (token === "-t" || token === "--target") {
@@ -212,6 +232,7 @@ function reviewCommand(name: string, mode: ReviewMode): Command {
       try {
         const result = await runBarbarianReview({
           repo,
+          barbarianDir: configuredBarbarianDir,
           source,
           target,
           instructions,
@@ -355,6 +376,104 @@ function reviewCommand(name: string, mode: ReviewMode): Command {
   };
 }
 
+const barbarianCleanCommand: Command = {
+  name: "clean",
+  summary: "Remove retained Barbarian runs for a repository",
+  description:
+    "Removes inactive Barbarian worktrees and their artifact roots for one git\n" +
+    "repository. Cleanup is explicit: solo and horde review commands never\n" +
+    "delete their own artifacts. Live locked runs and unverified directories\n" +
+    "are skipped; the run directory must be outside the repository.",
+  flags: [
+    {
+      long: "repo",
+      short: "r",
+      takesValue: true,
+      description: "Target git repository (default: the current working directory)",
+    },
+    {
+      long: "barbarian-dir",
+      takesValue: true,
+      description:
+        "Parent directory containing review runs (default: $RATH_BARBARIAN_DIR or OS temp)",
+    },
+    {
+      long: "dry-run",
+      takesValue: false,
+      description: "Print verified runs without removing them",
+    },
+  ],
+  run(prefix, argv) {
+    if (helpRequested(argv)) {
+      process.stdout.write(`${helpText(this, prefix)}\n`);
+      return 0;
+    }
+    let repoArg: string | undefined;
+    let configuredBarbarianDir: string | undefined;
+    let dryRun = false;
+    for (let i = 0; i < argv.length; i++) {
+      const token = argv[i]!;
+      const value = (): string => {
+        const selected = argv[++i];
+        if (selected === undefined) throw new Error(`Option ${token} requires a value`);
+        return selected;
+      };
+      try {
+        if (token === "-r" || token === "--repo") {
+          repoArg = value();
+        } else if (token === "--barbarian-dir") {
+          configuredBarbarianDir = value();
+        } else if (token === "--dry-run") {
+          dryRun = true;
+        } else {
+          process.stderr.write(
+            `Unknown argument: ${token}\nRun "${fullName(this, prefix)} -h" for usage.\n`,
+          );
+          return 1;
+        }
+      } catch (error) {
+        process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
+        return 1;
+      }
+    }
+
+    try {
+      const cwd = process.cwd();
+      const selectedRepo = repoArg?.trim() || cwd;
+      const repo = repoRoot(isAbsolute(selectedRepo) ? selectedRepo : resolve(cwd, selectedRepo));
+      const result = cleanBarbarianRuns({
+        repo,
+        barbarianDir: configuredBarbarianDir,
+        dryRun,
+      });
+      for (const run of dryRun ? result.wouldRemove : result.removed) {
+        process.stdout.write(
+          `${dryRun ? "Would remove" : "Removed"} ${run.artifactRoot} (${run.worktrees.length} worktree${run.worktrees.length === 1 ? "" : "s"})\n`,
+        );
+      }
+      for (const root of result.skippedActive) {
+        process.stdout.write(`Skipped active run ${root}\n`);
+      }
+      if (
+        result.removed.length === 0 &&
+        result.wouldRemove.length === 0 &&
+        result.skippedActive.length === 0
+      ) {
+        process.stdout.write(
+          `No Barbarian runs found for ${repo} under ${barbarianDir(configuredBarbarianDir)}.\n`,
+        );
+      }
+      for (const error of result.errors) {
+        process.stderr.write(`${error}\n`);
+      }
+      return result.errors.length === 0 ? 0 : 1;
+    } catch (error) {
+      process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
+      return 1;
+    }
+  },
+};
+
 const barbarianSoloCommand = reviewCommand("solo", "solo");
 const barbarianHordeCommand = reviewCommand("horde", "horde");
 
@@ -368,7 +487,13 @@ export const barbarianCommand: Command = {
     "\n" +
     "  rath barbarian solo    review with the original single intelligence\n" +
     "  rath barbarian horde   review with a chieftain and parallel attacks\n" +
+    "  rath barbarian clean   remove retained runs for a repository\n" +
     "  rath barbarian skill   print or install the Agent Skill",
-  subcommands: [barbarianSoloCommand, barbarianHordeCommand, barbarianSkillCommand],
+  subcommands: [
+    barbarianSoloCommand,
+    barbarianHordeCommand,
+    barbarianCleanCommand,
+    barbarianSkillCommand,
+  ],
   run: runSubcommands,
 };
