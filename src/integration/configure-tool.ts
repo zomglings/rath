@@ -17,7 +17,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Agent } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { loadTools, type RunFlags } from "../commands/run.js";
 import { loadPreferences, registerOpenAINative, registerOpenRouterNative } from "../index.js";
 import { resolveModel } from "../models.js";
@@ -31,15 +32,18 @@ async function main(): Promise<void> {
   registerOpenAINative();
   registerOpenRouterNative();
 
-  // Minimal stub agent: configure and sessionInfo only touch agent.state.
-  const state = {
-    model: resolveModel("openai-native/gpt-5.5"),
-    thinkingLevel: "low",
-    tools: [] as unknown[],
-    systemPrompt: "original prompt",
-    messages: [] as unknown[],
-  };
-  const agent = { state } as unknown as Agent;
+  // A real Agent: its systemPrompt is replayed from the transcript, so a stub
+  // with a plain field would not show whether configure replaced the prompt.
+  // Nothing is prompted, so streamFn is never called.
+  const agent = new Agent({
+    initialState: {
+      model: resolveModel("openai-native/gpt-5.5"),
+      thinkingLevel: "low",
+      systemPrompt: "original prompt",
+    },
+    streamFn: streamSimple,
+  });
+  const state = agent.state;
   const flags: RunFlags = {
     model: "openai-native/gpt-5.5",
     systemPrompt: "original prompt",
@@ -69,6 +73,11 @@ async function main(): Promise<void> {
   assert.equal(flags.mode, "slow");
   assert.equal(flags.systemPrompt, "you are a careful editor");
   assert.equal(state.systemPrompt, "you are a careful editor");
+  assert.equal(
+    state.messages.filter((m) => m.role === "system").length,
+    1,
+    "prompt replaced in place, not appended",
+  );
   assert.deepEqual(flags.tools, ["read", "configure"], "tool set replaced");
   assert.deepEqual(
     (state.tools as Array<{ name: string }>).map((t) => t.name),

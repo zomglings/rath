@@ -374,7 +374,7 @@ function createConfigureTool(
         }
       }
       if (params.systemPrompt !== undefined) {
-        agent.state.systemPrompt = params.systemPrompt;
+        replaceSystemPrompt(agent, params.systemPrompt);
         flags.systemPrompt = params.systemPrompt;
         changes.push(`system prompt -> set (${params.systemPrompt.length} chars)`);
       }
@@ -523,6 +523,19 @@ function createEndSessionTool(opts: {
   };
 }
 
+/**
+ * Replace the base prompt in the leading system message. pi carries the prompt
+ * in the transcript and a later system message only appends to it, but /sys
+ * and the configure tool promise replacement.
+ */
+export function replaceSystemPrompt(agent: Agent, prompt: string): void {
+  const [first, ...rest] = agent.state.messages;
+  agent.state.messages =
+    first?.role === "system"
+      ? [{ ...first, content: prompt }, ...rest]
+      : [{ role: "system", content: prompt, timestamp: 0 }, ...agent.state.messages];
+}
+
 export interface SerializedContext {
   systemPrompt?: string;
   messages: Message[];
@@ -660,7 +673,7 @@ export async function handleSlashCommand(
         const prompt = agent.state.systemPrompt;
         return { output: prompt.length > 0 ? prompt : "(empty)" };
       }
-      agent.state.systemPrompt = arg;
+      replaceSystemPrompt(agent, arg);
       flags.systemPrompt = arg;
       return { output: `system prompt set (${arg.length} chars)${deferred}` };
     }
@@ -1270,7 +1283,7 @@ export const runCommand: Command = {
             if (m.role === "toolResult") {
               return droppedToolCallIds.has(m.toolCallId) ? [] : [m];
             }
-            if (m.role === "user") {
+            if (m.role === "user" || m.role === "system") {
               return [m];
             }
             if (m.role !== "assistant") {
@@ -1411,7 +1424,7 @@ async function runTui(
     SelectList,
     Text,
     truncateToWidth,
-    TUI,
+    TuiMainScreen,
   } = piTui;
   const {
     AssistantMessageComponent,
@@ -1448,7 +1461,7 @@ async function runTui(
       .filter(isHostedToolCall)
       .map((block) => new Text(yellowLine(`[${block.toolName}]`)));
 
-  const tui = new TUI(new ProcessTerminal());
+  const tui = new TuiMainScreen(new ProcessTerminal());
   const transcript = new Container();
   const status = new Container();
   const loader = new Loader(tui, cyanLine, dimLine, "thinking…", {

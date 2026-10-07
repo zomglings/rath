@@ -1,6 +1,6 @@
 {
   "name": "@zomglings/rath",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "publishConfig": {
     "access": "public"
   },
@@ -41,10 +41,10 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.82.0",
-    "@earendil-works/pi-ai": "^0.82.0",
-    "@earendil-works/pi-coding-agent": "^0.82.0",
-    "@earendil-works/pi-tui": "^0.82.0",
+    "@earendil-works/pi-agent-core": "^1.0.4",
+    "@earendil-works/pi-ai": "^1.0.4",
+    "@earendil-works/pi-coding-agent": "^1.0.4",
+    "@earendil-works/pi-tui": "^1.0.4",
     "diff": "^8.0.4",
     "openai": "^6.42.0",
     "typebox": "^1.2.8"

@@ -64,6 +64,7 @@ import {
   isHostedToolCall,
   isRenderedCitations,
 } from "../hosted-tools.js";
+import { legacyContext } from "./legacy-context.js";
 
 export const OPENAI_NATIVE_API = "openai-native";
 
@@ -205,7 +206,11 @@ export const streamOpenAINative: StreamFunction<typeof OPENAI_NATIVE_API, OpenAI
       Object.assign(headers, options?.headers);
       const client = new OpenAI({ apiKey, baseURL: model.baseUrl, defaultHeaders: headers });
 
-      let params: ResponseCreateParamsStreaming = buildParams(model, context, options);
+      let params: ResponseCreateParamsStreaming = buildParams(
+        model,
+        legacyContext(context),
+        options,
+      );
       const nextParams = await options?.onPayload?.(params, model);
       if (nextParams !== undefined) {
         params = nextParams as ResponseCreateParamsStreaming;
@@ -226,6 +231,9 @@ export const streamOpenAINative: StreamFunction<typeof OPENAI_NATIVE_API, OpenAI
       await processNativeStream(openaiStream, output, stream, model);
       if (options?.signal?.aborted) {
         throw new Error("Request was aborted");
+      }
+      if (output.stopReason === "pending") {
+        throw new Error("OpenAI stream ended without a stop reason");
       }
       if (output.stopReason === "aborted" || output.stopReason === "error") {
         throw new Error("An unknown error occurred");
