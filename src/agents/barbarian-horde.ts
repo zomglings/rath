@@ -36,6 +36,7 @@ import {
   hasChanges,
   repoRoot,
   resolveSource,
+  systemMessage,
   totalUsage,
 } from "./barbarian.js";
 
@@ -238,7 +239,7 @@ function convertToLlm(messages: AgentMessage[]): Message[] {
     }
   }
   return messages.filter((message): message is Message => {
-    if (message.role === "user") {
+    if (message.role === "user" || message.role === "system") {
       return true;
     }
     if (message.role === "toolResult") {
@@ -317,6 +318,10 @@ export function barbarianBashSpawnHook(
 
 interface AgentRunOptions {
   context: AgentContext;
+  // Prepended to every request rather than stored, so checkpointed transcripts
+  // (including ones written before pi carried the prompt as a message) never
+  // hold it and a resume cannot duplicate it.
+  systemPrompt: string;
   config: AgentLoopConfig;
   transcript: AgentMessage[];
   promptMessages: AgentMessage[];
@@ -337,7 +342,7 @@ async function runAgentWithRecovery(options: AgentRunOptions): Promise<{
     const live = [...transcript];
     const events = agentLoop(
       promptMessages,
-      { ...options.context, messages: transcript },
+      { ...options.context, messages: [systemMessage(options.systemPrompt), ...transcript] },
       options.config,
       options.signal,
       streamWithoutWebSearch,
@@ -712,7 +717,6 @@ class HordeCoordinator {
       : controller.signal;
     const pi = await import("@earendil-works/pi-coding-agent");
     const context: AgentContext = {
-      systemPrompt: ATTACK_SYSTEM_PROMPT,
       messages: [],
       tools: [
         pi.createReadTool(record.worktree),
@@ -747,6 +751,7 @@ class HordeCoordinator {
     };
     const outcome = await runAgentWithRecovery({
       context,
+      systemPrompt: ATTACK_SYSTEM_PROMPT,
       config,
       transcript: record.messages,
       promptMessages,
@@ -1148,7 +1153,6 @@ async function runLockedHordeReview(
   });
   const pi = await import("@earendil-works/pi-coding-agent");
   const context: AgentContext = {
-    systemPrompt: CHIEFTAIN_SYSTEM_PROMPT,
     messages: [],
     tools: [
       pi.createReadTool(checkpoint.chieftainWorktree),
@@ -1202,6 +1206,7 @@ async function runLockedHordeReview(
   try {
     const outcome = await runAgentWithRecovery({
       context,
+      systemPrompt: CHIEFTAIN_SYSTEM_PROMPT,
       config,
       transcript: checkpoint.chieftainMessages,
       promptMessages,

@@ -37,6 +37,7 @@ import {
   type AssistantMessage,
   type Message,
   type SimpleStreamOptions,
+  type SystemMessage,
   streamSimple,
   type Usage,
 } from "@earendil-works/pi-ai/compat";
@@ -643,7 +644,6 @@ Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in
     // artifact root; the prompt forbids writes elsewhere).
     const pi = await import("@earendil-works/pi-coding-agent");
     const context: AgentContext = {
-      systemPrompt: BARBARIAN_SYSTEM_PROMPT,
       messages: [],
       tools: [
         pi.createReadTool(repo),
@@ -674,7 +674,7 @@ Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in
           }
         }
         return messages.filter((m): m is Message => {
-          if (m.role === "user") {
+          if (m.role === "user" || m.role === "system") {
             return true;
           }
           if (m.role === "toolResult") {
@@ -698,7 +698,7 @@ Review SOURCE..TARGET. Read outside the diff when needed. Stage reproductions in
     for (let attempt = 0; ; attempt++) {
       const events = agentLoop(
         promptMessages,
-        { ...context, messages: transcript },
+        { ...context, messages: [systemMessage(BARBARIAN_SYSTEM_PROMPT), ...transcript] },
         loopConfig,
         options.signal,
         streamFn,
@@ -836,4 +836,9 @@ export async function runBarbarianReview(options: BarbarianOptions): Promise<Bar
   }
   const { runBarbarianHordeReview } = await import("./barbarian-horde.js");
   return runBarbarianHordeReview(options, concurrency);
+}
+
+/** The leading system message that carries a review agent's prompt. */
+export function systemMessage(prompt: string): SystemMessage {
+  return { role: "system", content: prompt, timestamp: 0 };
 }

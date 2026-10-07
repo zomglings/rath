@@ -77,6 +77,7 @@ import {
   isRenderedCitations,
   type UrlCitation,
 } from "../hosted-tools.js";
+import { legacyContext } from "./legacy-context.js";
 
 export const OPENROUTER_NATIVE_API = "openrouter-native";
 
@@ -269,7 +270,11 @@ export const streamOpenRouterNative: StreamFunction<
       Object.assign(headers, options?.headers);
       const client = new OpenAI({ apiKey, baseURL: model.baseUrl, defaultHeaders: headers });
 
-      let params: ChatCompletionCreateParamsStreaming = buildParams(model, context, options);
+      let params: ChatCompletionCreateParamsStreaming = buildParams(
+        model,
+        legacyContext(context),
+        options,
+      );
       const nextParams = await options?.onPayload?.(params, model);
       if (nextParams !== undefined) {
         params = nextParams as ChatCompletionCreateParamsStreaming;
@@ -290,6 +295,9 @@ export const streamOpenRouterNative: StreamFunction<
       await processNativeStream(openrouterStream, output, stream, model);
       if (options?.signal?.aborted) {
         throw new Error("Request was aborted");
+      }
+      if (output.stopReason === "pending") {
+        throw new Error("OpenRouter stream ended without a stop reason");
       }
       if (output.stopReason === "aborted" || output.stopReason === "error") {
         throw new Error(output.errorMessage || "An unknown error occurred");

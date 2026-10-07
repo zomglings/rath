@@ -52,9 +52,14 @@ async function main(): Promise<void> {
   };
 
   const context: AgentContext = {
-    systemPrompt:
-      "You are a terse assistant. Use the lookup_codeword tool when asked for the codeword.",
-    messages: [],
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a terse assistant. Use the lookup_codeword tool when asked for the codeword.",
+        timestamp: 0,
+      },
+    ],
     tools: [lookupCodeword],
   };
 

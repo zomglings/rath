@@ -82,10 +82,11 @@ async function main(): Promise<void> {
   const toolCall = toolCalls[0]!;
   assert.equal(toolCall.name, "print");
   assert.ok(toolCall.id.includes("|"), `id must be callId|itemId (got: ${toolCall.id})`);
-  assert.equal(typeof toolCall.arguments.message, "string", "arguments must be parsed JSON");
+  const message = toolCall.arguments.message;
+  assert.ok(typeof message === "string", "arguments must be parsed JSON");
   assert.ok(
-    toolCall.arguments.message.toLowerCase().includes("hello world"),
-    `argument must be the requested text (got: ${toolCall.arguments.message})`,
+    message.toLowerCase().includes("hello world"),
+    `argument must be the requested text (got: ${message})`,
   );
   assert.ok(
     !("partialJson" in toolCall),

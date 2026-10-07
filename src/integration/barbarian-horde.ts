@@ -22,10 +22,11 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Context } from "@earendil-works/pi-ai/compat";
+import type { JsonObject, TranscriptContext } from "@earendil-works/pi-ai/compat";
 import {
   fauxAssistantMessage,
   fauxToolCall,
+  getCurrentSystemPrompt,
   registerFauxProvider,
 } from "@earendil-works/pi-ai/compat";
 import { type BarbarianResult, runBarbarianReview } from "../agents/barbarian.js";
@@ -68,7 +69,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
 
-function userText(context: Context): string {
+function userText(context: TranscriptContext): string {
   return context.messages
     .filter((message) => message.role === "user")
     .flatMap((message) =>
@@ -79,7 +80,10 @@ function userText(context: Context): string {
     .join("\n");
 }
 
-function toolState(context: Context): { revision: number; attacks: Map<string, AttackView> } {
+function toolState(context: TranscriptContext): {
+  revision: number;
+  attacks: Map<string, AttackView>;
+} {
   let revision = 0;
   const attacks = new Map<string, AttackView>();
   for (const message of context.messages) {
@@ -105,8 +109,8 @@ function toolState(context: Context): { revision: number; attacks: Map<string, A
 }
 
 function responseFactory(metrics: RunMetrics) {
-  return async (context: Context) => {
-    const systemPrompt = context.systemPrompt ?? "";
+  return async (context: TranscriptContext) => {
+    const systemPrompt = getCurrentSystemPrompt(context.messages);
     if (systemPrompt.includes("Barbarian Horde attack agent")) {
       metrics.workerCalls++;
       metrics.activeWorkers++;
@@ -126,7 +130,7 @@ function responseFactory(metrics: RunMetrics) {
     }
 
     const { revision, attacks } = toolState(context);
-    const toolCall = (name: string, arguments_: Record<string, unknown>) =>
+    const toolCall = (name: string, arguments_: JsonObject) =>
       fauxToolCall(name, arguments_, { id: `faux-${metrics.nextToolCall++}` });
     if (attacks.size === 0) {
       return fauxAssistantMessage(
@@ -390,8 +394,8 @@ async function main(): Promise<void> {
     );
 
     const fastFinding = "VERIFIED FAST ATTACK FINDING";
-    const fastFactory = async (context: Context) => {
-      if ((context.systemPrompt ?? "").includes("Barbarian Horde attack agent")) {
+    const fastFactory = async (context: TranscriptContext) => {
+      if (getCurrentSystemPrompt(context.messages).includes("Barbarian Horde attack agent")) {
         return fauxAssistantMessage(
           `Attack: attack-001\nVerdict: confirmed\nFinding: ${fastFinding}\nEvidence: deterministic\nReproduction: none\nSuggested fix: none`,
         );
@@ -440,8 +444,8 @@ async function main(): Promise<void> {
       workerCalls: 0,
       nextToolCall: 1,
     };
-    const exclusiveFactory = async (context: Context) => {
-      if ((context.systemPrompt ?? "").includes("Barbarian Horde attack agent")) {
+    const exclusiveFactory = async (context: TranscriptContext) => {
+      if (getCurrentSystemPrompt(context.messages).includes("Barbarian Horde attack agent")) {
         exclusiveMetrics.workerCalls++;
         exclusiveMetrics.activeWorkers++;
         exclusiveMetrics.maxActiveWorkers = Math.max(
@@ -832,8 +836,8 @@ async function main(): Promise<void> {
       workerCalls: 0,
       nextToolCall: 1,
     };
-    const cancelSuccessFactory = async (context: Context) => {
-      if ((context.systemPrompt ?? "").includes("Barbarian Horde attack agent")) {
+    const cancelSuccessFactory = async (context: TranscriptContext) => {
+      if (getCurrentSystemPrompt(context.messages).includes("Barbarian Horde attack agent")) {
         cancelSuccessMetrics.workerCalls++;
         cancelSuccessMetrics.activeWorkers++;
         cancelSuccessMetrics.maxActiveWorkers = Math.max(
@@ -853,7 +857,7 @@ async function main(): Promise<void> {
         }
       }
       const { revision, attacks } = toolState(context);
-      const call = (name: string, arguments_: Record<string, unknown>) =>
+      const call = (name: string, arguments_: JsonObject) =>
         fauxToolCall(name, arguments_, {
           id: `cancel-success-${cancelSuccessMetrics.nextToolCall++}`,
         });
@@ -902,8 +906,8 @@ async function main(): Promise<void> {
       workerCalls: 0,
       nextToolCall: 1,
     };
-    const failureFactory = async (context: Context) => {
-      if ((context.systemPrompt ?? "").includes("Barbarian Horde attack agent")) {
+    const failureFactory = async (context: TranscriptContext) => {
+      if (getCurrentSystemPrompt(context.messages).includes("Barbarian Horde attack agent")) {
         failureMetrics.workerCalls++;
         failureMetrics.activeWorkers++;
         try {
@@ -960,8 +964,8 @@ async function main(): Promise<void> {
       workerCalls: 0,
       nextToolCall: 1,
     };
-    const cancelFactory = async (context: Context) => {
-      if ((context.systemPrompt ?? "").includes("Barbarian Horde attack agent")) {
+    const cancelFactory = async (context: TranscriptContext) => {
+      if (getCurrentSystemPrompt(context.messages).includes("Barbarian Horde attack agent")) {
         cancelMetrics.workerCalls++;
         return fauxAssistantMessage(
           "Attack: attack-001\nVerdict: confirmed\nFinding: should not run\nEvidence: none\nReproduction: none\nSuggested fix: none",
